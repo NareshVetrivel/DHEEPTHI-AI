@@ -102,6 +102,10 @@ from ui.widgets.file_selection_panel import FileSelectionPanel
 from voice.speech_recognition import SpeechRecognizer
 from voice.text_to_speech import TextToSpeech
 
+# Production DHEEPTHI wake-word detector:
+# openWakeWord + TFLite, owned by wake_word.py.
+from voice.wake_word import WakeWordDetector
+
 from planner.intent_detector import IntentDetector
 from planner.entity_extractor import EntityExtractor
 from planner.text_extractor import TextExtractor
@@ -124,6 +128,7 @@ from automation.browser_controller import BrowserController
 from automation.file_monitor import FileMonitor
 
 from workers.initialization_worker import InitializationWorker
+from vision.vision_engine import VisionEngine
 
 
 # =====================================================
@@ -151,23 +156,102 @@ CLOSE_GREETINGS = [
 # Voice Worker
 # =====================================================
 
+class WakeWordWorker(QThread):
+    """Background worker dedicated to the production DHEEPTHI detector.
+
+    Wake detection is completely separate from command STT:
+        WakeWordDetector -> DHEEPTHI detected -> stop detector -> MainWindow
+        -> existing Listening/TTS/manual STT command pipeline.
+    """
+
+    wake_detected = Signal(str)
+    finished = Signal()
+    audio_level = Signal(float)
+
+    def __init__(self, detector):
+        super().__init__()
+        self.detector = detector
+        self._stop = False
+        self._detected_emitted = False
+
+        if self.detector is not None:
+            self.detector.on_detected = self._on_detected
+            self.detector.level_callback = self._on_level
+
+    def _on_detected(self, wake_word):
+        if self._stop or self._detected_emitted:
+            return
+
+        self._detected_emitted = True
+        print(f"⚡ Production wake word detected: {wake_word}")
+        self.wake_detected.emit(str(wake_word))
+
+    def _on_level(self, level):
+        try:
+            self.audio_level.emit(float(level))
+        except Exception:
+            pass
+
+    def run(self):
+        try:
+            if self._stop or self.isInterruptionRequested():
+                return
+
+            if self.detector is None:
+                print("❌ WakeWordDetector is not available.")
+                return
+
+            print("\n========== DHEEPTHI / OPENWAKEWORD ==========")
+            print("DHEEPTHI standby: Production openWakeWord + TFLite.")
+            print("Threshold: 0.000250")
+            print("STT wake detection: DISABLED")
+
+            if not self.detector.start():
+                print("❌ Production DHEEPTHI detector failed to start.")
+                return
+
+            print("🎤 Production DHEEPTHI listener active.")
+
+            # WakeWordDetector.start() opens the sounddevice stream and
+            # returns immediately. Keep this QThread alive until the detector
+            # is stopped, so MainWindow does not accidentally restart it.
+            while (
+                not self._stop
+                and not self.isInterruptionRequested()
+                and self.detector.is_running()
+            ):
+                self.msleep(40)
+
+        except Exception as error:
+            print(f"WakeWordWorker Error : {error}")
+        finally:
+            try:
+                if self.detector is not None and self.detector.is_running():
+                    self.detector.stop()
+            except Exception:
+                pass
+
+            self.finished.emit()
+
+    def stop(self):
+        """Stop the production detector without blocking the GUI thread."""
+        self._stop = True
+        self.requestInterruption()
+
+        try:
+            if self.detector is not None:
+                self.detector.stop()
+        except Exception as error:
+            print(f"Wake detector stop error: {error}")
+
+
 class VoiceWorker(QThread):
-    """Background voice worker for ASTRA-AI.
-
-    Voice pipeline:
-
-        WAKE MODE
-            Local Faster-Whisper -> DHEEPTHI detection
-            -> discard wake audio -> fresh command capture
-
-        MANUAL MODE
-            Fresh microphone capture -> existing command STT path
+    """Background worker for existing manual command STT.
 
     IMPORTANT:
-        Wake detection is owned by SpeechRecognizer.
-        MainWindow does not duplicate wake-word recognition.
-        After DHEEPTHI is detected, the wake recording is discarded and
-        a completely fresh recording is made for the actual command.
+        This worker no longer performs wake-word recognition.
+        Production DHEEPTHI detection belongs exclusively to WakeWordWorker.
+        The existing SpeechRecognizer command-capture path is preserved.
     """
 
     command_ready = Signal(str)
@@ -182,9 +266,6 @@ class VoiceWorker(QThread):
         self._stop = False
         self._command_emitted = False
 
-        # SpeechRecognizer calls this callback from its audio thread.
-        # Emit a Qt signal here; MainWindow/MicWidget then receive the
-        # level through Qt's queued signal mechanism.
         try:
             self.recognizer.level_callback = self.audio_level.emit
         except Exception as error:
@@ -195,107 +276,51 @@ class VoiceWorker(QThread):
             if self._stop or self.isInterruptionRequested():
                 return
 
+            # Wake mode is intentionally rejected here. The production
+            # detector has its own worker and microphone owner.
             if self.wake_word_mode:
-                print("\n========== DHEEPTHI / FASTER-WHISPER ==========")
-                print("DHEEPTHI standby: LOCAL Faster-Whisper wake detection.")
-                print("Groq wake detection: DISABLED")
-
-                detected = self.recognizer.listen_for_wake_word()
-
-                if (
-                    not detected
-                    or self._stop
-                    or self.isInterruptionRequested()
-                ):
-                    return
-
-                # The wake-word recording is owned and discarded by the
-                # recognizer.  Start a completely fresh recording for the
-                # actual command so "DHEEPTHI" can never become the command.
-                print("\n⚡ DHEEPTHI detected.")
-
-                # --------------------------------------------------
-                # 3. TTS -> "Listening"
-                # --------------------------------------------------
-                # Speak only after DHEEPTHI is detected.  The wake
-                # recording is already discarded by WhisperRecognizer.
-                # Wait for TTS to finish before opening the microphone
-                # so ASTRA cannot hear its own voice.
-                try:
-                    if self.tts is not None:
-                        self.tts.speak("Listening")
-
-                        while (
-                            self.tts.speaking()
-                            and not self._stop
-                            and not self.isInterruptionRequested()
-                        ):
-                            self.msleep(30)
-
-                except Exception as error:
-                    print(f"TTS Listening Error : {error}")
-
-                if self._stop or self.isInterruptionRequested():
-                    return
-
-                # --------------------------------------------------
-                # 4. FRESH COMMAND MICROPHONE CAPTURE
-                # --------------------------------------------------
-                # IMPORTANT:
-                # Never call the generic listen(retries=...) path here.
-                # The new WhisperRecognizer API explicitly provides
-                # listen_after_wake_word() for the second-stage capture.
-                # This guarantees that the DHEEPTHI wake recording is
-                # not reused as the user's command.
-                print("🎤 Starting a NEW command recording...")
-
-                command = self.recognizer.listen_after_wake_word(
-                    timeout=5,
-                    phrase_time_limit=20,
+                print(
+                    "⚠️ VoiceWorker received wake mode unexpectedly; "
+                    "use WakeWordWorker for DHEEPTHI detection."
                 )
-            else:
-                # Manual microphone mode.
-                self.msleep(180)
+                return
 
-                if self._stop or self.isInterruptionRequested():
-                    return
+            # Existing manual microphone command capture.
+            self.msleep(180)
 
-                command = self.recognizer.listen(
-                    timeout=5,
-                    phrase_time_limit=20,
-                    calibrate=False,
-                )
+            if self._stop or self.isInterruptionRequested():
+                return
+
+            command = self.recognizer.listen(
+                timeout=5,
+                phrase_time_limit=20,
+                calibrate=False,
+            )
 
             if self._stop or self.isInterruptionRequested():
                 return
 
             if command:
                 command = str(command).strip()
+
                 if command and not self._command_emitted:
                     self._command_emitted = True
                     print(f"Command Ready : {command}")
                     self.command_ready.emit(command)
 
         except TypeError as error:
-            # Do not fall back to listen(retries=...) in wake mode.
-            # That legacy fallback was the source of the old
-            # "unexpected keyword argument 'retries'" integration path
-            # and could reopen the wrong microphone lifecycle.
             print(f"VoiceWorker API Error : {error}")
+
         except Exception as error:
             print(f"VoiceWorker Error : {error}")
+
         finally:
             self.finished.emit()
 
     def stop(self):
-        """Stop the worker and interrupt any active microphone operation."""
+        """Stop the existing command microphone operation."""
         self._stop = True
         self.requestInterruption()
-
-        try:
-            self.recognizer.stop_wake_word()
-        except Exception:
-            pass
 
         try:
             self.recognizer.stop_audio_meter()
@@ -395,6 +420,45 @@ class ChatWorker(QThread):
                 "Sorry, I couldn't connect to ASTRA right now."
             )
 
+
+# =====================================================
+# Vision Worker
+# =====================================================
+
+class VisionWorker(QThread):
+    """Run full screen Vision analysis outside the Qt GUI thread."""
+
+    analysis_ready = Signal(dict)
+    error_occurred = Signal(str)
+
+    def __init__(self, vision_engine):
+        super().__init__()
+        self.vision_engine = vision_engine
+
+    def run(self):
+        try:
+            if self.vision_engine is None:
+                self.error_occurred.emit(
+                    "Vision is not available right now."
+                )
+                return
+
+            analysis = self.vision_engine.analyze_screen(
+                preprocess_ocr=True
+            )
+
+            self.analysis_ready.emit(
+                analysis or {}
+            )
+
+        except Exception as error:
+            print(
+                f"Vision Worker Error : {error}"
+            )
+            self.error_occurred.emit(
+                "I could not analyze the current screen."
+            )
+
 # =====================================================
 # Main Window
 # =====================================================
@@ -433,6 +497,15 @@ class MainWindow(QMainWindow):
         self._startup_tts_request_id = None
         self._startup_unlock_watchdog = None
         self._startup_poll_timer = None
+
+        # ----------------------------------
+        # Wake-word -> command lifecycle guard
+        # ----------------------------------
+        # A DHEEPTHI detection is converted into the SAME command
+        # lifecycle used by the manual microphone. This guard prevents
+        # duplicate transitions while the wake worker is stopping and
+        # its finished signal is travelling back to the GUI thread.
+        self._wake_command_transition_active = False
 
         # Safety timeout only. Normal unlock happens from the real
         # TTS completion signal or the speaking-state fallback.
@@ -484,6 +557,14 @@ class MainWindow(QMainWindow):
         self.file_monitor = None
 
         self.gemini = None
+
+        # ----------------------------------
+        # Vision Engine
+        # ----------------------------------
+        self.vision = None
+        self.vision_worker = None
+        self.vision_processing = False
+        self._vision_speak_response = False
 
         self._backend_ready = False
         self._backend_initialization_started = False
@@ -555,6 +636,16 @@ class MainWindow(QMainWindow):
         self.wake_word_enabled = True
 
         self.wake_word_running = False
+
+        # Production DHEEPTHI detector is separate from the existing
+        # SpeechRecognizer command STT backend.
+        self.wake_word_detector = None
+        self.wake_word_model_path = (
+            PROJECT_ROOT
+            / "models"
+            / "wakeword"
+            / "dheepthi_float32.tflite"
+        )
 
         # Prevent multiple mic clicks
         self.processing_voice = False
@@ -1264,8 +1355,33 @@ class MainWindow(QMainWindow):
         self.recognizer = SpeechRecognizer()
 
         print("Vosk Speech Recognizer Created.")
-        print("Wake Engine : Vosk LOCAL / OFFLINE")
-        print("Faster-Whisper : DISABLED")
+        print("Command STT : Existing SpeechRecognizer pipeline")
+        print("Faster-Whisper wake detection : DISABLED")
+
+        # ------------------------------------------
+        # Production DHEEPTHI Wake Word
+        # ------------------------------------------
+
+        try:
+            self.wake_word_detector = WakeWordDetector(
+                model_path=self.wake_word_model_path,
+                threshold=0.000250,
+            )
+
+            print(
+                "Production WakeWordDetector created."
+            )
+
+            print(
+                f"Wake Model : {self.wake_word_model_path}"
+            )
+
+        except Exception as error:
+            self.wake_word_detector = None
+
+            print(
+                f"Production WakeWordDetector creation failed: {error}"
+            )
 
         # ------------------------------------------
         # Voice
@@ -1314,6 +1430,37 @@ class MainWindow(QMainWindow):
         )
 
         self.browser_controller = BrowserController()
+
+        # ------------------------------------------
+        # Vision Engine
+        # ------------------------------------------
+
+        try:
+
+            self.vision = VisionEngine(
+                ocr_language="eng"
+            )
+
+            print(
+                "Vision Engine Ready."
+            )
+
+            print(
+                f"Vision OCR : {self.vision.is_available()}"
+            )
+
+            print(
+                f"Vision Objects : "
+                f"{self.vision.is_object_detection_available()}"
+            )
+
+        except Exception as error:
+
+            self.vision = None
+
+            print(
+                f"Vision Engine Initialization Error : {error}"
+            )
 
         # ------------------------------------------
         # Gemini AI
@@ -3286,6 +3433,471 @@ class MainWindow(QMainWindow):
         return str(entity or "")
 
     # --------------------------------------------------
+    # --------------------------------------------------
+    # Vision Command Detection
+    # --------------------------------------------------
+
+    @staticmethod
+    def _is_vision_command(text):
+        """Detect explicit requests to describe/analyze the current screen."""
+
+        cleaned = re.sub(
+            r"\s+",
+            " ",
+            str(text or "").strip().lower()
+        )
+
+        if not cleaned:
+            return False
+
+        phrases = (
+            "what is on screen",
+            "what's on screen",
+            "what is on my screen",
+            "what's on my screen",
+            "tell me what is on screen",
+            "tell me what's on screen",
+            "describe the screen",
+            "describe screen",
+            "analyze the screen",
+            "analyze screen",
+            "analyse the screen",
+            "analyse screen",
+            "what do you see on screen",
+            "what do you see on my screen",
+            "what can you see on screen",
+            "look at the screen",
+            "look at my screen",
+            "read the screen",
+            "read my screen",
+            "screen-la enna irukku",
+            "screen la enna irukku",
+            "screen-la enna iruku",
+            "screen la enna iruku",
+            "screen la enna irukku nu sollu",
+            "screen la enna iruku nu sollu",
+        )
+
+        return any(
+            phrase in cleaned
+            for phrase in phrases
+        )
+
+    @staticmethod
+    def _format_vision_response(analysis):
+        """Build a human-readable response with object/text coordinates."""
+
+        analysis = analysis or {}
+
+        description = str(
+            analysis.get("description", "") or ""
+        ).strip()
+
+        objects = analysis.get("objects") or []
+        words = analysis.get("ocr_words") or []
+
+        parts = []
+
+        if description:
+            parts.append(description)
+        else:
+            parts.append(
+                "I could not identify any readable text or supported objects on the screen."
+            )
+
+        if objects:
+            locations = []
+
+            for obj in objects[:50]:
+                label = str(
+                    obj.get("label", "object")
+                )
+
+                confidence = float(
+                    obj.get("confidence", 0.0) or 0.0
+                )
+
+                locations.append(
+                    f"{label}: box={obj.get('box')}, "
+                    f"center={obj.get('center')}, "
+                    f"confidence={confidence:.2f}"
+                )
+
+            parts.append(
+                "Object coordinates: "
+                + "; ".join(locations)
+                + "."
+            )
+
+        if words:
+            text_locations = []
+
+            for word in words[:40]:
+                word_text = str(
+                    word.get("text", "")
+                ).strip()
+
+                if not word_text:
+                    continue
+
+                text_locations.append(
+                    f"{word_text}: box={word.get('box')}, "
+                    f"center={word.get('center')}"
+                )
+
+            if text_locations:
+                parts.append(
+                    "Text coordinates: "
+                    + "; ".join(text_locations)
+                    + "."
+                )
+
+        width = analysis.get("image_width")
+        height = analysis.get("image_height")
+
+        if width and height:
+            parts.append(
+                f"Screen size: {width} x {height} pixels."
+            )
+
+        return " ".join(parts).strip()
+
+    def _start_vision_screen_analysis(
+        self,
+        speak_response=False
+    ):
+        """Analyze the current screen in a background VisionWorker."""
+
+        if self._closing:
+            return True
+
+        if self.vision is None:
+            message = (
+                "Vision is not available. "
+                "Please check the VisionEngine setup."
+            )
+
+            try:
+                self.mic_widget.update_ai_message(message)
+            except Exception:
+                pass
+
+            try:
+                self.conversation_panel.show_error(message)
+            except Exception:
+                pass
+
+            self.status_label.setText(
+                "Status : Vision Unavailable"
+            )
+
+            if speak_response and self.tts is not None:
+                try:
+                    self.tts.speak(message)
+                    self._unlock_after_speech(
+                        restart_wake=True,
+                        terminal_avatar_state="error"
+                    )
+                except Exception:
+                    self.unlock_microphone()
+
+            return True
+
+        worker = getattr(
+            self,
+            "vision_worker",
+            None
+        )
+
+        if worker is not None:
+            try:
+                if worker.isRunning():
+                    message = "Vision is already analyzing the screen."
+
+                    try:
+                        self.mic_widget.update_ai_message(message)
+                    except Exception:
+                        pass
+
+                    return True
+
+            except RuntimeError:
+                self.vision_worker = None
+
+        self.vision_processing = True
+        self._vision_speak_response = bool(
+            speak_response
+        )
+
+        try:
+            self.status_label.setText(
+                "Status : Analyzing Screen..."
+            )
+
+            self.mic_widget.update_ai_message(
+                "Let me look at the screen..."
+            )
+
+            self.conversation_label.setText(
+                "Vision Analysis\n\n"
+                "Analyzing the current screen..."
+            )
+
+            self._set_thinking_state(
+                "Thinking",
+                avatar_state="thinking_laptop"
+            )
+
+            self._set_avatar_state(
+                "thinking_laptop"
+            )
+
+            self.left_panel.set_speaking(
+                "Silent"
+            )
+
+        except Exception:
+            pass
+
+        self.vision_worker = VisionWorker(
+            self.vision
+        )
+
+        self.vision_worker.analysis_ready.connect(
+            self._on_vision_analysis_ready
+        )
+
+        self.vision_worker.error_occurred.connect(
+            self._on_vision_analysis_error
+        )
+
+        self.vision_worker.finished.connect(
+            self._on_vision_worker_finished
+        )
+
+        print(
+            "\n========== VISION SCREEN ANALYSIS =========="
+        )
+
+        print(
+            "VisionWorker Started"
+        )
+
+        print(
+            "===========================================\n"
+        )
+
+        self.vision_worker.start()
+
+        return True
+
+    @Slot(dict)
+    def _on_vision_analysis_ready(
+        self,
+        analysis
+    ):
+        """Display completed Vision analysis on the GUI thread."""
+
+        if self._closing:
+            return
+
+        message = self._format_vision_response(
+            analysis
+        )
+
+        print(
+            "\n========== VISION RESULT =========="
+        )
+
+        print(
+            message
+        )
+
+        print(
+            "===================================\n"
+        )
+
+        try:
+            self.mic_widget.update_ai_message(
+                message
+            )
+        except Exception:
+            pass
+
+        try:
+            self.conversation_panel.show_ai_response(
+                message
+            )
+        except Exception:
+            pass
+
+        self.conversation_label.setText(
+            f"Vision Analysis\n\n{message}"
+        )
+
+        self.status_label.setText(
+            "Status : Vision Analysis Complete"
+        )
+
+        try:
+            self.right_panel.update_system_metrics()
+        except Exception:
+            pass
+
+        try:
+            self._set_thinking_state(
+                "Inactive"
+            )
+
+            self.left_panel.set_speaking(
+                "Speaking"
+                if self._vision_speak_response
+                else "Silent"
+            )
+
+        except Exception:
+            pass
+
+        if self._vision_speak_response:
+
+            self._set_avatar_state(
+                "speaking"
+            )
+
+            try:
+                self.tts.speak(
+                    message
+                )
+
+                self._unlock_after_speech(
+                    restart_wake=True,
+                    terminal_avatar_state="success"
+                )
+
+            except Exception as error:
+
+                print(
+                    f"Vision TTS Error : {error}"
+                )
+
+                self.unlock_microphone()
+
+                self._set_avatar_state(
+                    "success"
+                )
+
+        else:
+
+            self._set_avatar_state(
+                "success"
+            )
+
+    @Slot(str)
+    def _on_vision_analysis_error(
+        self,
+        message
+    ):
+        """Handle Vision analysis errors."""
+
+        if self._closing:
+            return
+
+        error_message = str(
+            message or
+            "I could not analyze the current screen."
+        )
+
+        print(
+            f"Vision Analysis Failed : {error_message}"
+        )
+
+        try:
+            self.mic_widget.update_ai_message(
+                error_message
+            )
+        except Exception:
+            pass
+
+        try:
+            self.conversation_panel.show_error(
+                error_message
+            )
+        except Exception:
+            pass
+
+        self.status_label.setText(
+            "Status : Vision Analysis Failed"
+        )
+
+        try:
+            self.conversation_label.setText(
+                f"Vision Analysis Failed\n\n"
+                f"{error_message}"
+            )
+
+            self._set_thinking_state(
+                "Inactive"
+            )
+
+            self.left_panel.set_speaking(
+                "Speaking"
+                if self._vision_speak_response
+                else "Silent"
+            )
+
+            self._set_avatar_state(
+                "error"
+            )
+
+        except Exception:
+            pass
+
+        if (
+            self._vision_speak_response
+            and self.tts is not None
+        ):
+
+            try:
+
+                self.tts.speak(
+                    error_message
+                )
+
+                self._unlock_after_speech(
+                    restart_wake=True,
+                    terminal_avatar_state="error"
+                )
+
+                return
+
+            except Exception:
+                pass
+
+        self.unlock_microphone()
+
+    @Slot()
+    def _on_vision_worker_finished(self):
+        """Release VisionWorker after Qt reports that it has finished."""
+
+        worker = getattr(
+            self,
+            "vision_worker",
+            None
+        )
+
+        if worker is not None:
+
+            try:
+
+                if worker.isRunning():
+                    return
+
+            except RuntimeError:
+                pass
+
+        self.vision_processing = False
+        self.vision_worker = None
+
     # Process Command
     # --------------------------------------------------
 
@@ -3406,6 +4018,26 @@ class MainWindow(QMainWindow):
         if not text:
 
             self.unlock_microphone()
+
+            return
+
+        # ------------------------------------------
+        # Vision Command
+        # ------------------------------------------
+        # Full screen analysis: readable text + detected objects
+        # + coordinates. Existing screenshot commands are untouched.
+        # ------------------------------------------
+
+        if self._is_vision_command(text):
+
+            self.mic_widget.show_conversation(
+                text,
+                "Looking at the screen..."
+            )
+
+            self._start_vision_screen_analysis(
+                speak_response=True
+            )
 
             return
 
@@ -6883,6 +7515,7 @@ class MainWindow(QMainWindow):
         # ---------------------------------
 
         self.manual_listening_requested = True
+        self._wake_command_transition_active = False
 
         # Lock immediately so the user cannot start another
         # microphone action while the mode is switching.
@@ -7225,7 +7858,7 @@ class MainWindow(QMainWindow):
         """
         Handle completion of both:
 
-        1. DHEEPTHI wake-word listening
+        1. Production DHEEPTHI wake-word listening
         2. Manual microphone listening
 
         IMPORTANT:
@@ -7435,6 +8068,11 @@ class MainWindow(QMainWindow):
 
             self.wake_word_running = False
 
+            # The wake listener has released the microphone. The transition
+            # guard can now be cleared because command capture is about to
+            # take ownership through the existing manual path.
+            self._wake_command_transition_active = False
+
             # ---------------------------------
             # Manual microphone has priority
             # ---------------------------------
@@ -7574,12 +8212,16 @@ class MainWindow(QMainWindow):
         # ---------------------------------
 
         if wake_word_mode:
+            # Wake mode is owned by start_wake_word_worker().
+            # Do not route production wake detection through SpeechRecognizer.
+            print(
+                "[VOICE] Wake mode request redirected to production detector."
+            )
 
-            self.current_voice_mode = "wake"
+            self.start_wake_word_worker()
+            return
 
-        else:
-
-            self.current_voice_mode = "manual"
+        self.current_voice_mode = "manual"
 
         # ---------------------------------
         # Create Worker
@@ -7588,7 +8230,7 @@ class MainWindow(QMainWindow):
         self.voice_worker = VoiceWorker(
             self.recognizer,
             self.tts,
-            wake_word_mode=wake_word_mode,
+            wake_word_mode=False,
         )
 
         # ---------------------------------
@@ -7722,9 +8364,159 @@ class MainWindow(QMainWindow):
 
             pass
 
-        self.start_voice_worker(
-            wake_word_mode=True
+        # Production detector owns the wake-word microphone.
+        self.voice_worker = WakeWordWorker(
+            self.wake_word_detector
         )
+
+        self.voice_worker.wake_detected.connect(
+            self._on_wake_word_detected
+        )
+
+        self.voice_worker.audio_level.connect(
+            self.update_audio_wave
+        )
+
+        self.voice_worker.finished.connect(
+            self.listening_finished
+        )
+
+        self.voice_worker.start()
+
+        self.wake_word_running = True
+
+        print(
+            "DHEEPTHI production wake listener started."
+        )
+
+    # --------------------------------------------------
+    # Production DHEEPTHI Detection Callback
+    # --------------------------------------------------
+
+    @Slot(str)
+    def _on_wake_word_detected(
+        self,
+        wake_word,
+    ):
+        """Convert DHEEPTHI detection into the existing manual command flow.
+
+        Production wake-word recognition stays completely inside
+        ``WakeWordDetector``. Once it confirms DHEEPTHI, MainWindow only
+        performs the hand-off: stop the wake listener, show the existing
+        LISTENING avatar/state, say ``Listening``, and then start the exact
+        same command STT worker used by the manual microphone button.
+
+        This method intentionally does NOT add a second STT path and does
+        NOT send the wake-word text into the command dispatcher.
+        """
+
+        if self._closing:
+            return
+
+        if not self.wake_word_enabled:
+            return
+
+        if self.processing_voice:
+            return
+
+        if self.manual_listening_requested:
+            return
+
+        # The detector already guarantees one callback per detection.
+        # The additional GUI-side guard protects against a race between
+        # the detector callback, the worker shutdown signal, and queued
+        # Qt events.
+        if self._wake_command_transition_active:
+            return
+
+        normalized = (
+            str(wake_word or "")
+            .strip()
+            .lower()
+        )
+
+        if normalized and "dheepthi" not in normalized:
+            return
+
+        self._wake_command_transition_active = True
+
+        print(
+            "\n⚡ DHEEPTHI confirmed by production detector."
+        )
+        print(
+            "[WAKE -> COMMAND] Handing control to the existing manual STT lifecycle."
+        )
+
+        # --------------------------------------------------
+        # Reuse the EXACT manual microphone lifecycle
+        # --------------------------------------------------
+        # This flag is consumed by listening_finished(). When the wake
+        # worker releases the microphone, listening_finished() calls
+        # _begin_manual_listening_prompt(), which says "Listening" and then
+        # starts the normal VoiceWorker command capture.
+        self.manual_listening_requested = True
+        self.lock_microphone()
+
+        # Immediate UI transition: identical to a manual mic click.
+        self.status_label.setText(
+            "Status : Listening..."
+        )
+
+        self._set_avatar_state(
+            "listening"
+        )
+
+        try:
+            self.mic_widget.show_listening()
+            self.mic_widget.set_listening(False)
+
+            self.left_panel.set_listening(
+                "Listening"
+            )
+
+            self._set_thinking_state(
+                "Inactive"
+            )
+
+            self.left_panel.set_speaking(
+                "Silent"
+            )
+
+            QApplication.processEvents()
+
+        except Exception as error:
+            print(
+                f"Wake listening UI state error: {error}"
+            )
+
+        # --------------------------------------------------
+        # Release wake-word microphone before TTS/STT
+        # --------------------------------------------------
+        # Never run command STT while the production wake detector still
+        # owns the sounddevice stream. This also prevents the following
+        # "Listening" TTS from being captured by the wake detector.
+        wake_worker = self.voice_worker
+
+        if wake_worker is not None:
+            try:
+                if wake_worker.isRunning():
+                    print(
+                        "Stopping production DHEEPTHI listener "
+                        "before command capture..."
+                    )
+                    wake_worker.stop()
+                    return
+            except Exception as error:
+                print(
+                    f"Wake worker state error: {error}"
+                )
+
+        # Worker already finished: continue through the same manual prompt.
+        QTimer.singleShot(
+            0,
+            self._begin_manual_listening_prompt
+        )
+
 
     # --------------------------------------------------
     # Audio Wave Update
@@ -11184,6 +11976,7 @@ class MainWindow(QMainWindow):
         # ----------------------------------------------
 
         self.manual_listening_requested = False
+        self._wake_command_transition_active = False
         self.wake_word_enabled = False
         self.wake_word_running = False
         self.processing_voice = False
@@ -11535,6 +12328,99 @@ class MainWindow(QMainWindow):
                 )
 
         # ==================================================
+        # ==================================================
+        # VISION WORKER
+        # ==================================================
+
+        vision_worker = getattr(
+            self,
+            "vision_worker",
+            None
+        )
+
+        if vision_worker is not None:
+
+            try:
+
+                if vision_worker.isRunning():
+
+                    print(
+                        "Stopping VisionWorker..."
+                    )
+
+                    if vision_worker.wait(250):
+
+                        print(
+                            "VisionWorker stopped successfully."
+                        )
+
+                        self.vision_worker = None
+
+                    else:
+
+                        print(
+                            "VisionWorker is still finishing."
+                        )
+
+                        try:
+                            vision_worker.finished.connect(
+                                self._on_vision_worker_shutdown_finished,
+                                Qt.QueuedConnection
+                            )
+                        except (TypeError, RuntimeError):
+
+                            try:
+                                vision_worker.finished.connect(
+                                    self._on_vision_worker_shutdown_finished
+                                )
+                            except Exception:
+                                pass
+
+                        event.ignore()
+                        return
+
+                else:
+
+                    self.vision_worker = None
+
+            except Exception as error:
+
+                print(
+                    f"VisionWorker Cleanup Error : {error}"
+                )
+
+        # ==================================================
+        # VISION ENGINE
+        # ==================================================
+
+        try:
+
+            vision = getattr(
+                self,
+                "vision",
+                None
+            )
+
+            if vision is not None:
+
+                print(
+                    "Closing VisionEngine..."
+                )
+
+                vision.close()
+
+                self.vision = None
+
+                print(
+                    "VisionEngine closed successfully."
+                )
+
+        except Exception as error:
+
+            print(
+                f"VisionEngine Cleanup Error : {error}"
+            )
+
         # INITIALIZATION WORKER
         # ==================================================
 
@@ -11611,6 +12497,37 @@ class MainWindow(QMainWindow):
 
                 print(
                     f"File Monitor Cleanup Error : {error}"
+                )
+
+        # ==================================================
+        # PRODUCTION DHEEPTHI WAKE DETECTOR
+        # ==================================================
+
+        wake_detector = getattr(
+            self,
+            "wake_word_detector",
+            None
+        )
+
+        if wake_detector is not None:
+
+            try:
+                print(
+                    "Closing production DHEEPTHI wake detector..."
+                )
+
+                wake_detector.close()
+
+                self.wake_word_detector = None
+
+                print(
+                    "Production DHEEPTHI wake detector closed."
+                )
+
+            except Exception as error:
+
+                print(
+                    f"Wake detector cleanup error: {error}"
                 )
 
         # ==================================================
@@ -11701,6 +12618,50 @@ class MainWindow(QMainWindow):
         )
 
     # ==================================================
+    # ==================================================
+    # VISION WORKER SHUTDOWN CONTINUATION
+    # ==================================================
+
+    def _on_vision_worker_shutdown_finished(
+        self
+    ):
+        """Continue shutdown after VisionWorker has fully finished."""
+
+        if not getattr(
+            self,
+            "_shutdown_finalizing",
+            False
+        ):
+            return
+
+        worker = getattr(
+            self,
+            "vision_worker",
+            None
+        )
+
+        if worker is not None:
+
+            try:
+
+                if worker.isRunning():
+                    return
+
+            except RuntimeError:
+                pass
+
+        self.vision_worker = None
+
+        print(
+            "VisionWorker stopped asynchronously; "
+            "continuing final shutdown."
+        )
+
+        QTimer.singleShot(
+            0,
+            self.close
+        )
+
     # VOICE WORKER SHUTDOWN CONTINUATION
     # ==================================================
 

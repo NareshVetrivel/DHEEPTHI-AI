@@ -1,823 +1,652 @@
 """
-tests/test_wake_word.py
-
 ASTRA-AI
 ========
 
-CONTINUOUS LIVE WAKE WORD DATA COLLECTION TEST
-----------------------------------------------
+Production Wake Word Test
+-------------------------
 
-Purpose
--------
-Test voice/wake_word.py independently before integrating
-wake-word detection into main_window.py.
+Purpose:
+    Test the ACTUAL production WakeWordDetector from
+    wake_word.py using the real microphone.
 
-This test intentionally runs continuously.
+No:
+    - STT
+    - PyAutoGUI
+    - Model comparison
 
-The microphone remains available until the user presses
-Ctrl+C.
-
-Every time DHEEPTHI is detected:
-
-    detection
-        ↓
-    print captured text
-        ↓
-    re-arm detector
-        ↓
-    continue listening
-
-Therefore one detection does NOT terminate this test.
-
-IMPORTANT
----------
-main_window.py is NOT loaded.
-
-Groq is NOT loaded.
-
-Faster-Whisper is NOT loaded.
-
-This file is ONLY for testing Vosk wake-word matching
-and collecting real recognition behaviour.
-
-Run from project root:
-
-    python -m tests.test_wake_word
-
-Stop:
-
-    Ctrl+C
-
-
-DATA COLLECTION
----------------
-
-Try both positive and negative phrases.
-
-POSITIVE:
-    Dheepthi
-    Deepthi
-    Deepti
-    Deepthy
-    Deeptee
-    Dhepti
-    Dhepthi
-    Dheethi
-    Dhethi
-
-    Deep thi
-    Deep tea
-    Deep thee
-    Deep tee
-    Deep ti
-
-    Dheep thi
-    Dheep tea
-    Dheep thee
-    Dheep tee
-    Dheep ti
-
-    Deep deep
-    Deep thee
-    Deep the
-    Thee the
-    The the
-
-    Hey Dheepthi
-    Hello Dheepthi
-    Hi Dheepthi
-
-NEGATIVE / FALSE-DETECTION TESTS:
-    Deep sleep
-    Deep water
-    Deep voice
-    Deep breath
-    Deep thought
-    Deep thoughts
-    Sleep deeply
-    Hello
-    Hi
-    Hey
-    Good morning
-    How are you
-    Deep
-    A deep
-    My lord
-    Added day
-    The
-    The the
-
-IMPORTANT
----------
-Do NOT intentionally pronounce the wake word unnaturally.
-
-Speak normally.
-
-The purpose is to discover what Vosk actually captures.
+Test:
+    - Production model loading
+    - Microphone capture
+    - TFLite inference
+    - Wake-word detection
+    - Callback
+    - Cooldown / re-arm
 """
-
 
 from __future__ import annotations
 
-import signal
 import sys
-import threading
 import time
+from pathlib import Path
+
+
+# ----------------------------------------------------------------------
+# PROJECT ROOT
+# ----------------------------------------------------------------------
+
+PROJECT_ROOT = Path(__file__).resolve().parents[1]
+
+if str(PROJECT_ROOT) not in sys.path:
+    sys.path.insert(0, str(PROJECT_ROOT))
+
+
+# ----------------------------------------------------------------------
+# IMPORT ACTUAL PRODUCTION DETECTOR
+# ----------------------------------------------------------------------
 
 from voice.wake_word import WakeWordDetector
 
 
-# ==========================================================
-# TEST STATE
-# ==========================================================
+# ----------------------------------------------------------------------
+# CONFIGURATION
+# ----------------------------------------------------------------------
 
-running = True
+WAKE_WORD = "dheepthi"
 
-detector: WakeWordDetector | None = None
+TEST_DURATION_SECONDS = 30.0
+
+# Use the SAME production threshold from wake_word.py.
+THRESHOLD = WakeWordDetector.DEFAULT_THRESHOLD
+
+
+# ----------------------------------------------------------------------
+# MODEL PATH
+# ----------------------------------------------------------------------
+
+MODEL_PATH = (
+    PROJECT_ROOT
+    / "models"
+    / "wakeword"
+    / "dheepthi_float32.tflite"
+)
+
+
+# ----------------------------------------------------------------------
+# CALLBACK
+# ----------------------------------------------------------------------
 
 detection_count = 0
 
-detection_lock = threading.Lock()
 
-
-# ==========================================================
-# Ctrl+C Handler
-# ==========================================================
-
-def handle_shutdown(signum, frame):
-    """
-    Stop the continuous test.
-
-    Ctrl+C is the ONLY normal way to end the test.
-    """
-
-    global running
-
-    if not running:
-        return
-
-    print(
-        "\n\n"
-        "============================================================"
-    )
-
-    print(
-        "Ctrl+C received."
-    )
-
-    print(
-        "Stopping continuous wake-word test..."
-    )
-
-    print(
-        "============================================================"
-    )
-
-    running = False
-
-    current_detector = detector
-
-    if current_detector is not None:
-
-        try:
-            current_detector.stop()
-
-        except Exception:
-            pass
-
-
-# ==========================================================
-# Detection Callback
-# ==========================================================
-
-def on_detected(text: str = ""):
-    """
-    Called whenever the detector recognizes DHEEPTHI.
-
-    IMPORTANT
-    ---------
-    Detection does NOT end the test.
-
-    The detector stops its current wake session after
-    detection by design.
-
-    We immediately re-arm it so the next utterance can
-    also be tested.
-    """
-
-    global detection_count
-    global running
-    global detector
-
-    with detection_lock:
-
-        detection_count += 1
-
-        current_count = detection_count
-
-    print(
-        "\n"
-        "============================================================"
-    )
-
-    print(
-        f"WAKE DETECTION #{current_count}"
-    )
-
-    print(
-        "============================================================"
-    )
-
-    print(
-        f"Captured text : {text}"
-    )
-
-    print(
-        "Result        : MATCH / ACTIVATED"
-    )
-
-    print(
-        "------------------------------------------------------------"
-    )
-
-    if not running:
-        return
-
-    current_detector = detector
-
-    if current_detector is None:
-        return
-
-    # ------------------------------------------------------
-    # Small delay.
-    #
-    # The previous microphone stream must completely close
-    # before a fresh stream is opened.
-    # ------------------------------------------------------
-
-    time.sleep(0.10)
-
-    if not running:
-        return
-
-    try:
-
-        success = current_detector.start()
-
-        if success:
-
-            print(
-                "🔄 Wake detector re-armed."
-            )
-
-            print(
-                "🎤 Listening for next wake phrase..."
-            )
-
-        else:
-
-            print(
-                "⚠️ Failed to re-arm wake detector."
-            )
-
-    except Exception as error:
-
-        print(
-            "Wake detector re-arm error:"
-        )
-
-        print(
-            f"    {type(error).__name__}: {error}"
-        )
-
-
-# ==========================================================
-# Audio Level Callback
-# ==========================================================
-
-def on_level(level: float):
-    """
-    Receive microphone audio level.
-
-    We intentionally do not print every level because
-    doing so would flood the terminal.
-
-    The callback is still installed so the test also
-    verifies that audio-level processing remains active.
-    """
-
-    pass
-
-
-# ==========================================================
-# Print Dataset Test Cases
-# ==========================================================
-
-def print_dataset_cases():
-    """
-    Print positive and negative test phrases.
-
-    These are NOT automatically fed to Vosk.
-
-    They are examples for the user to speak naturally
-    during the live microphone test.
-    """
-
-    print(
-        "\n"
-        "============================================================"
-    )
-
-    print(
-        "POSITIVE / WAKE-WORD TEST CASES"
-    )
-
-    print(
-        "============================================================"
-    )
-
-    positive_cases = (
-        "Dheepthi",
-        "Deepthi",
-        "Deepti",
-        "Deepthy",
-        "Deeptee",
-        "Dhepti",
-        "Dhepthi",
-        "Dheethi",
-        "Dhethi",
-        "Deep thi",
-        "Deep tea",
-        "Deep thee",
-        "Deep tee",
-        "Deep ti",
-        "Dheep thi",
-        "Dheep tea",
-        "Dheep thee",
-        "Dheep tee",
-        "Dheep ti",
-        "Deep deep",
-        "Deep deep thi",
-        "Deep deep tea",
-        "Deep deep thee",
-        "Deep thee",
-        "Deep the",
-        "Thee the",
-        "The the",
-        "Hey Dheepthi",
-        "Hello Dheepthi",
-        "Hi Dheepthi",
-    )
-
-    for phrase in positive_cases:
-
-        print(
-            f"    + {phrase}"
-        )
-
-    print(
-        "\n"
-        "============================================================"
-    )
-
-    print(
-        "NEGATIVE / FALSE-DETECTION TEST CASES"
-    )
-
-    print(
-        "============================================================"
-    )
-
-    negative_cases = (
-        "Deep sleep",
-        "Sleep deeply",
-        "Deep water",
-        "Deep voice",
-        "Deep breath",
-        "Deep breathing",
-        "Deep thought",
-        "Deep thoughts",
-        "Hello",
-        "Hi",
-        "Hey",
-        "Good morning",
-        "How are you",
-        "Deep",
-        "A deep",
-        "My lord",
-        "Added day",
-        "The",
-        "The the",
-    )
-
-    for phrase in negative_cases:
-
-        print(
-            f"    - {phrase}"
-        )
-
-
-# ==========================================================
-# Main
-# ==========================================================
-
-def main():
-    """
-    Start continuous live Vosk testing.
-
-    The function does NOT finish after a wake detection.
-
-    It remains alive until Ctrl+C.
-    """
-
-    global detector
-    global running
+def on_wake_detected(word: str) -> None:
     global detection_count
 
-    # ------------------------------------------------------
-    # Reset state.
-    # ------------------------------------------------------
+    detection_count += 1
 
-    running = True
-    detection_count = 0
+    print()
+    print("=" * 70)
+    print("⚡ DHEEPTHI DETECTED")
+    print("=" * 70)
+    print(f"Wake Word : {word}")
+    print(f"Detection : #{detection_count}")
+    print("=" * 70)
+    print()
 
-    # ------------------------------------------------------
-    # Install Ctrl+C handler.
-    # ------------------------------------------------------
 
-    signal.signal(
-        signal.SIGINT,
-        handle_shutdown,
-    )
+# ----------------------------------------------------------------------
+# MAIN TEST
+# ----------------------------------------------------------------------
 
-    if hasattr(signal, "SIGTERM"):
+def main() -> int:
 
-        signal.signal(
-            signal.SIGTERM,
-            handle_shutdown,
-        )
-
-    # ======================================================
-    # Header
-    # ======================================================
-
+    print()
+    print("=" * 80)
+    print(" ASTRA-AI :: PRODUCTION WAKE WORD TEST")
+    print("=" * 80)
+    print()
+    print(f"Wake Word       : {WAKE_WORD}")
+    print(f"Duration        : {TEST_DURATION_SECONDS:.1f} seconds")
+    print("Detector        : ACTUAL production WakeWordDetector")
     print(
-        "\n"
-        "============================================================"
+        f"Threshold       : {THRESHOLD:.6f} "
+        f"(from production wake_word.py)"
     )
+    print("STT             : Disabled")
+    print("PyAutoGUI       : Disabled")
+    print()
 
-    print(
-        "        ASTRA-AI CONTINUOUS WAKE WORD TEST"
-    )
+    print("-" * 80)
+    print("Creating production WakeWordDetector...")
+    print("-" * 80)
+    print()
 
-    print(
-        "============================================================"
-    )
+    # --------------------------------------------------------------
+    # Validate model path BEFORE creating detector.
+    # --------------------------------------------------------------
 
-    print(
-        "\n"
-        "main_window.py : NOT LOADED"
-    )
+    if not MODEL_PATH.exists():
 
-    print(
-        "Groq           : NOT LOADED"
-    )
-
-    print(
-        "Faster-Whisper : NOT LOADED"
-    )
-
-    print(
-        "Wake Engine    : Vosk"
-    )
-
-    print(
-        "Mode           : LOCAL / OFFLINE"
-    )
-
-    print(
-        "Test Mode      : CONTINUOUS"
-    )
-
-    print(
-        "\nWake Word:"
-    )
-
-    print(
-        "    DHEEPTHI"
-    )
-
-    # ======================================================
-    # Dataset examples
-    # ======================================================
-
-    print_dataset_cases()
-
-    # ======================================================
-    # Instructions
-    # ======================================================
-
-    print(
-        "\n"
-        "============================================================"
-    )
-
-    print(
-        "LIVE TEST INSTRUCTIONS"
-    )
-
-    print(
-        "============================================================"
-    )
-
-    print(
-        "\nSpeak naturally."
-    )
-
-    print(
-        "Do NOT force the pronunciation."
-    )
-
-    print(
-        "\nFor every phrase Vosk recognizes, watch:"
-    )
-
-    print(
-        "    Wake Partial : ..."
-    )
-
-    print(
-        "    Wake STT     : ..."
-    )
-
-    print(
-        "\nIf the wake matcher accepts a phrase:"
-    )
-
-    print(
-        "    WAKE DETECTION #N"
-    )
-
-    print(
-        "    Captured text : ..."
-    )
-
-    print(
-        "\nAfter detection the microphone will automatically"
-    )
-
-    print(
-        "re-arm and continue listening."
-    )
-
-    print(
-        "\nThe test stops ONLY with:"
-    )
-
-    print(
-        "    Ctrl+C"
-    )
-
-    print(
-        "============================================================\n"
-    )
-
-    # ======================================================
-    # Create Detector
-    # ======================================================
-
-    detector = WakeWordDetector(
-        on_detected=on_detected,
-        level_callback=on_level,
-    )
-
-    # ======================================================
-    # Load Model
-    # ======================================================
-
-    print(
-        "Loading Vosk model..."
-    )
-
-    if not detector.load_model():
-
-        print(
-            "\n"
-            "============================================================"
-        )
-
-        print(
-            "ERROR"
-        )
-
-        print(
-            "============================================================"
-        )
-
-        print(
-            "Vosk model could not be loaded."
-        )
-
-        print(
-            "Check the model path."
-        )
-
-        print(
-            "============================================================"
-        )
-
-        detector = None
+        print("❌ Model file not found.")
+        print()
+        print("Expected path:")
+        print(f"  {MODEL_PATH}")
+        print()
 
         return 1
 
-    print(
-        "\nVosk model loaded successfully."
-    )
+    if not MODEL_PATH.is_file():
 
-    # ======================================================
-    # Start Background Detector
-    # ======================================================
+        print("❌ Model path is not a file.")
+        print()
+        print("Path:")
+        print(f"  {MODEL_PATH}")
+        print()
 
-    print(
-        "\n"
-        "============================================================"
-    )
+        return 1
 
-    print(
-        "STARTING CONTINUOUS MICROPHONE LISTENER"
-    )
+    print("✅ Model file found.")
+    print()
 
-    print(
-        "============================================================"
-    )
+    # --------------------------------------------------------------
+    # CREATE PRODUCTION DETECTOR
+    # --------------------------------------------------------------
 
     try:
 
-        if not detector.start():
+        detector = WakeWordDetector(
+            model_path=MODEL_PATH,
+            threshold=THRESHOLD,
+            on_detected=on_wake_detected,
+        )
 
-            print(
-                "\nERROR:"
-            )
+    except Exception as error:
 
+        print()
+        print("❌ Failed to create WakeWordDetector.")
+        print(f"Error: {error}")
+        print()
+
+        return 1
+
+    print("✅ Production WakeWordDetector created.")
+    print()
+
+    # --------------------------------------------------------------
+    # LOAD MODEL
+    # --------------------------------------------------------------
+
+    print("-" * 80)
+    print("Loading production wake-word model...")
+    print("-" * 80)
+    print()
+
+    try:
+
+        if not detector.load_model():
+
+            print()
             print(
-                "Could not start wake-word detector."
+                "❌ Production wake-word "
+                "model loading failed."
             )
+            print()
+
+            try:
+                detector.close()
+            except Exception:
+                pass
 
             return 1
 
     except Exception as error:
 
-        print(
-            "\n"
-            "Wake detector start error:"
-        )
+        print()
+        print("❌ Exception while loading model.")
+        print(f"Error: {error}")
+        print()
 
-        print(
-            f"{type(error).__name__}: {error}"
-        )
+        try:
+            detector.close()
+        except Exception:
+            pass
 
         return 1
 
-    print(
-        "\n🎤 MICROPHONE ACTIVE"
-    )
+    print()
+    print("✅ Production model loaded.")
+    print()
 
-    print(
-        "🎧 Vosk listening continuously"
-    )
+    # --------------------------------------------------------------
+    # START DETECTOR
+    # --------------------------------------------------------------
 
-    print(
-        "🗣️ Speak naturally"
-    )
-
-    print(
-        "🔄 Detection will automatically re-arm"
-    )
-
-    print(
-        "🛑 Press Ctrl+C to stop"
-    )
-
-    print(
-        "\n"
-        "------------------------------------------------------------"
-    )
-
-    # ======================================================
-    # CONTINUOUS WAIT LOOP
-    # ======================================================
-    #
-    # IMPORTANT:
-    #
-    # Do NOT use:
-    #
-    #     while detector.is_running():
-    #
-    # because detector.is_running() becomes False
-    # immediately after one wake detection.
-    #
-    # We intentionally keep OUR OWN test loop alive.
-    #
-    # The detector is re-armed by on_detected().
-    #
-    # ======================================================
+    print("-" * 80)
+    print("Starting production wake-word detector...")
+    print("-" * 80)
+    print()
 
     try:
 
-        while running:
+        if not detector.start():
 
-            time.sleep(0.20)
+            print()
+            print(
+                "❌ Failed to start "
+                "production detector."
+            )
+            print()
+
+            try:
+                detector.close()
+            except Exception:
+                pass
+
+            return 1
+
+    except Exception as error:
+
+        print()
+        print("❌ Exception while starting detector.")
+        print(f"Error: {error}")
+        print()
+
+        try:
+            detector.close()
+        except Exception:
+            pass
+
+        return 1
+
+    print()
+    print("✅ PRODUCTION DETECTOR STARTED")
+    print()
+    print("🎤 Microphone is active.")
+    print("🧠 TFLite FP32 inference is active.")
+    print()
+    print("IMPORTANT:")
+    print()
+    print("First, remain SILENT.")
+    print("The detector should NOT detect anything.")
+    print()
+    print("Then say:")
+    print()
+    print("    DHEEPTHI")
+    print()
+    print("multiple times.")
+    print()
+    print("Waiting for detection...")
+    print()
+
+    # --------------------------------------------------------------
+    # MONITOR
+    # --------------------------------------------------------------
+
+    start_time = time.monotonic()
+
+    last_print_time = 0.0
+
+    # Keep final diagnostics BEFORE detector.close().
+    final_diagnostics = {}
+
+    try:
+
+        while (
+            time.monotonic() - start_time
+            < TEST_DURATION_SECONDS
+        ):
+
+            now = time.monotonic()
+
+            # ------------------------------------------------------
+            # Print diagnostics approximately every 250 ms.
+            # ------------------------------------------------------
+
+            if now - last_print_time >= 0.25:
+
+                last_print_time = now
+
+                diagnostics = (
+                    detector.get_diagnostics()
+                )
+
+                audio_level = diagnostics.get(
+                    "audio_level",
+                    0.0,
+                )
+
+                wake_score = diagnostics.get(
+                    "wake_score",
+                    0.0,
+                )
+
+                peak_score = diagnostics.get(
+                    "peak_wake_score",
+                    0.0,
+                )
+
+                audio_blocks = diagnostics.get(
+                    "audio_blocks_received",
+                    0,
+                )
+
+                inference_count = diagnostics.get(
+                    "inference_count",
+                    0,
+                )
+
+                inference_errors = diagnostics.get(
+                    "inference_errors",
+                    0,
+                )
+
+                consecutive = diagnostics.get(
+                    "consecutive_positive",
+                    0,
+                )
+
+                print(
+                    f"Audio={audio_level:.3f} | "
+                    f"Wake={wake_score:.6f} | "
+                    f"Peak={peak_score:.6f} | "
+                    f"Threshold={THRESHOLD:.6f} | "
+                    f"RX={audio_blocks} | "
+                    f"INF={inference_count} | "
+                    f"ERR={inference_errors} | "
+                    f"Consecutive={consecutive}",
+                    flush=True,
+                )
+
+            time.sleep(0.01)
 
     except KeyboardInterrupt:
 
-        handle_shutdown(
-            signal.SIGINT,
-            None,
-        )
+        print()
+        print()
+        print("⚠️ Test interrupted by user.")
 
     finally:
 
-        print(
-            "\n"
-            "============================================================"
-        )
+        # ----------------------------------------------------------
+        # IMPORTANT:
+        #
+        # Capture diagnostics BEFORE stop()/close().
+        #
+        # close() clears the model:
+        #     _model = None
+        #     _model_loaded = False
+        #
+        # Therefore diagnostics must be captured first.
+        # ----------------------------------------------------------
+
+        try:
+
+            final_diagnostics = (
+                detector.get_diagnostics()
+            )
+
+        except Exception as error:
+
+            print(
+                f"⚠️ Final diagnostics warning: "
+                f"{error}"
+            )
+
+            final_diagnostics = {}
+
+        print()
+        print("-" * 80)
+        print("Stopping detector...")
+        print("-" * 80)
+        print()
+
+        try:
+
+            detector.stop()
+
+        except Exception as error:
+
+            print(
+                f"⚠️ Detector stop warning: "
+                f"{error}"
+            )
+
+        print()
+        print("-" * 80)
+        print("Closing detector...")
+        print("-" * 80)
+        print()
+
+        try:
+
+            detector.close()
+
+        except Exception as error:
+
+            print(
+                f"⚠️ Detector close warning: "
+                f"{error}"
+            )
+
+    # --------------------------------------------------------------
+    # FINAL DIAGNOSTICS
+    # --------------------------------------------------------------
+
+    diagnostics = final_diagnostics
+
+    model_loaded = diagnostics.get(
+        "model_loaded",
+        False,
+    )
+
+    model_type = diagnostics.get(
+        "model_type",
+        "unknown",
+    )
+
+    model_path = diagnostics.get(
+        "model_path",
+        str(MODEL_PATH),
+    )
+
+    framework = diagnostics.get(
+        "inference_framework",
+        "unknown",
+    )
+
+    audio_blocks = diagnostics.get(
+        "audio_blocks_received",
+        0,
+    )
+
+    inference_count = diagnostics.get(
+        "inference_count",
+        0,
+    )
+
+    inference_errors = diagnostics.get(
+        "inference_errors",
+        0,
+    )
+
+    peak_score = diagnostics.get(
+        "peak_wake_score",
+        0.0,
+    )
+
+    last_score = diagnostics.get(
+        "wake_score",
+        0.0,
+    )
+
+    release_threshold = diagnostics.get(
+        "release_threshold",
+        WakeWordDetector.RELEASE_THRESHOLD,
+    )
+
+    detection_count_final = detection_count
+
+    # --------------------------------------------------------------
+    # RESULT
+    # --------------------------------------------------------------
+
+    print()
+    print("=" * 80)
+    print(" FINAL RESULT")
+    print("=" * 80)
+    print()
+
+    print(
+        f"Model Loaded       : "
+        f"{model_loaded}"
+    )
+
+    print(
+        f"Model Type         : "
+        f"{model_type}"
+    )
+
+    print(
+        f"Model Path         : "
+        f"{model_path}"
+    )
+
+    print(
+        f"Framework          : "
+        f"{framework}"
+    )
+
+    print()
+
+    print(
+        f"Audio Blocks       : "
+        f"{audio_blocks}"
+    )
+
+    print(
+        f"Inferences         : "
+        f"{inference_count}"
+    )
+
+    print(
+        f"Inference Errors   : "
+        f"{inference_errors}"
+    )
+
+    print()
+
+    print(
+        f"Peak Wake Score    : "
+        f"{peak_score:.6f}"
+    )
+
+    print(
+        f"Last Wake Score    : "
+        f"{last_score:.6f}"
+    )
+
+    print(
+        f"Threshold          : "
+        f"{THRESHOLD:.6f}"
+    )
+
+    print(
+        f"Release Threshold  : "
+        f"{release_threshold:.6f}"
+    )
+
+    print()
+
+    print(
+        f"DHEEPTHI Detection : "
+        f"{detection_count_final}"
+    )
+
+    print()
+
+    print("=" * 80)
+    print("VERDICT")
+    print("-" * 80)
+    print()
+
+    # --------------------------------------------------------------
+    # SUCCESS
+    # --------------------------------------------------------------
+
+    if (
+        model_loaded
+        and inference_count > 0
+        and inference_errors == 0
+        and detection_count_final > 0
+    ):
+
+        print("✅ WAKE WORD SYSTEM WORKING")
+        print()
 
         print(
-            "FINAL CLEANUP"
+            "Production wake_word.py successfully:"
         )
+
+        print("  ✓ Loaded TFLite model")
+        print("  ✓ Captured microphone audio")
+        print("  ✓ Ran inference")
+        print("  ✓ Applied audio/VAD gate")
+        print("  ✓ Applied wake threshold")
+        print("  ✓ Confirmed DHEEPTHI")
+        print("  ✓ Triggered callback")
+        print("  ✓ Kept microphone active")
+        print()
 
         print(
-            "============================================================"
+            "Next step: "
+            "integrate into main_window.py."
         )
 
-        current_detector = detector
+        return 0
 
-        if current_detector is not None:
+    # --------------------------------------------------------------
+    # FAILURE
+    # --------------------------------------------------------------
 
-            try:
+    print(
+        "❌ WAKE WORD SYSTEM TEST FAILED"
+    )
 
-                current_detector.stop()
+    print()
 
-            except Exception as error:
-
-                print(
-                    f"Detector stop error: {error}"
-                )
-
-            try:
-
-                current_detector.close()
-
-            except Exception as error:
-
-                print(
-                    f"Detector close error: {error}"
-                )
+    if not model_loaded:
 
         print(
-            "\n"
-            "============================================================"
+            "  ✗ Model was not loaded."
         )
+
+    if inference_count == 0:
 
         print(
-            "WAKE WORD TEST FINISHED"
+            "  ✗ No inference was performed."
         )
+
+    if inference_errors > 0:
 
         print(
-            "============================================================"
+            f"  ✗ Inference errors: "
+            f"{inference_errors}"
         )
+
+    if detection_count_final == 0:
 
         print(
-            f"Total wake detections : {detection_count}"
+            "  ✗ DHEEPTHI was not detected "
+            "during the test."
         )
 
-        print(
-            "\n"
-            "Use the captured Vosk text above to improve"
-        )
+    print()
 
-        print(
-            "the DHEEPTHI matching dataset."
-        )
-
-        print(
-            "\n"
-            "main_window.py was NOT modified."
-        )
-
-        print(
-            "============================================================\n"
-        )
-
-    return 0
+    return 1
 
 
-# ==========================================================
-# Entry Point
-# ==========================================================
+# ----------------------------------------------------------------------
+# ENTRY POINT
+# ----------------------------------------------------------------------
 
 if __name__ == "__main__":
-
-    sys.exit(
-        main()
-    )
+    raise SystemExit(main())
