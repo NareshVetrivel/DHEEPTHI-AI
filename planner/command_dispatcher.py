@@ -6,8 +6,13 @@ to the appropriate controller.
 """
 
 from pathlib import Path
+import re
+import shutil
+import subprocess
+import sys
 
 from ai.gemini_client import GeminiClient
+from code_agent.agent import CodeAgent
 from automation.screen_recorder import ScreenRecorder
 from automation.file_system_agent import FileSystemAgent
 from ff_agent import FileFolderAgent
@@ -63,6 +68,19 @@ class CommandDispatcher:
         self.whisper = whisper
 
         self.gemini = gemini_client
+
+        # --------------------------------------------------
+        # DHEEPTHI Code Agent V1
+        # --------------------------------------------------
+        # The dispatcher owns the end-to-end coding workflow while
+        # CodeAgent remains responsible for cloud generation and
+        # source-file management.
+        self.code_agent = CodeAgent()
+
+        # Maximum automatic compile/rewrite attempts.
+        # Attempt 1 = original generation, attempts 2-3 = automatic
+        # regeneration using the compiler error as correction context.
+        self.code_agent_max_attempts = 3
 
         # --------------------------------------------------
         # Microsoft Word V1 Agent
@@ -2078,6 +2096,496 @@ class CommandDispatcher:
             metadata,
         )
 
+    # ==================================================
+    # DHEEPTHI CODE AGENT V1
+    # ==================================================
+
+    @staticmethod
+    def _looks_like_code_command(command, intent=None):
+        """Return True only for an explicit programming request."""
+
+        text = str(command or "").strip().lower()
+        if not text:
+            return False
+
+        if intent in {
+            # Explicit Code Agent intents.  ``code_agent`` is the
+            # canonical V1 intent emitted by MainWindow/IntentDetector.
+            "code_agent",
+            "code_generation",
+            "generate_code",
+            "write_code",
+            "create_code",
+            "create_program",
+            "coding",
+            "programming",
+        }:
+            return True
+
+        language = re.search(r"\b(python|py|java)\b", text)
+        if not language:
+            return False
+
+        action_patterns = (
+            r"\bwrite\b",
+            r"\bcreate\b",
+            r"\bgenerate\b",
+            r"\bbuild\b",
+            r"\bdevelop\b",
+            r"\bprogram\b",
+            r"\bcode\b",
+            r"\bimplement\b",
+            r"\bmake\b.*\bprogram\b",
+        )
+
+        return any(
+            re.search(pattern, text)
+            for pattern in action_patterns
+        )
+
+    @staticmethod
+    def _extract_code_request(command, entity=None):
+        """Keep the complete original coding request for generation."""
+
+        if command:
+            return str(command).strip()
+
+        if isinstance(entity, dict):
+            for key in (
+                "command",
+                "request",
+                "prompt",
+                "description",
+                "program",
+                "task",
+                "value",
+                "entity",
+            ):
+                value = entity.get(key)
+                if value:
+                    return str(value).strip()
+
+        if entity:
+            return str(entity).strip()
+
+        return ""
+
+    def _resolve_vscode_command(self):
+        """Find the Windows VS Code CLI without requiring a PATH entry."""
+
+        candidates = [
+            shutil.which("code"),
+            shutil.which("code.cmd"),
+            shutil.which("code-insiders"),
+            shutil.which("code-insiders.cmd"),
+        ]
+
+        local_app_data = Path.home() / "AppData" / "Local"
+        program_files = Path("C:/Program Files")
+        program_files_x86 = Path("C:/Program Files (x86)")
+
+        candidates.extend([
+            local_app_data / "Programs" / "Microsoft VS Code" / "bin" / "code.cmd",
+            local_app_data / "Programs" / "Microsoft VS Code" / "bin" / "code",
+            program_files / "Microsoft VS Code" / "bin" / "code.cmd",
+            program_files_x86 / "Microsoft VS Code" / "bin" / "code.cmd",
+        ])
+
+        for candidate in candidates:
+            if not candidate:
+                continue
+            candidate = Path(candidate)
+            if candidate.exists():
+                return candidate
+
+        return None
+
+    def _open_vscode_path(self, path):
+        """Open a folder/file in VS Code without printing CLI output."""
+
+        vscode = self._resolve_vscode_command()
+        if vscode is None:
+            return {
+                "success": False,
+                "error": "VS Code command was not found on this Windows system.",
+            }
+
+        try:
+            creationflags = getattr(
+                subprocess,
+                "CREATE_NO_WINDOW",
+                0,
+            )
+
+            subprocess.Popen(
+                [str(vscode), str(Path(path))],
+                stdout=subprocess.DEVNULL,
+                stderr=subprocess.DEVNULL,
+                stdin=subprocess.DEVNULL,
+                creationflags=creationflags,
+                close_fds=False,
+            )
+
+            return {
+                "success": True,
+                "error": "",
+            }
+
+        except Exception as error:
+            return {
+                "success": False,
+                "error": str(error),
+            }
+
+    def _clear_code_file(self, file_path):
+        """Clear the existing source file before every automatic retry."""
+
+        path = Path(file_path)
+        path.write_text("", encoding="utf-8")
+        return path
+
+    @staticmethod
+    def _resolve_java_tool(tool_name):
+        """Resolve java/javac even when the JDK is not on PATH."""
+
+        candidates = []
+
+        found = shutil.which(tool_name)
+        if found:
+            candidates.append(Path(found))
+
+        java_home = Path(
+            str(__import__("os").environ.get("JAVA_HOME", "")).strip()
+        )
+
+        if str(java_home):
+            candidates.append(java_home / "bin" / f"{tool_name}.exe")
+            candidates.append(java_home / "bin" / tool_name)
+
+        # Common Windows JDK installations.
+        for root in (
+            Path("C:/Program Files/Java"),
+            Path("C:/Program Files/Eclipse Adoptium"),
+            Path("C:/Program Files/Microsoft"),
+        ):
+            if root.exists():
+                try:
+                    for child in root.iterdir():
+                        if child.is_dir():
+                            candidates.append(
+                                child / "bin" / f"{tool_name}.exe"
+                            )
+                            candidates.append(
+                                child / "bin" / tool_name
+                            )
+                except OSError:
+                    pass
+
+        for candidate in candidates:
+            try:
+                candidate = Path(candidate)
+                if candidate.is_file():
+                    return candidate
+            except (TypeError, ValueError):
+                continue
+
+        return None
+
+    @staticmethod
+    def _print_code_execution_output(
+        language,
+        file_path,
+        execution,
+    ):
+        """Print the actual compile/run result to DHEEPTHI's terminal."""
+
+        execution = execution or {}
+        output = str(execution.get("output") or "").strip()
+        error = str(execution.get("error") or "").strip()
+
+        print("\n========== CODE AGENT EXECUTION ==========")
+        print(f"Language : {str(language).title()}")
+        print(f"File     : {file_path}")
+        print(f"Success  : {bool(execution.get('success', False))}")
+        print("------------------------------------------")
+        print("PROGRAM OUTPUT:")
+        print(output if output else "[no stdout output]")
+
+        if error:
+            print("------------------------------------------")
+            print("PROGRAM ERROR:")
+            print(error)
+
+        print("==========================================\n")
+
+    def _compile_code(self, language, file_path):
+        """Compatibility wrapper around CodeAgent.compile().
+
+        CodeAgent is the single owner of Code Agent compilation so the
+        dispatcher cannot accidentally use a second, different compiler path.
+        """
+
+        result = self.code_agent.compile(
+            language,
+            Path(file_path),
+        )
+
+        return result
+
+    def _run_compiled_code(self, language, file_path):
+        """Compatibility wrapper around CodeAgent.execute().
+
+        The generated program is launched by CodeAgent in its dedicated
+        visible terminal on Windows.  stdout/stderr are intentionally not
+        captured into the DHEEPTHI process.
+        """
+
+        return self.code_agent.execute(
+            language,
+            Path(file_path),
+            already_compiled=True,
+        )
+
+    def _build_code_retry_request(
+        self,
+        original_command,
+        language,
+        previous_code,
+        compile_error,
+        attempt,
+    ):
+        """Build a full-program correction request for a failed compile."""
+
+        language_name = "Python" if language == "python" else "Java"
+
+        return (
+            f"Fix the {language_name} program for the following compiler error.\n\n"
+            f"Original user request:\n{original_command}\n\n"
+            f"Previous generated source code:\n{previous_code}\n\n"
+            f"Compiler error from attempt {attempt}:\n{compile_error}\n\n"
+            "Generate the COMPLETE corrected program from the beginning.\n"
+            f"Return ONLY {language_name} source code. No Markdown fences, explanation, "
+            "headings, placeholders, TODOs, or omitted implementation.\n"
+            "Preserve the original requested functionality.\n"
+            "The corrected program must compile successfully.\n"
+            + (
+                "For Java, the public class name MUST exactly match the source filename.\n"
+                if language == "java"
+                else ""
+            )
+        )
+
+    def process_code_agent(
+        self,
+        command,
+        intent=None,
+        entity=None,
+    ):
+        """Execute the complete DHEEPTHI Code Agent V1 workflow.
+
+        CodeAgent is the single owner of generation, source-file writing,
+        compilation, automatic compiler-error retries, and program launch.
+        The dispatcher only performs routing, VS Code presentation, and
+        user-facing acknowledgement.
+
+        Program stdout/stderr is deliberately not copied into the DHEEPTHI
+        response.  On Windows the CodeAgent opens a separate visible cmd.exe
+        console for the generated program.
+        """
+
+        request = self._extract_code_request(command, entity)
+
+        if not self._looks_like_code_command(request, intent):
+            return None
+
+        print("\n========== DHEEPTHI CODE AGENT V1 ==========")
+        print(f"Request  : {request}")
+        print(f"Intent   : {intent}")
+        print("Route    : CommandDispatcher -> CodeAgent")
+
+        language = self.code_agent.detect_language(request)
+
+        if language not in self.code_agent.SUPPORTED_LANGUAGES:
+            message = self.speak(
+                "Please specify Python or Java for the programming request."
+            )
+            return self.response(
+                False,
+                "",
+                "Status : Code Language Missing",
+                message,
+                code_agent=True,
+                code_language=language,
+            )
+
+        try:
+            filename = self.code_agent.detect_filename(
+                request,
+                language,
+            )
+
+            # CodeAgent owns the complete V1 execution pipeline.
+            # This guarantees that the same source file is cleared and
+            # regenerated on compile failures, with a maximum of 3 attempts.
+            result = self.code_agent.generate_save_execute(
+                command=request,
+                language=language,
+                filename=filename,
+            )
+
+            file_path = Path(
+                result.get("file_path") or
+                (
+                    self.code_agent.create_project_folder(language)
+                    / filename
+                )
+            )
+
+            # Open the generated source in VS Code only after the file exists.
+            # VS Code is optional and must never block generation/compilation.
+            vscode_result = self._open_vscode_path(file_path)
+            vscode_warning = ""
+
+            if not vscode_result.get("success"):
+                vscode_warning = str(
+                    vscode_result.get("error") or ""
+                )
+                print(
+                    "[CODE AGENT] VS Code open skipped: "
+                    f"{vscode_warning}"
+                )
+
+            if not result.get("success"):
+                error = str(result.get("error") or "")
+                compile_attempts = int(
+                    result.get("compile_attempts") or 0
+                )
+
+                # Keep technical compiler diagnostics out of TTS/UI.
+                # They remain available in the structured result and terminal
+                # diagnostics for development/debugging.
+                if result.get("compiled") is False and result.get(
+                    "stopped_after_max_attempts"
+                ):
+                    message_text = (
+                        "I could not complete the program after three "
+                        "compile attempts."
+                    )
+                    failed_status = "Status : Code Agent Compile Failed"
+                elif result.get("saved") is False:
+                    message_text = (
+                        "I could not save the generated program."
+                    )
+                    failed_status = "Status : Code File Save Failed"
+                else:
+                    message_text = (
+                        "I could not complete the programming request."
+                    )
+                    failed_status = "Status : Code Agent Failed"
+
+                message = self.speak(message_text)
+
+                return self.response(
+                    False,
+                    "",
+                    failed_status,
+                    message,
+                    code_agent=True,
+                    code_language=language,
+                    file_path=str(file_path),
+                    compile_attempts=compile_attempts,
+                    compile_history=result.get("compile_history", []),
+                    compile_error=result.get("compile_error", ""),
+                    generation_error=result.get("error", "")
+                    if not result.get("compile_error")
+                    else "",
+                    execution=result.get("execution"),
+                    saved=bool(result.get("saved", False)),
+                    compiled=bool(result.get("compiled", False)),
+                    executed=bool(result.get("executed", False)),
+                    terminal_opened=bool(
+                        result.get("terminal_opened", False)
+                    ),
+                    displayed_in_terminal=bool(
+                        result.get("displayed_in_terminal", False)
+                    ),
+                    vscode_warning=vscode_warning,
+                    model=result.get("model", self.code_agent.GROQ_MODEL),
+                )
+
+            execution = result.get("execution") or {}
+            terminal_opened = bool(
+                result.get("terminal_opened")
+                or execution.get("terminal_opened")
+            )
+            displayed_in_terminal = bool(
+                result.get("displayed_in_terminal")
+                or execution.get("displayed_in_terminal")
+            )
+
+            # IMPORTANT: Do not read/copy program_output into the UI response.
+            # The generated program owns the separate terminal and its stdout
+            # remains visible there.
+            if terminal_opened or displayed_in_terminal:
+                message_text = (
+                    f"{language.title()} program generated and compiled "
+                    "successfully. I opened it in a separate terminal."
+                )
+            else:
+                message_text = (
+                    f"{language.title()} program generated and compiled "
+                    "successfully."
+                )
+
+            message = self.speak(message_text)
+
+            return self.response(
+                True,
+                "Status : Code Execution Completed",
+                "Status : Code Execution Failed",
+                message,
+                code_agent=True,
+                code_language=language,
+                file_path=str(file_path),
+                saved=True,
+                compiled=True,
+                executed=bool(result.get("executed", False)),
+                compile_attempts=int(
+                    result.get("compile_attempts") or 0
+                ),
+                compile_history=result.get("compile_history", []),
+                compile_result=result.get("compile_result"),
+                execution=execution,
+                terminal_opened=terminal_opened,
+                displayed_in_terminal=displayed_in_terminal,
+                program_output="",
+                program_output_displayed=displayed_in_terminal,
+                vscode_warning=vscode_warning,
+                model=result.get("model", self.code_agent.GROQ_MODEL),
+                requests_used=result.get("requests_used", 0),
+            )
+
+        except Exception as error:
+            print(
+                "[CODE AGENT] Dispatcher integration error :",
+                error,
+            )
+
+            message = self.speak(
+                "I could not complete the programming request."
+            )
+
+            return self.response(
+                False,
+                "",
+                "Status : Code Agent Failed",
+                message,
+                code_agent=True,
+                code_language=language,
+                error=str(error),
+            )
+
+
     # --------------------------------------------------
     # Dispatcher
     # --------------------------------------------------
@@ -2105,6 +2613,30 @@ class CommandDispatcher:
         """
 
         try:
+
+            # ==================================================
+            # CODE AGENT ROUTING LOCK
+            # ==================================================
+            # Keep an explicit programming intent authoritative.
+            # Context resolution must never turn a code request into
+            # ``ai_chat`` and send it to Gemini.
+            incoming_intent = intent
+            incoming_user_text = user_text
+            incoming_typed_text = typed_text
+            incoming_entity = entity
+            incoming_code_intent = (
+                isinstance(incoming_intent, str)
+                and incoming_intent.strip().lower() in {
+                    "code_agent",
+                    "code_generation",
+                    "generate_code",
+                    "write_code",
+                    "create_code",
+                    "create_program",
+                    "coding",
+                    "programming",
+                }
+            )
 
             # ==================================================
             # AI PLANNER PAYLOAD NORMALIZATION
@@ -2179,15 +2711,31 @@ class CommandDispatcher:
                 intent
             )
 
-            entity = context_payload.get(
-                "entity",
-                entity
-            )
+            # Explicit code-agent routing has priority over context
+            # rewriting.  This is the hard guard that prevents a coding
+            # request from falling through to the Gemini conversation path.
+            if incoming_code_intent:
+                intent = incoming_intent
+                # Preserve the exact programming request that entered the
+                # dispatcher. Context resolution must never replace it with
+                # an older conversational/file-system context.
+                if incoming_user_text:
+                    user_text = incoming_user_text
+                if incoming_typed_text:
+                    typed_text = incoming_typed_text
+                if incoming_entity is not None:
+                    entity = incoming_entity
 
-            typed_text = context_payload.get(
-                "typed_text",
-                typed_text
-            )
+            if not incoming_code_intent:
+                entity = context_payload.get(
+                    "entity",
+                    entity
+                )
+
+                typed_text = context_payload.get(
+                    "typed_text",
+                    typed_text
+                )
 
             browser = context_payload.get(
                 "browser",
@@ -2209,10 +2757,11 @@ class CommandDispatcher:
                 profile
             )
 
-            user_text = context_payload.get(
-                "user_text",
-                user_text
-            )
+            if not incoming_code_intent:
+                user_text = context_payload.get(
+                    "user_text",
+                    user_text
+                )
 
             selection = context_payload.get(
                 "selection",
@@ -2264,6 +2813,30 @@ class CommandDispatcher:
                     multi_command=multi_command,
                 )
             )
+
+            # ==================================================
+            # DHEEPTHI CODE AGENT V1
+            # ==================================================
+            # Coding requests are handled before generic AI chat so a
+            # command such as "create a Python program for factorial"
+            # never falls through to Gemini conversation handling.
+            code_command = user_text or typed_text or ""
+
+            print("\n========== CODE AGENT ROUTING ==========")
+            print(f"Incoming Intent : {incoming_intent}")
+            print(f"Resolved Intent : {intent}")
+            print(f"Code Request    : {code_command}")
+            print("Route           : CommandDispatcher -> CodeAgent")
+            print("========================================\n")
+
+            code_result = self.process_code_agent(
+                command=code_command,
+                intent=intent,
+                entity=entity,
+            )
+
+            if code_result is not None:
+                return code_result
 
             # ==================================================
             # MICROSOFT WORD V1 AGENT

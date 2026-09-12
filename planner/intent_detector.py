@@ -391,6 +391,9 @@ class IntentDetector:
             # Conversation
             "ai_chat",
 
+            # Code Agent
+            "code_agent",
+
             # Application
             "launch_application",
             "close_application",
@@ -2617,6 +2620,84 @@ class IntentDetector:
         return None
 
     # ==========================================================
+    # CODE AGENT INTENT
+    # ==========================================================
+
+    def _detect_code_agent_intent(
+        self,
+        text: str,
+    ) -> Optional[str]:
+        """
+        Detect explicit Python / Java programming requests.
+
+        Code requests are checked before generic typing, file,
+        application, and AI keyword detection so commands such as:
+
+            write a python program for bfs
+            create python code for factorial
+            generate java program for stack
+            implement binary search in java
+
+        are routed to the DHEEPTHI Code Agent instead of being
+        interpreted as a normal typing action or ai_chat.
+
+        Questions about programming languages remain ai_chat because
+        conversation protection runs before this detector.
+        """
+
+        if not text:
+            return None
+
+        text = self._basic_normalize(text)
+
+        if not text:
+            return None
+
+        # ------------------------------------------------------
+        # Programming language must be explicit for V1.
+        # ------------------------------------------------------
+
+        has_python = bool(
+            re.search(r"\bpython\b|\bpy\b", text)
+        )
+
+        has_java = bool(
+            re.search(r"\bjava\b", text)
+        )
+
+        if not (has_python or has_java):
+            return None
+
+        # ------------------------------------------------------
+        # Explicit code-generation / implementation language.
+        # ------------------------------------------------------
+
+        code_action_patterns = (
+            r"\b(write|create|generate|make|implement|develop|build)\b",
+            r"\b(code|program|programme|source code|script)\b",
+            r"\b(algorithm|data structure)\b.*\b(in|using|with)\b",
+            r"\b(in|using|with)\b.*\b(python|py|java)\b",
+        )
+
+        has_code_action = any(
+            re.search(pattern, text)
+            for pattern in code_action_patterns
+        )
+
+        if not has_code_action:
+            return None
+
+        # ------------------------------------------------------
+        # Do not classify explanation / learning questions as
+        # executable code requests.
+        # ------------------------------------------------------
+
+        if self._is_conversational_message(text):
+            return None
+
+        return "code_agent"
+
+    # ==========================================================
     # LOCAL INTENT DETECTION
     # ==========================================================
 
@@ -2636,6 +2717,18 @@ class IntentDetector:
 
             if self._is_conversational_message(text):
                 return "ai_chat"
+
+        # ------------------------------------------------------
+        # Code Agent FIRST
+        #
+        # Programming requests must be routed before generic
+        # "write", "create", "run", and file/application intents.
+        # ------------------------------------------------------
+
+        intent = self._detect_code_agent_intent(text)
+
+        if intent:
+            return intent
 
         # ------------------------------------------------------
         # Word FIRST

@@ -424,6 +424,89 @@ class ChatWorker(QThread):
 
 
 # =====================================================
+# DHEEPTHI Code Agent Worker
+# =====================================================
+
+class CodeAgentWorker(QThread):
+    """
+    Run the complete Code Agent dispatcher workflow outside the
+    Qt GUI thread.
+
+    The worker performs no UI operations. It sends the final
+    CommandDispatcher result back to MainWindow through a Qt signal.
+    """
+
+    result_ready = Signal(object)
+    error_occurred = Signal(str)
+
+    def __init__(self, dispatcher, command):
+        super().__init__()
+        self.dispatcher = dispatcher
+        self.command = str(command or "").strip()
+
+    def run(self):
+        try:
+            if self.dispatcher is None:
+                self.error_occurred.emit(
+                    "CommandDispatcher is not available."
+                )
+                return
+
+            if not self.command:
+                self.error_occurred.emit(
+                    "Empty Code Agent command."
+                )
+                return
+
+            print(
+                "\n========== CODE AGENT BACKGROUND WORKER ==========",
+                flush=True,
+            )
+            print(f"Request : {self.command}", flush=True)
+            print("GUI thread blocked : NO", flush=True)
+            print("=================================================\n", flush=True)
+
+            result = self.dispatcher.dispatch(
+                intent="code_agent",
+                entity=None,
+                typed_text=self.command,
+                browser=None,
+                website=None,
+                search_query=None,
+                profile=None,
+                user_text=self.command,
+                multi_command=False,
+            )
+
+            if not isinstance(result, dict):
+                result = {
+                    "success": False,
+                    "code_agent": True,
+                    "status": "Status : Code Agent Failed",
+                    "message": (
+                        "Code Agent did not return a valid result."
+                    ),
+                    "error": "Invalid CommandDispatcher result.",
+                }
+            else:
+                result = dict(result)
+                result["code_agent"] = True
+
+            self.result_ready.emit(result)
+
+        except Exception as error:
+            print(
+                "\n========== CODE AGENT WORKER ERROR ==========",
+                flush=True,
+            )
+            print(f"Request : {self.command}", flush=True)
+            print(f"Error   : {error}", flush=True)
+            print("=============================================\n", flush=True)
+
+            self.error_occurred.emit(str(error))
+
+
+# =====================================================
 # Vision Worker
 # =====================================================
 
@@ -717,6 +800,16 @@ class MainWindow(QMainWindow):
         self.command_normalizer = None
 
         self.dispatcher = None
+
+        # DHEEPTHI Code Agent V1 lifecycle state.
+        # CommandDispatcher owns generation/compile/retry/run;
+        # MainWindow owns presentation and microphone lifecycle.
+        #
+        # Code Agent work runs in a background QThread so Groq,
+        # compilation, retry logic, and terminal launch never block
+        # the Qt GUI thread.
+        self._code_agent_processing = False
+        self._code_agent_worker = None
 
         self.multi_command_planner = None
 
@@ -3195,6 +3288,11 @@ class MainWindow(QMainWindow):
 
         result = result or {}
 
+        # Code Agent has its own complete generation/compile/run
+        # lifecycle. Present its result before generic branches.
+        if self._handle_code_agent_result(result, text):
+            return
+
         # ---------------------------------
         # Word Information Required
         # ---------------------------------
@@ -3571,6 +3669,92 @@ class MainWindow(QMainWindow):
     # --------------------------------------------------
     # Intent Routing Helpers
     # --------------------------------------------------
+
+    @staticmethod
+    def _is_code_agent_request(text):
+        """Return True only for explicit Python/Java code-generation requests.
+
+        MainWindow keeps a final routing guard because conversational
+        protection inside IntentDetector may classify some explicit coding
+        commands as ``ai_chat``. Explicit executable requests must reach
+        CommandDispatcher -> CodeAgent instead of Gemini.
+        """
+
+        cleaned = str(text or "").strip().lower()
+        if not cleaned:
+            return False
+
+        # V1 supports Python and Java only, and the language must be explicit.
+        has_python = bool(re.search(r"\bpython\b|\bpy\b", cleaned))
+        has_java = bool(re.search(r"\bjava\b", cleaned))
+
+        if not (has_python or has_java):
+            return False
+
+        code_actions = (
+            r"\bwrite\b",
+            r"\bcreate\b",
+            r"\bgenerate\b",
+            r"\bbuild\b",
+            r"\bdevelop\b",
+            r"\bimplement\b",
+            r"\bmake\b.*\bprogram\b",
+        )
+
+        has_code_action = any(
+            re.search(pattern, cleaned)
+            for pattern in code_actions
+        )
+
+        has_code_noun = bool(
+            re.search(
+                r"\b(code|program|programme|source\s+code|script)\b",
+                cleaned,
+            )
+        )
+
+        has_algorithm_request = bool(
+            re.search(
+                r"\b(algorithm|data\s+structure)\b.*\b(in|using|with)\b",
+                cleaned,
+            )
+            or re.search(
+                r"\b(in|using|with)\b.*\b(algorithm|data\s+structure)\b",
+                cleaned,
+            )
+        )
+
+        if not (
+            has_code_action
+            or has_code_noun
+            or has_algorithm_request
+        ):
+            return False
+
+        # Keep educational/conversational programming questions in Gemini.
+        conversational_markers = (
+            "what is ",
+            "what are ",
+            "what does ",
+            "what do ",
+            "who is ",
+            "why ",
+            "how does ",
+            "how do ",
+            "explain ",
+            "tell me about ",
+            "difference between ",
+            "meaning of ",
+            "definition of ",
+        )
+
+        if any(
+            cleaned.startswith(marker)
+            for marker in conversational_markers
+        ) and not has_code_action:
+            return False
+
+        return True
 
     def _is_word_command_context(self, text):
         """Detect explicit or active Microsoft Word command context."""
@@ -4111,6 +4295,278 @@ class MainWindow(QMainWindow):
     # Process Command
     # --------------------------------------------------
 
+    def _start_code_agent_worker(self, command):
+        """
+        Start the complete Code Agent workflow in a background QThread.
+
+        Voice and typed programming requests use this same entry point.
+        MainWindow remains responsive while CommandDispatcher performs
+        generation -> save -> compile -> retry -> terminal launch.
+        """
+
+        command = str(command or "").strip()
+
+        if not command:
+            self._handle_code_agent_worker_error(
+                "Empty Code Agent command."
+            )
+            return False
+
+        current_worker = getattr(
+            self,
+            "_code_agent_worker",
+            None,
+        )
+
+        if current_worker is not None:
+            try:
+                if current_worker.isRunning():
+                    print(
+                        "[CODE AGENT] Existing worker is still running; "
+                        "new request ignored."
+                    )
+                    return False
+            except RuntimeError:
+                self._code_agent_worker = None
+
+        if self.dispatcher is None:
+            self._handle_code_agent_worker_error(
+                "CommandDispatcher is not available."
+            )
+            return False
+
+        self._code_agent_processing = True
+
+        try:
+            self.status_label.setText(
+                "Status : Code Agent Executing..."
+            )
+
+            self._thinking_avatar_mode = "thinking_laptop"
+            self._set_avatar_state("thinking_laptop")
+
+            try:
+                self.left_panel.set_listening("Code Agent")
+                self._set_thinking_state(
+                    "Code Agent",
+                    avatar_state="thinking_laptop",
+                )
+                self.left_panel.set_speaking("Silent")
+                self.mic_widget.update_ai_message(
+                    "Generating and running your program..."
+                )
+            except Exception:
+                pass
+
+            print(
+                "\n========== CODE AGENT ASYNC ROUTE ==========",
+                flush=True,
+            )
+            print(f"Request : {command}", flush=True)
+            print(
+                "Route   : MainWindow -> CodeAgentWorker -> "
+                "CommandDispatcher -> CodeAgent",
+                flush=True,
+            )
+            print("GUI     : NON-BLOCKING", flush=True)
+            print("============================================\n", flush=True)
+
+            worker = CodeAgentWorker(
+                dispatcher=self.dispatcher,
+                command=command,
+            )
+
+            self._code_agent_worker = worker
+
+            worker.result_ready.connect(
+                lambda result, original_command=command:
+                self._handle_code_agent_worker_result(
+                    result,
+                    original_command,
+                )
+            )
+
+            worker.error_occurred.connect(
+                self._handle_code_agent_worker_error
+            )
+
+            worker.finished.connect(
+                self._on_code_agent_worker_finished
+            )
+
+            worker.finished.connect(
+                worker.deleteLater
+            )
+
+            worker.start()
+            return True
+
+        except Exception as error:
+            self._code_agent_processing = False
+            self._code_agent_worker = None
+            self._handle_code_agent_worker_error(str(error))
+            return False
+
+    @Slot(object)
+    def _handle_code_agent_worker_result(
+        self,
+        result,
+        original_command,
+    ):
+        """
+        Handle the completed Code Agent result on the Qt GUI thread.
+        """
+
+        if not isinstance(result, dict):
+            result = {
+                "success": False,
+                "code_agent": True,
+                "status": "Status : Code Agent Failed",
+                "message": (
+                    "Code Agent did not return a valid result."
+                ),
+                "error": "Invalid worker result.",
+            }
+
+        result = dict(result)
+        result["code_agent"] = True
+
+        execution = result.get("execution")
+        if not isinstance(execution, dict):
+            execution = {}
+
+        print(
+            "\n========== CODE AGENT GUI RESULT ==========",
+            flush=True,
+        )
+        print(
+            f"Success          : {result.get('success', False)}",
+            flush=True,
+        )
+        print(
+            f"Status           : {result.get('status', '')}",
+            flush=True,
+        )
+        print(
+            f"File             : {result.get('file_path', '')}",
+            flush=True,
+        )
+        print(
+            f"Compile Attempts : {result.get('compile_attempts', 0)}",
+            flush=True,
+        )
+        print(
+            f"Terminal Opened  : "
+            f"{execution.get('terminal_opened', False)}",
+            flush=True,
+        )
+        print(
+            f"Execution Mode   : "
+            f"{execution.get('execution_mode', '')}",
+            flush=True,
+        )
+        print("===========================================\n", flush=True)
+
+        self._handle_code_agent_result(
+            result,
+            original_command,
+        )
+
+    @Slot(str)
+    def _handle_code_agent_worker_error(self, error):
+        """
+        Handle a Code Agent worker exception on the Qt GUI thread.
+        """
+
+        self._code_agent_processing = False
+
+        error = str(error or "").strip()
+        if not error:
+            error = "Unknown Code Agent error."
+
+        print(
+            "\n========== CODE AGENT ASYNC ERROR ==========",
+            flush=True,
+        )
+        print(f"Error : {error}", flush=True)
+        print("============================================\n", flush=True)
+
+        message = (
+            "Sorry da, Code Agent could not complete that program."
+        )
+
+        try:
+            self.conversation_panel.show_error(message)
+        except Exception:
+            pass
+
+        try:
+            self.mic_widget.update_ai_message(message)
+        except Exception:
+            pass
+
+        try:
+            self.status_label.setText(
+                "Status : Code Agent Error"
+            )
+            self.conversation_label.setText(
+                "Code Agent Error\n\n"
+                f"Error:\n{error}"
+            )
+            self._set_thinking_state("Inactive")
+            self.left_panel.set_speaking("Speaking")
+        except Exception:
+            pass
+
+        self._set_avatar_state("error")
+
+        try:
+            if self.tts is not None:
+                self.tts.speak(message)
+        except Exception:
+            pass
+
+        self._unlock_after_speech(
+            restart_wake=True,
+            terminal_avatar_state="error",
+        )
+
+        QTimer.singleShot(
+            1400,
+            lambda: self.left_panel.set_speaking("Silent"),
+        )
+
+    @Slot()
+    def _on_code_agent_worker_finished(self):
+        """
+        Clear the worker reference after the background QThread stops.
+        """
+
+        worker = self._code_agent_worker
+
+        if worker is None:
+            return
+
+        try:
+            if worker.isRunning():
+                return
+        except RuntimeError:
+            pass
+
+        self._code_agent_worker = None
+
+    def _start_code_agent_route(self, original_text):
+        """
+        Common Code Agent entry point for voice and typed commands.
+        """
+
+        command = str(original_text or "").strip()
+
+        if not command:
+            return False
+
+        return self._start_code_agent_worker(command)
+
     def process_command(
         self,
         text
@@ -4261,6 +4717,41 @@ class MainWindow(QMainWindow):
         )
 
         # ------------------------------------------
+        # DHEEPTHI Code Agent V1 Routing Guard
+        # ------------------------------------------
+        # Decide explicit Python/Java code generation before multi-command
+        # planning and before the generic Gemini branch.
+        code_agent_requested = self._is_code_agent_request(text)
+
+        if code_agent_requested:
+            print(
+                "\n========== CODE AGENT ROUTING GUARD =========="
+            )
+            print(
+                f"Programming request detected : {text}"
+            )
+            print(
+                "Forcing intent : code_agent"
+            )
+            print(
+                "==============================================\n"
+            )
+
+            # --------------------------------------------------
+            # HARD V1 CODE-AGENT ROUTE
+            # --------------------------------------------------
+            # Run the complete dispatcher workflow in a background
+            # QThread. This keeps the Qt event loop responsive while
+            # Groq generation, compile/retry, and terminal launch run.
+            # --------------------------------------------------
+
+            self._start_code_agent_route(
+                original_text
+            )
+
+            return
+
+        # ------------------------------------------
         # Multi-Command Detection
         # ------------------------------------------
         #
@@ -4296,7 +4787,7 @@ class MainWindow(QMainWindow):
 
                 is_multi_command = False
 
-        if is_multi_command:
+        if is_multi_command and not code_agent_requested:
 
             print(
                 "\n========== MULTI COMMAND =========="
@@ -4625,6 +5116,16 @@ class MainWindow(QMainWindow):
         intent = self._detect_intent_with_context(
             text
         )
+
+        # Final routing protection: explicit Python/Java programming
+        # requests must never fall through to the Gemini ai_chat branch.
+        if self._is_code_agent_request(text):
+            if intent != "code_agent":
+                print(
+                    "IntentDetector returned "
+                    f"{intent!r}; overriding to code_agent."
+                )
+            intent = "code_agent"
 
         # ------------------------------------------
         # Avatar Thinking Mode
@@ -5251,6 +5752,14 @@ class MainWindow(QMainWindow):
         # ---------------------------------
         # Execute Command
         # ---------------------------------
+
+        self._code_agent_processing = (
+            intent == "code_agent"
+            or intent == "generate_code"
+            or intent == "write_code"
+            or intent == "create_code"
+            or intent == "programming"
+        )
 
         result = self.dispatcher.dispatch(
 
@@ -9326,6 +9835,16 @@ class MainWindow(QMainWindow):
                 normalized_text
             )
 
+            # Final routing protection: explicit Python/Java programming
+            # requests must never enter the Gemini ai_chat branch.
+            if self._is_code_agent_request(normalized_text):
+                if intent != "code_agent":
+                    print(
+                        "Text IntentDetector returned "
+                        f"{intent!r}; overriding to code_agent."
+                    )
+                intent = "code_agent"
+
         except Exception as error:
 
             print(
@@ -9382,7 +9901,22 @@ class MainWindow(QMainWindow):
             return
 
         # =================================================
-        # 10. NORMAL AUTOMATION COMMAND
+        # 10. CODE AGENT
+        # =================================================
+        # Typed Python/Java requests use the same background worker
+        # as voice programming requests.
+        # =================================================
+
+        if intent == "code_agent":
+
+            self._start_code_agent_route(
+                original_text
+            )
+
+            return
+
+        # =================================================
+        # 11. NORMAL AUTOMATION COMMAND
         # =================================================
 
         self._process_text_command(
@@ -10067,6 +10601,14 @@ class MainWindow(QMainWindow):
             # Dispatcher
             # =================================================
 
+            self._code_agent_processing = (
+                intent == "code_agent"
+                or intent == "generate_code"
+                or intent == "write_code"
+                or intent == "create_code"
+                or intent == "programming"
+            )
+
             result = self.dispatcher.dispatch(
 
                 intent=intent,
@@ -10139,6 +10681,206 @@ class MainWindow(QMainWindow):
     # Text Dispatcher Result
     # =====================================================
 
+    def _handle_code_agent_result(
+        self,
+        result,
+        text,
+    ):
+        """
+        Handle a DHEEPTHI Code Agent result.
+
+        CommandDispatcher owns:
+            generation -> same-file rewrite -> compile ->
+            automatic retry (maximum 3) -> run.
+
+        MainWindow owns:
+            UI presentation -> status/avatar -> microphone lifecycle.
+
+        No confirmation is requested for Code Agent retries.
+        """
+        result = result or {}
+
+        if not result.get("code_agent"):
+            return False
+
+        self._code_agent_processing = False
+
+        success = bool(result.get("success", False))
+        status = result.get(
+            "status",
+            "Status : Code Agent Completed"
+            if success
+            else "Status : Code Agent Failed",
+        )
+
+        # Dispatcher already speaks the user-facing message.
+        # MainWindow must not speak it a second time.
+        message = str(
+            result.get(
+                "message",
+                result.get(
+                    "assistant_reply",
+                    "Code Agent completed the request."
+                    if success
+                    else "Code Agent could not complete the request.",
+                ),
+            )
+            or ""
+        ).strip()
+
+        if success:
+            execution = result.get("execution")
+            if not isinstance(execution, dict):
+                execution = {}
+
+            terminal_opened = bool(
+                execution.get("terminal_opened", False)
+            )
+
+            execution_mode = str(
+                execution.get("execution_mode") or ""
+            ).strip()
+
+            if not message:
+                if terminal_opened:
+                    message = (
+                        "Program compiled successfully and is running "
+                        "in the new terminal."
+                    )
+                else:
+                    output = str(
+                        result.get("output")
+                        or execution.get("output")
+                        or ""
+                    ).strip()
+                    message = (
+                        output
+                        or "Program executed successfully."
+                    )
+
+            try:
+                self.conversation_panel.show_ai_response(message)
+            except Exception:
+                pass
+
+            self.status_label.setText(status)
+
+            try:
+                self.mic_widget.update_ai_message(message)
+            except Exception:
+                pass
+
+            if terminal_opened:
+                terminal_detail = (
+                    "Program launched in a separate terminal."
+                )
+
+                if execution_mode:
+                    terminal_detail += (
+                        f"\nExecution Mode: {execution_mode}"
+                    )
+
+                output_detail = (
+                    "Program output is displayed in that terminal."
+                )
+            else:
+                terminal_detail = (
+                    "Program execution completed."
+                )
+                output_detail = (
+                    "No captured output was returned."
+                )
+
+            self.conversation_label.setText(
+                "Code Agent Completed\n\n"
+                f"Request:\n{text}\n\n"
+                f"File:\n{result.get('file_path', '')}\n\n"
+                f"Compile Attempts: {result.get('compile_attempts', 0)}\n\n"
+                f"{terminal_detail}\n"
+                f"{output_detail}"
+            )
+
+            try:
+                self.left_panel.set_listening("Idle")
+                self._set_thinking_state("Inactive")
+                self.left_panel.set_speaking("Speaking")
+                self.right_panel.update_system_metrics()
+            except Exception:
+                pass
+
+            self._set_avatar_state("success")
+
+            self._unlock_after_speech(
+                restart_wake=True,
+                terminal_avatar_state="success",
+            )
+
+            QTimer.singleShot(
+                1400,
+                lambda: self.left_panel.set_speaking("Silent"),
+            )
+
+            return True
+
+        # Failure: after the third compile failure the dispatcher has
+        # already cleared the same source file and stopped the task.
+        try:
+            self.conversation_panel.show_error(message)
+        except Exception:
+            pass
+
+        try:
+            self.mic_widget.update_ai_message(message)
+        except Exception:
+            pass
+
+        attempts = result.get("compile_attempts", 0)
+
+        if result.get("stopped_after_max_attempts"):
+            status = "Status : Code Agent Stopped"
+            detail = (
+                "Code Agent stopped automatically after "
+                f"{attempts or 3} compile attempts."
+            )
+        else:
+            detail = (
+                f"Compile attempts: {attempts}"
+                if attempts
+                else ""
+            )
+
+        self.status_label.setText(status)
+
+        self.conversation_label.setText(
+            "Code Agent Failed\n\n"
+            f"Request:\n{text}\n\n"
+            f"File:\n{result.get('file_path', '')}\n\n"
+            f"{detail}\n\n"
+            f"Error:\n"
+            f"{result.get('compile_error') or result.get('error') or message}"
+        )
+
+        try:
+            self.left_panel.set_listening("Idle")
+            self._set_thinking_state("Inactive")
+            self.left_panel.set_speaking("Speaking")
+        except Exception:
+            pass
+
+        self._set_avatar_state("error")
+
+        self._unlock_after_speech(
+            restart_wake=True,
+            terminal_avatar_state="error",
+        )
+
+        QTimer.singleShot(
+            1400,
+            lambda: self.left_panel.set_speaking("Silent"),
+        )
+
+        return True
+
     def _handle_text_dispatch_result(
         self,
         result,
@@ -10154,6 +10896,11 @@ class MainWindow(QMainWindow):
         """
 
         result = result or {}
+
+        # Code Agent has its own complete generation/compile/run
+        # lifecycle. Present its result before generic branches.
+        if self._handle_code_agent_result(result, text):
+            return
 
         # =================================================
         # Word Information Required - FIRST
