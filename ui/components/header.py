@@ -274,7 +274,7 @@ class HeaderWidget(QFrame):
         )
 
         self.title = QLabel(
-            "ASTRA-AI"
+            "DHEEPTHI-AI"
         )
 
         self.title.setFont(
@@ -697,9 +697,9 @@ class HeaderWidget(QFrame):
 
         logo_paths = [
 
-            "ui/assets/astra_logo.png",
+            "ui/assets/dheepthi_logo-2.png",
 
-            "assets/astra_logo.png",
+            "assets/dheepthi_logo-2.png",
 
             "ui/assets/logo.png",
 

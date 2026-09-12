@@ -70,6 +70,7 @@ from PySide6.QtGui import (
     QFont,
     QIcon,
     QDesktopServices,
+    QPixmap,
 )
 
 from PySide6.QtWidgets import (
@@ -83,6 +84,7 @@ from PySide6.QtWidgets import (
     QVBoxLayout,
     QWidget,
     QSizePolicy,
+    QToolButton,
 )
 
 from config import settings
@@ -417,7 +419,7 @@ class ChatWorker(QThread):
             )
 
             self.error_occurred.emit(
-                "Sorry, I couldn't connect to ASTRA right now."
+                "Sorry, I couldn't connect to DHEEPTHI right now."
             )
 
 
@@ -458,6 +460,192 @@ class VisionWorker(QThread):
             self.error_occurred.emit(
                 "I could not analyze the current screen."
             )
+
+# =====================================================
+# Custom Application Title Bar
+# =====================================================
+
+class ApplicationTitleBar(QWidget):
+    """Custom DHEEPTHI-AI title bar used instead of the native Windows bar.
+
+    The native Windows title bar has a system-controlled height, so it cannot
+    be reliably enlarged from Qt stylesheets. This widget keeps the existing
+    main window behaviour while giving the application a controllable title
+    bar height.
+    """
+
+    HEIGHT = 40
+
+    def __init__(self, parent=None):
+
+        super().__init__(parent)
+
+        self._drag_position = None
+
+        self.setObjectName("applicationTitleBar")
+        self.setFixedHeight(self.HEIGHT)
+        self.setAttribute(Qt.WA_StyledBackground, True)
+
+        self.setStyleSheet("""
+
+        QWidget#applicationTitleBar {
+
+            background: rgb(31, 31, 31);
+            border: none;
+
+        }
+
+        QLabel#applicationTitle {
+
+            color: white;
+            font-size: 18px;
+            font-weight: 700;
+            padding-left: 3px;
+
+        }
+
+        QToolButton {
+
+            background: transparent;
+            border: none;
+            color: rgb(235, 235, 235);
+            font-size: 18px;
+            min-width: 70px;
+            max-width: 70px;
+            min-height: 40px;
+            max-height: 40px;
+
+        }
+
+        QToolButton:hover {
+
+            background: rgb(55, 55, 55);
+
+        }
+
+        QToolButton#closeButton:hover {
+
+            background: rgb(196, 43, 43);
+
+        }
+
+        """)
+
+        layout = QHBoxLayout(self)
+        layout.setContentsMargins(16, 0, 0, 0)
+        layout.setSpacing(0)
+
+        self.icon_label = QLabel()
+        self.icon_label.setFixedSize(38, 38)
+        self.icon_label.setAlignment(Qt.AlignCenter)
+
+        icon_path = os.path.abspath(
+            "ui/assets/dheepthi_logo-2.png"
+        )
+
+        if os.path.exists(icon_path):
+
+            pixmap = QPixmap(icon_path)
+
+            if not pixmap.isNull():
+                self.icon_label.setPixmap(
+                    pixmap.scaled(34, 34, Qt.KeepAspectRatio, Qt.SmoothTransformation)
+                )
+
+        self.title_label = QLabel("DHEEPTHI-AI")
+        self.title_label.setObjectName("applicationTitle")
+        self.title_label.setAlignment(Qt.AlignVCenter | Qt.AlignLeft)
+
+        layout.addWidget(self.icon_label)
+        layout.addSpacing(8)
+        layout.addWidget(self.title_label, 1)
+
+        self.minimize_button = QToolButton()
+        self.minimize_button.setText("−")
+        self.minimize_button.setToolTip("Minimize")
+        self.minimize_button.clicked.connect(self._minimize)
+
+        self.maximize_button = QToolButton()
+        self.maximize_button.setText("□")
+        self.maximize_button.setToolTip("Maximize / Restore")
+        self.maximize_button.clicked.connect(self._toggle_maximize)
+
+        self.close_button = QToolButton()
+        self.close_button.setObjectName("closeButton")
+        self.close_button.setText("×")
+        self.close_button.setToolTip("Close")
+        self.close_button.clicked.connect(self._close)
+
+        layout.addWidget(self.minimize_button)
+        layout.addWidget(self.maximize_button)
+        layout.addWidget(self.close_button)
+
+    def _minimize(self):
+        window = self.window()
+        if window is not None:
+            window.showMinimized()
+
+    def _toggle_maximize(self):
+        window = self.window()
+        if window is None:
+            return
+
+        if window.isMaximized():
+            window.showNormal()
+            self.maximize_button.setText("□")
+        else:
+            window.showMaximized()
+            self.maximize_button.setText("❐")
+
+    def _close(self):
+        window = self.window()
+        if window is not None:
+            window.close()
+
+    def mousePressEvent(self, event):
+        if event.button() == Qt.LeftButton:
+
+            window = self.window()
+
+            if window is not None:
+
+                self._drag_position = (
+                    event.globalPosition().toPoint() - window.frameGeometry().topLeft()
+                )
+
+            event.accept()
+            return
+
+        super().mousePressEvent(event)
+
+    def mouseMoveEvent(self, event):
+        if self._drag_position is not None and event.buttons() & Qt.LeftButton:
+
+            window = self.window()
+
+            if window is not None and not window.isMaximized():
+
+                window.move(
+                    event.globalPosition().toPoint() - self._drag_position
+                )
+
+            event.accept()
+            return
+
+        super().mouseMoveEvent(event)
+
+    def mouseReleaseEvent(self, event):
+        self._drag_position = None
+        super().mouseReleaseEvent(event)
+
+    def mouseDoubleClickEvent(self, event):
+        if event.button() == Qt.LeftButton:
+            self._toggle_maximize()
+            event.accept()
+            return
+
+        super().mouseDoubleClickEvent(event)
+
 
 # =====================================================
 # Main Window
@@ -706,11 +894,20 @@ class MainWindow(QMainWindow):
         # ----------------------------------
         # Window
         # ----------------------------------
+        # Use a custom title bar so its height is fully controllable.
+        # The native Windows title bar height cannot be reliably changed
+        # from Qt stylesheets.
+        # ----------------------------------
 
-        self.setWindowTitle("ASTRA-AI")
+        self.setWindowFlags(
+            Qt.FramelessWindowHint |
+            Qt.Window
+        )
+
+        self.setWindowTitle("DHEEPTHI-AI")
 
         icon_path = os.path.abspath(
-            "ui/assets/astra_logo.png"
+            "ui/assets/dheepthi_logo-1.png"
         )
 
         if os.path.exists(icon_path):
@@ -734,6 +931,19 @@ class MainWindow(QMainWindow):
         # ----------------------------------
 
         self.setup_ui()
+
+        # ----------------------------------
+        # Custom Title Bar
+        # ----------------------------------
+
+        self.application_title_bar = ApplicationTitleBar(self)
+        self.application_title_bar.setGeometry(
+            0,
+            0,
+            self.width(),
+            ApplicationTitleBar.HEIGHT
+        )
+        self.application_title_bar.raise_()
 
     def setup_ui(self):
         """
@@ -784,7 +994,7 @@ class MainWindow(QMainWindow):
 
         self.root_layout.setContentsMargins(
             28,
-            14,
+            ApplicationTitleBar.HEIGHT + 14,
             28,
             0
         )
@@ -1107,7 +1317,7 @@ class MainWindow(QMainWindow):
 
         icon = QApplication.windowIcon()
 
-        pixmap = icon.pixmap(180, 180)
+        pixmap = icon.pixmap(420, 420)
 
         self.loading_logo.setPixmap(pixmap)
 
@@ -1217,7 +1427,7 @@ class MainWindow(QMainWindow):
         # --------------------------------------------------
 
         self.loading_status = QLabel(
-            "Starting ASTRA..."
+            "Starting DHEEPTHI..."
         )
 
         self.loading_status.setAlignment(
@@ -1290,7 +1500,7 @@ class MainWindow(QMainWindow):
 
         self.conversation_label.setText(
 
-            "Initializing ASTRA-AI..."
+            "Initializing DHEEPTHI-AI..."
 
         )
 
@@ -4975,7 +5185,7 @@ class MainWindow(QMainWindow):
 
         if getattr(settings, "DEBUG", False):
 
-            print("\n========== ASTRA ==========")
+            print("\n========== DHEEPTHI ==========")
 
             print(f"Text    : {text}")
 
@@ -5595,7 +5805,7 @@ class MainWindow(QMainWindow):
         self.loading_percent.setText("0%")
 
         self.loading_status.setText(
-            "Starting ASTRA..."
+            "Starting DHEEPTHI-AI..."
         )
 
         self.worker = InitializationWorker(
@@ -5960,7 +6170,7 @@ class MainWindow(QMainWindow):
         )
 
         self.conversation_label.setText(
-            "Welcome to ASTRA-AI\n\n"
+            "Welcome to DHEEPTHI-AI\n\n"
             "Click the microphone to start."
         )
 
@@ -6293,7 +6503,7 @@ class MainWindow(QMainWindow):
         # HELLO avatar
         # --------------------------------------------------
         try:
-            print("\n========== ASTRA STARTUP GREETING ==========")
+            print("\n========== DHEEPTHI STARTUP GREETING ==========")
 
             center_panel = getattr(
                 self,
@@ -8610,7 +8820,7 @@ class MainWindow(QMainWindow):
             try:
 
                 self.conversation_panel.show_error(
-                    "ASTRA is still processing the previous request."
+                    "DHEEPTHI is still processing the previous request."
                 )
 
             except Exception:
@@ -9269,7 +9479,7 @@ class MainWindow(QMainWindow):
         # ------------------------------------------
 
         self.status_label.setText(
-            "Status : ASTRA is thinking..."
+            "Status : DHEEPTHI is thinking..."
         )
 
         try:
@@ -10979,11 +11189,11 @@ class MainWindow(QMainWindow):
             pass
 
         print(
-            "\n========== ASTRA CONVERSATION =========="
+            "\n========== DHEEPTHI CONVERSATION =========="
         )
 
         print(
-            f"ASTRA : {reply}"
+            f"DHEEPTHI : {reply}"
         )
 
         print(
@@ -11648,6 +11858,33 @@ class MainWindow(QMainWindow):
         )
 
         # --------------------------------------------------
+        # Custom title bar
+        # --------------------------------------------------
+
+        title_bar = getattr(
+            self,
+            "application_title_bar",
+            None
+        )
+
+        if title_bar is not None:
+
+            try:
+
+                title_bar.setGeometry(
+                    0,
+                    0,
+                    self.width(),
+                    ApplicationTitleBar.HEIGHT
+                )
+
+                title_bar.raise_()
+
+            except RuntimeError:
+
+                self.application_title_bar = None
+
+        # --------------------------------------------------
         # Loading overlay
         # --------------------------------------------------
 
@@ -11784,7 +12021,7 @@ class MainWindow(QMainWindow):
         if tts is None:
 
             print(
-                "[ASTRA SHUTDOWN] TTS object is unavailable. "
+                "[DHEEPTHI SHUTDOWN] TTS object is unavailable. "
                 "Closing immediately."
             )
 
@@ -11815,11 +12052,11 @@ class MainWindow(QMainWindow):
                     self._goodbye_tts_signal_connected = True
 
                     print(
-                        "[ASTRA SHUTDOWN] TTS completion signal connected."
+                        "[DHEEPTHI SHUTDOWN] TTS completion signal connected."
                     )
 
                 print(
-                    "[ASTRA SHUTDOWN] Speaking goodbye..."
+                    "[DHEEPTHI SHUTDOWN] Speaking goodbye..."
                 )
 
                 result = tts.speak(message)
@@ -11827,14 +12064,14 @@ class MainWindow(QMainWindow):
                 if result is not None:
 
                     print(
-                        "[ASTRA SHUTDOWN] Goodbye TTS started. "
+                        "[DHEEPTHI SHUTDOWN] Goodbye TTS started. "
                         "Waiting for speech_finished."
                     )
 
                     return True
 
                 print(
-                    "[ASTRA SHUTDOWN] Goodbye TTS did not start. "
+                    "[DHEEPTHI SHUTDOWN] Goodbye TTS did not start. "
                     "Closing immediately."
                 )
 
@@ -11845,7 +12082,7 @@ class MainWindow(QMainWindow):
             # not expose speech_finished. Poll the actual speaking state;
             # this is not a fixed shutdown delay.
             print(
-                "[ASTRA SHUTDOWN] speech_finished signal unavailable. "
+                "[DHEEPTHI SHUTDOWN] speech_finished signal unavailable. "
                 "Using speaking-state completion fallback."
             )
 
@@ -11862,7 +12099,7 @@ class MainWindow(QMainWindow):
         except Exception as error:
 
             print(
-                f"[ASTRA SHUTDOWN] Goodbye TTS error: {error}"
+                f"[DHEEPTHI SHUTDOWN] Goodbye TTS error: {error}"
             )
 
             self._finish_goodbye_shutdown()
@@ -11913,7 +12150,7 @@ class MainWindow(QMainWindow):
         except Exception as error:
 
             print(
-                f"[ASTRA SHUTDOWN] TTS completion check error: {error}"
+                f"[DHEEPTHI SHUTDOWN] TTS completion check error: {error}"
             )
 
             self._finish_goodbye_shutdown()
@@ -11950,13 +12187,13 @@ class MainWindow(QMainWindow):
             self.lock_microphone()
 
             print(
-                "[ASTRA SHUTDOWN] Microphone locked for goodbye."
+                "[DHEEPTHI SHUTDOWN] Microphone locked for goodbye."
             )
 
         except Exception as error:
 
             print(
-                f"[ASTRA SHUTDOWN] Microphone lock error: {error}"
+                f"[DHEEPTHI SHUTDOWN] Microphone lock error: {error}"
             )
 
         # Select exactly one closing greeting for this shutdown.
@@ -11965,11 +12202,11 @@ class MainWindow(QMainWindow):
         goodbye_message = random.choice(CLOSE_GREETINGS)
 
         print(
-            f"[ASTRA SHUTDOWN] Selected goodbye : {goodbye_message}"
+            f"[DHEEPTHI SHUTDOWN] Selected goodbye : {goodbye_message}"
         )
 
-        print("\n========== ASTRA GOODBYE ==========")
-        print(f"ASTRA : {goodbye_message}")
+        print("\n========== DHEEPTHI GOODBYE ==========")
+        print(f"DHEEPTHI : {goodbye_message}")
 
         # ----------------------------------------------
         # Prevent new voice / wake-word work.
@@ -11996,13 +12233,13 @@ class MainWindow(QMainWindow):
                     voice_worker.stop()
 
                     print(
-                        "[ASTRA SHUTDOWN] VoiceWorker stop requested."
+                        "[DHEEPTHI SHUTDOWN] VoiceWorker stop requested."
                     )
 
             except Exception as error:
 
                 print(
-                    f"[ASTRA SHUTDOWN] VoiceWorker stop error: {error}"
+                    f"[DHEEPTHI SHUTDOWN] VoiceWorker stop error: {error}"
                 )
 
         # ----------------------------------------------
@@ -12024,7 +12261,7 @@ class MainWindow(QMainWindow):
         except Exception as error:
 
             print(
-                f"[ASTRA SHUTDOWN] Goodbye avatar error: {error}"
+                f"[DHEEPTHI SHUTDOWN] Goodbye avatar error: {error}"
             )
 
         # ----------------------------------------------
@@ -12083,7 +12320,7 @@ class MainWindow(QMainWindow):
         self._goodbye_tts_finished = True
 
         print(
-            "[ASTRA SHUTDOWN] Goodbye TTS finished. "
+            "[DHEEPTHI SHUTDOWN] Goodbye TTS finished. "
             f"Success : {bool(success)}"
         )
 
@@ -12104,7 +12341,7 @@ class MainWindow(QMainWindow):
             return
 
         print(
-            "[ASTRA SHUTDOWN] Goodbye complete. "
+            "[DHEEPTHI SHUTDOWN] Goodbye complete. "
             "Starting final cleanup."
         )
 
@@ -12165,7 +12402,7 @@ class MainWindow(QMainWindow):
         self._closing = True
 
         print(
-            "\n========== ASTRA SHUTDOWN =========="
+            "\n========== DHEEPTHI SHUTDOWN =========="
         )
 
         # ==================================================
@@ -12601,7 +12838,7 @@ class MainWindow(QMainWindow):
         # ==================================================
 
         print(
-            "========== ASTRA SHUTDOWN COMPLETE ==========\n"
+            "========== DHEEPTHI SHUTDOWN COMPLETE ==========\n"
         )
 
         # --------------------------------------------------

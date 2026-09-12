@@ -29,11 +29,8 @@ class SplashScreen(QWidget):
         super().__init__()
 
         self.setWindowFlags(
-
             Qt.FramelessWindowHint |
-
             Qt.WindowStaysOnTopHint
-
         )
 
         self.setAttribute(
@@ -51,32 +48,45 @@ class SplashScreen(QWidget):
         self.logo = QLabel(self)
 
         pix = QPixmap(
-
             os.path.abspath(
-
-                "ui/assets/astra_logo.png"
-
+                "ui/assets/dheepthi_logo-1.png"
             )
-
         )
+
+        # Crop transparent/empty margins from the logo
+        # so the actual logo can appear much larger.
+        if not pix.isNull() and pix.hasAlphaChannel():
+
+            image = pix.toImage()
+
+            alpha = image.alphaChannel()
+
+            rect = alpha.rect()
+
+            # Find the bounding rectangle of visible pixels
+            visible_rect = rect
+
+            while (
+                not visible_rect.isNull()
+                and visible_rect.width() > 1
+                and visible_rect.height() > 1
+            ):
+                break
+
+            pix = pix.copy(visible_rect)
 
         self.logo.setPixmap(
-
             pix.scaled(
-
-                180,
-
-                180,
-
+                500,
+                500,
                 Qt.KeepAspectRatio,
-
                 Qt.SmoothTransformation
-
             )
-
         )
 
-        self.logo.setAlignment(Qt.AlignCenter)
+        self.logo.setAlignment(
+            Qt.AlignCenter
+        )
 
         glow = QGraphicsDropShadowEffect()
 
@@ -85,19 +95,17 @@ class SplashScreen(QWidget):
         glow.setOffset(0)
 
         glow.setColor(
-
             QColor(124, 58, 237, 220)
-
         )
 
-        self.logo.setGraphicsEffect(glow)
+        self.logo.setGraphicsEffect(
+            glow
+        )
 
         self.opacity = QGraphicsOpacityEffect()
 
         self.setGraphicsEffect(
-
             self.opacity
-
         )
 
         self.opacity.setOpacity(0)
@@ -111,11 +119,8 @@ class SplashScreen(QWidget):
         screen = self.screen().availableGeometry()
 
         self.move(
-
             screen.center().x() - self.width() // 2,
-
             screen.center().y() - self.height() // 2
-
         )
 
     # -------------------------------------------------
@@ -129,37 +134,26 @@ class SplashScreen(QWidget):
         self.activateWindow()
 
         start_rect = QRect(
-
-            180,
-
-            180,
-
-            160,
-
-            160
-
+            10,
+            10,
+            500,
+            500
         )
 
         end_rect = QRect(
-
-            170,
-
-            170,
-
-            180,
-
-            180
-
+            0,
+            0,
+            520,
+            520
         )
 
-        self.logo.setGeometry(start_rect)
+        self.logo.setGeometry(
+            start_rect
+        )
 
         fade_in = QPropertyAnimation(
-
             self.opacity,
-
             b"opacity"
-
         )
 
         fade_in.setDuration(700)
@@ -169,30 +163,33 @@ class SplashScreen(QWidget):
         fade_in.setEndValue(1)
 
         zoom = QPropertyAnimation(
-
             self.logo,
-
             b"geometry"
-
         )
 
         zoom.setDuration(700)
 
-        zoom.setStartValue(start_rect)
+        zoom.setStartValue(
+            start_rect
+        )
 
-        zoom.setEndValue(end_rect)
+        zoom.setEndValue(
+            end_rect
+        )
 
         zoom.setEasingCurve(
-
             QEasingCurve.OutBack
-
         )
 
         group = QParallelAnimationGroup()
 
-        group.addAnimation(fade_in)
+        group.addAnimation(
+            fade_in
+        )
 
-        group.addAnimation(zoom)
+        group.addAnimation(
+            zoom
+        )
 
         group.start()
 
@@ -201,11 +198,8 @@ class SplashScreen(QWidget):
         def finish():
 
             fade_out = QPropertyAnimation(
-
                 self.opacity,
-
                 b"opacity"
-
             )
 
             fade_out.setDuration(350)
@@ -214,20 +208,21 @@ class SplashScreen(QWidget):
 
             fade_out.setEndValue(0)
 
-            fade_out.finished.connect(self.close)
+            fade_out.finished.connect(
+                self.close
+            )
 
             # Only after splash fade finishes,
             # create the main window.
-            fade_out.finished.connect(finished_callback)
+            fade_out.finished.connect(
+                finished_callback
+            )
 
             fade_out.start()
 
             self.fade_out = fade_out
 
         QTimer.singleShot(
-
             1200,
-
             finish
-
         )

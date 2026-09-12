@@ -156,7 +156,7 @@ class InitializationWorker(QThread):
 
             self._update_status(
                 0,
-                "Starting ASTRA..."
+                "Starting DHEEPTHI-AI..."
             )
 
             if self.should_stop():
@@ -164,16 +164,16 @@ class InitializationWorker(QThread):
                 return
 
             # ------------------------------------------
-            # Load Whisper Model
+            # Load Groq Model
             # ------------------------------------------
 
             self._update_status(
                 10,
-                "Loading Whisper Model..."
+                "Loading Groq Model..."
             )
 
             print(
-                "Loading Whisper model..."
+                "Loading Groq model..."
             )
 
             if self.recognizer is None:
@@ -274,7 +274,7 @@ class InitializationWorker(QThread):
 
             self._update_status(
                 95,
-                "Preparing ASTRA..."
+                "Preparing DHEEPTHI-AI..."
             )
 
             print(

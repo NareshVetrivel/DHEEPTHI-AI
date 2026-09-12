@@ -41,7 +41,7 @@ def main():
     # -------------------------------------------------
 
     icon_path = os.path.abspath(
-        "ui/assets/astra_logo.png"
+        "ui/assets/dheepthi_logo-2.png"
     )
 
     if os.path.exists(icon_path):
