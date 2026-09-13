@@ -71,6 +71,8 @@ from PySide6.QtGui import (
     QIcon,
     QDesktopServices,
     QPixmap,
+    QImage,
+    QPainter,
 )
 
 from PySide6.QtWidgets import (
@@ -130,7 +132,8 @@ from automation.browser_controller import BrowserController
 from automation.file_monitor import FileMonitor
 
 from workers.initialization_worker import InitializationWorker
-from vision.vision_engine import VisionEngine
+from vision.gemini_vision import GeminiVision
+from vision.ocr import OCREngine
 
 
 # =====================================================
@@ -511,14 +514,15 @@ class CodeAgentWorker(QThread):
 # =====================================================
 
 class VisionWorker(QThread):
-    """Run full screen Vision analysis outside the Qt GUI thread."""
+    """Run cloud Gemini Vision analysis outside the Qt GUI thread."""
 
     analysis_ready = Signal(dict)
     error_occurred = Signal(str)
 
-    def __init__(self, vision_engine):
+    def __init__(self, vision_engine, screenshot_path):
         super().__init__()
         self.vision_engine = vision_engine
+        self.screenshot_path = str(screenshot_path)
 
     def run(self):
         try:
@@ -528,20 +532,43 @@ class VisionWorker(QThread):
                 )
                 return
 
-            analysis = self.vision_engine.analyze_screen(
-                preprocess_ocr=True
+            analysis = self.vision_engine.analyze_image(
+                self.screenshot_path,
+                """
+Look at the complete visible desktop screenshot and describe what is
+actually visible in simple natural language.
+
+Identify the main application or window and mention only the most important
+visible text, buttons, or objects. Keep the response short, clear, and
+conversational, normally 2 to 4 sentences.
+
+Do not use Markdown, headings, bullet points, asterisks, hash symbols,
+backticks, tables, coordinates, confidence values, or special formatting.
+Do not invent anything that is not visible. This is visual understanding
+only; do not perform or suggest automation actions.
+""".strip()
             )
 
-            self.analysis_ready.emit(
-                analysis or {}
-            )
+            self.analysis_ready.emit({
+                "success": True,
+                "description": str(analysis or "").strip(),
+                "objects": [],
+                "ocr_words": [],
+                "ocr_text": str(analysis or "").strip(),
+                "provider": "gemini",
+                "model": getattr(
+                    self.vision_engine,
+                    "model",
+                    "",
+                ),
+            })
 
         except Exception as error:
             print(
                 f"Vision Worker Error : {error}"
             )
             self.error_occurred.emit(
-                "I could not analyze the current screen."
+                f"I could not analyze the current screen: {error}"
             )
 
 # =====================================================
@@ -1735,34 +1762,43 @@ class MainWindow(QMainWindow):
         self.browser_controller = BrowserController()
 
         # ------------------------------------------
-        # Vision Engine
+        # Cloud Vision + OCR Engines
+        # ------------------------------------------
+        #
+        # Vision processing is cloud-based. No local OCR, OpenCV,
+        # YOLO, or Vision mouse automation is initialized here.
+        # The existing MouseController remains untouched and is still
+        # passed to CommandDispatcher for normal mouse commands.
         # ------------------------------------------
 
         try:
 
-            self.vision = VisionEngine(
-                ocr_language="eng"
+            self.vision = GeminiVision()
+            self.ocr = OCREngine(
+                language="eng"
             )
 
             print(
-                "Vision Engine Ready."
+                "Cloud Gemini Vision Engine Ready."
             )
 
             print(
-                f"Vision OCR : {self.vision.is_available()}"
+                f"Vision API Keys : "
+                f"{self.vision.total_api_keys()}"
             )
 
             print(
-                f"Vision Objects : "
-                f"{self.vision.is_object_detection_available()}"
+                f"OCR API Keys : "
+                f"{self.ocr.total_api_keys()}"
             )
 
         except Exception as error:
 
             self.vision = None
+            self.ocr = None
 
             print(
-                f"Vision Engine Initialization Error : {error}"
+                f"Cloud Vision/OCR Initialization Error : {error}"
             )
 
         # ------------------------------------------
@@ -3833,12 +3869,12 @@ class MainWindow(QMainWindow):
 
     @staticmethod
     def _is_vision_command(text):
-        """Detect explicit requests to describe/analyze the current screen."""
+        """Detect natural-language requests to inspect the current screen."""
 
         cleaned = re.sub(
             r"\s+",
             " ",
-            str(text or "").strip().lower()
+            str(text or "").strip().lower(),
         )
 
         if not cleaned:
@@ -3849,17 +3885,31 @@ class MainWindow(QMainWindow):
             "what's on screen",
             "what is on my screen",
             "what's on my screen",
+            "what is in my screen",
+            "what's in my screen",
+            "what is in the screen",
+            "what's in the screen",
             "tell me what is on screen",
             "tell me what's on screen",
+            "tell me what is on my screen",
+            "tell me what's on my screen",
+            "tell me what is in my screen",
+            "tell me what's in my screen",
             "describe the screen",
+            "describe my screen",
             "describe screen",
             "analyze the screen",
+            "analyze my screen",
             "analyze screen",
             "analyse the screen",
+            "analyse my screen",
             "analyse screen",
             "what do you see on screen",
             "what do you see on my screen",
+            "what do you see in my screen",
             "what can you see on screen",
+            "what can you see on my screen",
+            "what can you see in my screen",
             "look at the screen",
             "look at my screen",
             "read the screen",
@@ -3868,93 +3918,65 @@ class MainWindow(QMainWindow):
             "screen la enna irukku",
             "screen-la enna iruku",
             "screen la enna iruku",
+            "screen-la enna irukku nu sollu",
             "screen la enna irukku nu sollu",
+            "screen-la enna iruku nu sollu",
             "screen la enna iruku nu sollu",
+            "screen ah paaru",
+            "screen-a paaru",
+            "screen paaru",
+            "my screen paaru",
+            "my screen la enna irukku",
+            "my screen la enna iruku",
         )
 
-        return any(
-            phrase in cleaned
-            for phrase in phrases
+        if any(phrase in cleaned for phrase in phrases):
+            return True
+
+        # Flexible fallback for natural requests such as
+        # "tell me what is visible on my desktop".
+        screen_terms = (
+            "screen",
+            "display",
+            "desktop",
+            "monitor",
+        )
+
+        request_terms = (
+            "what is",
+            "what's",
+            "what do you see",
+            "what can you see",
+            "tell me",
+            "describe",
+            "analyze",
+            "analyse",
+            "look at",
+            "read",
+        )
+
+        return (
+            any(term in cleaned for term in screen_terms)
+            and any(term in cleaned for term in request_terms)
         )
 
     @staticmethod
     def _format_vision_response(analysis):
-        """Build a human-readable response with object/text coordinates."""
+        """Return concise, human-readable Vision output."""
 
         analysis = analysis or {}
-
         description = str(
             analysis.get("description", "") or ""
         ).strip()
 
-        objects = analysis.get("objects") or []
-        words = analysis.get("ocr_words") or []
-
-        parts = []
-
-        if description:
-            parts.append(description)
-        else:
-            parts.append(
-                "I could not identify any readable text or supported objects on the screen."
+        if not description:
+            return (
+                "I could not identify what is visible on the screen right now."
             )
 
-        if objects:
-            locations = []
-
-            for obj in objects[:50]:
-                label = str(
-                    obj.get("label", "object")
-                )
-
-                confidence = float(
-                    obj.get("confidence", 0.0) or 0.0
-                )
-
-                locations.append(
-                    f"{label}: box={obj.get('box')}, "
-                    f"center={obj.get('center')}, "
-                    f"confidence={confidence:.2f}"
-                )
-
-            parts.append(
-                "Object coordinates: "
-                + "; ".join(locations)
-                + "."
-            )
-
-        if words:
-            text_locations = []
-
-            for word in words[:40]:
-                word_text = str(
-                    word.get("text", "")
-                ).strip()
-
-                if not word_text:
-                    continue
-
-                text_locations.append(
-                    f"{word_text}: box={word.get('box')}, "
-                    f"center={word.get('center')}"
-                )
-
-            if text_locations:
-                parts.append(
-                    "Text coordinates: "
-                    + "; ".join(text_locations)
-                    + "."
-                )
-
-        width = analysis.get("image_width")
-        height = analysis.get("image_height")
-
-        if width and height:
-            parts.append(
-                f"Screen size: {width} x {height} pixels."
-            )
-
-        return " ".join(parts).strip()
+        return MainWindow._clean_vision_response_for_tts(
+            description
+        )
 
     def _start_vision_screen_analysis(
         self,
@@ -3968,7 +3990,7 @@ class MainWindow(QMainWindow):
         if self.vision is None:
             message = (
                 "Vision is not available. "
-                "Please check the VisionEngine setup."
+                "Please check the cloud Gemini Vision setup."
             )
 
             try:
@@ -3987,7 +4009,9 @@ class MainWindow(QMainWindow):
 
             if speak_response and self.tts is not None:
                 try:
-                    self.tts.speak(message)
+                    self.tts.speak(
+                        self._clean_vision_response_for_tts(message)
+                    )
                     self._unlock_after_speech(
                         restart_wake=True,
                         terminal_avatar_state="error"
@@ -4053,8 +4077,249 @@ class MainWindow(QMainWindow):
         except Exception:
             pass
 
+        # --------------------------------------------------------------
+        # Capture the current desktop once before starting the cloud worker.
+        # The screenshot capture itself is local and lightweight; Gemini
+        # processing happens entirely in the background QThread.
+        # --------------------------------------------------------------
+
+        screenshot_path = None
+
+        try:
+            import tempfile
+
+            # ----------------------------------------------------------
+            # Capture the current Windows desktop.
+            #
+            # IMPORTANT: ImageGrab.grab() returns a PIL Image, whose
+            # save() method returns None on success.  The previous code
+            # treated that return value as a boolean, so a successful PIL
+            # save could be reported as:
+            #     Unable to save the current desktop capture.
+            #
+            # Keep PIL and Qt save handling separate and verify the actual
+            # file instead of relying on PIL Image.save()'s return value.
+            # ----------------------------------------------------------
+
+            screenshot_image = None
+            capture_method = None
+
+            # 1. Preferred: complete Windows virtual desktop.
+            try:
+                from PIL import ImageGrab
+
+                screenshot_image = ImageGrab.grab(
+                    all_screens=True
+                )
+
+                if screenshot_image is not None:
+                    capture_method = "PIL ImageGrab / all screens"
+                    print(
+                        "Vision Capture : Full Windows virtual desktop"
+                    )
+
+            except Exception as capture_error:
+                print(
+                    f"Full desktop capture fallback : {capture_error}"
+                )
+
+            # 2. PIL primary-screen fallback.  Some Windows display / DPI
+            # configurations can reject all_screens=True while normal
+            # ImageGrab still works.
+            if screenshot_image is None:
+                try:
+                    from PIL import ImageGrab
+
+                    screenshot_image = ImageGrab.grab()
+
+                    if screenshot_image is not None:
+                        capture_method = "PIL ImageGrab / primary screen"
+                        print(
+                            "Vision Capture : Primary Windows screen fallback"
+                        )
+
+                except Exception as capture_error:
+                    print(
+                        f"Primary screen capture fallback : {capture_error}"
+                    )
+
+            # 3. Qt fallback.
+            if screenshot_image is None:
+                screens = QApplication.screens()
+
+                if not screens:
+                    raise RuntimeError(
+                        "No display screen is available."
+                    )
+
+                geometries = [
+                    screen.geometry()
+                    for screen in screens
+                ]
+
+                left = min(
+                    geometry.left()
+                    for geometry in geometries
+                )
+                top = min(
+                    geometry.top()
+                    for geometry in geometries
+                )
+                right = max(
+                    geometry.right()
+                    for geometry in geometries
+                )
+                bottom = max(
+                    geometry.bottom()
+                    for geometry in geometries
+                )
+
+                width = right - left + 1
+                height = bottom - top + 1
+
+                if width <= 0 or height <= 0:
+                    raise RuntimeError(
+                        f"Invalid desktop geometry: {width}x{height}."
+                    )
+
+                screenshot_image = QImage(
+                    width,
+                    height,
+                    QImage.Format.Format_RGB32,
+                )
+
+                if screenshot_image.isNull():
+                    raise RuntimeError(
+                        "Qt could not allocate the desktop capture image."
+                    )
+
+                screenshot_image.fill(Qt.black)
+
+                painter = QPainter(screenshot_image)
+
+                try:
+                    captured_screen = False
+
+                    for screen, geometry in zip(
+                        screens,
+                        geometries,
+                    ):
+                        pixmap = screen.grabWindow(0)
+
+                        if pixmap.isNull():
+                            print(
+                                f"Vision Capture : Could not grab screen {screen.name()}"
+                            )
+                            continue
+
+                        painter.drawPixmap(
+                            geometry.left() - left,
+                            geometry.top() - top,
+                            pixmap,
+                        )
+                        captured_screen = True
+
+                finally:
+                    painter.end()
+
+                if not captured_screen:
+                    raise RuntimeError(
+                        "Qt could not capture any display screen."
+                    )
+
+                capture_method = "Qt QScreen fallback"
+                print(
+                    "Vision Capture : Qt desktop fallback"
+                )
+
+            # ----------------------------------------------------------
+            # Create a unique destination path.
+            # ----------------------------------------------------------
+
+            temp_file = tempfile.NamedTemporaryFile(
+                prefix="dheepthi_vision_",
+                suffix=".png",
+                delete=False,
+            )
+
+            screenshot_path = temp_file.name
+            temp_file.close()
+
+            screenshot_file = Path(
+                screenshot_path
+            )
+
+            # ----------------------------------------------------------
+            # Save according to the actual image type.
+            # PIL Image.save() returns None on success, so NEVER use
+            # `if not image.save(...)` for a PIL image.
+            # ----------------------------------------------------------
+
+            if hasattr(screenshot_image, "save"):
+
+                if screenshot_image.__class__.__module__.startswith("PIL"):
+                    screenshot_image.save(
+                        screenshot_path,
+                        format="PNG",
+                    )
+                else:
+                    saved = screenshot_image.save(
+                        screenshot_path,
+                        "PNG",
+                    )
+
+                    if saved is False:
+                        raise RuntimeError(
+                            "Qt could not save the current desktop capture as PNG."
+                        )
+
+            else:
+                raise RuntimeError(
+                    "Desktop capture returned an unsupported image type."
+                )
+
+            # ----------------------------------------------------------
+            # Validate the physical file before handing it to VisionWorker.
+            # This catches silent / partial capture failures early.
+            # ----------------------------------------------------------
+
+            if (
+                not screenshot_file.exists()
+                or screenshot_file.stat().st_size <= 0
+            ):
+                raise RuntimeError(
+                    "Desktop capture file was not created or is empty."
+                )
+
+            print(
+                f"Vision Capture Saved : {screenshot_path}"
+            )
+            print(
+                f"Vision Capture Size : {screenshot_file.stat().st_size} bytes"
+            )
+            print(
+                f"Vision Capture Method : {capture_method}"
+            )
+
+        except Exception as error:
+            self.vision_processing = False
+
+            if screenshot_path:
+                try:
+                    Path(screenshot_path).unlink(
+                        missing_ok=True
+                    )
+                except Exception:
+                    pass
+
+            self._on_vision_analysis_error(
+                f"I could not capture the current screen: {error}"
+            )
+            return True
+
         self.vision_worker = VisionWorker(
-            self.vision
+            self.vision,
+            screenshot_path,
         )
 
         self.vision_worker.analysis_ready.connect(
@@ -4084,6 +4349,133 @@ class MainWindow(QMainWindow):
         self.vision_worker.start()
 
         return True
+
+
+    @staticmethod
+    def _clean_vision_response_for_tts(message):
+        """Remove Markdown/formatting before text reaches TTS."""
+
+        text = str(message or "").strip()
+
+        if not text:
+            return ""
+
+        # Markdown links: speak only the human-readable label.
+        text = re.sub(
+            r"\[([^\]]+)\]\((?:[^()]|\([^()]*\))*\)",
+            r"\1",
+            text,
+        )
+
+        # Fenced and inline code markers.
+        text = re.sub(
+            r"```[A-Za-z0-9_+.-]*",
+            "",
+            text,
+        )
+        text = text.replace(
+            "```",
+            "",
+        )
+        text = text.replace(
+            "`",
+            "",
+        )
+
+        # Markdown headings, blockquotes, bullets and numbered lists.
+        text = re.sub(
+            r"(?m)^\s*#{1,6}\s*",
+            "",
+            text,
+        )
+        text = re.sub(
+            r"(?m)^\s*>\s?",
+            "",
+            text,
+        )
+        text = re.sub(
+            r"(?m)^\s*[-+*]\s+",
+            "",
+            text,
+        )
+        text = re.sub(
+            r"(?m)^\s*\d+[.)]\s+",
+            "",
+            text,
+        )
+
+        # Markdown table formatting.
+        text = re.sub(
+            r"(?m)^\s*\|?\s*:?-{3,}:?\s*(?:\|\s*:?-{3,}:?\s*)+\|?\s*$",
+            "",
+            text,
+        )
+        text = text.replace(
+            "|",
+            " ",
+        )
+
+        # Bold, italic and strike delimiters.
+        text = text.replace(
+            "**",
+            "",
+        )
+        text = text.replace(
+            "__",
+            "",
+        )
+        text = text.replace(
+            "~~",
+            "",
+        )
+        text = text.replace(
+            "*",
+            " ",
+        )
+
+        # Standalone underscores are formatting markers. Do not strip
+        # underscores inside normal words such as file_name.
+        text = text.replace(
+            "_",
+            " ",
+        )
+        text = re.sub(
+            r"(?<!\w)#+(?!\w)",
+            " ",
+            text,
+        )
+
+        # Final protection against heading markers reaching TTS.
+        text = re.sub(
+            r"(?m)^\s*#+\s*",
+            "",
+            text,
+        )
+
+        lines = []
+        for line in text.splitlines():
+            line = re.sub(
+                r"[ \t]+",
+                " ",
+                line,
+            ).strip()
+
+            if line:
+                lines.append(line)
+
+        text = " ".join(lines)
+        text = re.sub(
+            r"\s+([,.!?;:])",
+            r"\1",
+            text,
+        )
+        text = re.sub(
+            r"\s{2,}",
+            " ",
+            text,
+        ).strip()
+
+        return text
 
     @Slot(dict)
     def _on_vision_analysis_ready(
@@ -4159,8 +4551,12 @@ class MainWindow(QMainWindow):
             )
 
             try:
-                self.tts.speak(
+                speech_message = self._clean_vision_response_for_tts(
                     message
+                )
+
+                self.tts.speak(
+                    speech_message
                 )
 
                 self._unlock_after_speech(
@@ -4254,7 +4650,7 @@ class MainWindow(QMainWindow):
             try:
 
                 self.tts.speak(
-                    error_message
+                    self._clean_vision_response_for_tts(error_message)
                 )
 
                 self._unlock_after_speech(
@@ -4290,7 +4686,27 @@ class MainWindow(QMainWindow):
                 pass
 
         self.vision_processing = False
+
+        worker_path = None
+
+        if worker is not None:
+            worker_path = getattr(
+                worker,
+                "screenshot_path",
+                None,
+            )
+
         self.vision_worker = None
+
+        if worker_path:
+            try:
+                Path(worker_path).unlink(
+                    missing_ok=True
+                )
+            except Exception as error:
+                print(
+                    f"Vision screenshot cleanup error : {error}"
+                )
 
     # Process Command
     # --------------------------------------------------
@@ -4695,6 +5111,10 @@ class MainWindow(QMainWindow):
         # ------------------------------------------
 
         if self._is_vision_command(text):
+
+            print(
+                f"VISION ROUTE SELECTED : {text}"
+            )
 
             self.mic_widget.show_conversation(
                 text,
@@ -5277,7 +5697,9 @@ class MainWindow(QMainWindow):
                 # AvatarWidget automatically returns to idle
                 self._set_avatar_state("speaking")
 
-                self.tts.speak(ai_reply)
+                speech_reply = self._clean_vision_response_for_tts(ai_reply)
+
+                self.tts.speak(speech_reply)
 
                 self._unlock_after_speech(
                     restart_wake=True,
@@ -13388,7 +13810,7 @@ class MainWindow(QMainWindow):
             if vision is not None:
 
                 print(
-                    "Closing VisionEngine..."
+                    "Closing Cloud Vision Engine..."
                 )
 
                 vision.close()
@@ -13396,13 +13818,13 @@ class MainWindow(QMainWindow):
                 self.vision = None
 
                 print(
-                    "VisionEngine closed successfully."
+                    "Cloud Vision Engine closed successfully."
                 )
 
         except Exception as error:
 
             print(
-                f"VisionEngine Cleanup Error : {error}"
+                f"Cloud Vision Engine Cleanup Error : {error}"
             )
 
         # INITIALIZATION WORKER
@@ -13634,7 +14056,23 @@ class MainWindow(QMainWindow):
             except RuntimeError:
                 pass
 
+        worker_path = getattr(
+            worker,
+            "screenshot_path",
+            None,
+        ) if worker is not None else None
+
         self.vision_worker = None
+
+        if worker_path:
+            try:
+                Path(worker_path).unlink(
+                    missing_ok=True
+                )
+            except Exception as error:
+                print(
+                    f"Vision screenshot cleanup error : {error}"
+                )
 
         print(
             "VisionWorker stopped asynchronously; "
