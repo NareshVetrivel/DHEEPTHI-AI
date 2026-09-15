@@ -1,7 +1,19 @@
 """
-ASTRA-AI
-Premium Left Status Panel
-Review 1 Production UI
+DHEEPTHI-AI
+Lightweight Glass Left Status Panel
+--------------------------------------------
+
+Features
+✓ Lightweight Glass Dashboard
+✓ Transparent Panel
+✓ Premium SYSTEM STATUS Heading
+✓ Strong SYSTEM STATUS Visibility
+✓ Clean 2 × 4 Status Grid
+✓ No Blur Effects
+✓ No Graphics Shadow Effects
+✓ No Animations
+✓ i3-Friendly Rendering
+✓ Existing Status API Preserved
 """
 
 from PySide6.QtCore import Qt
@@ -19,13 +31,26 @@ from ui.widgets.status_tile import StatusTileWidget
 
 class LeftPanelWidget(QWidget):
 
-    def __init__(self, parent=None):
-        super().__init__(parent)
+    def __init__(
+        self,
+        parent=None
+    ):
 
-        self.setObjectName("LeftPanel")
+        super().__init__(
+            parent
+        )
 
-        self.setMinimumWidth(360)
-        self.setMaximumWidth(370)
+        self.setObjectName(
+            "LeftPanel"
+        )
+
+        self.setMinimumWidth(
+            360
+        )
+
+        self.setMaximumWidth(
+            370
+        )
 
         self.setSizePolicy(
             QSizePolicy.Fixed,
@@ -34,24 +59,35 @@ class LeftPanelWidget(QWidget):
 
         self.build_ui()
 
-    # ---------------------------------------------------------
-    # Build UI
-    # ---------------------------------------------------------
+    # =========================================================
+    # BUILD UI
+    # =========================================================
 
     def build_ui(self):
 
+        # =====================================================
+        # TRANSPARENT PANEL
+        # =====================================================
+
         self.setStyleSheet("""
 
-        QWidget#LeftPanel{
+        QWidget#LeftPanel {
 
-            background:transparent;
-            border:none;
+            background: transparent;
+
+            border: none;
 
         }
 
         """)
 
-        root = QVBoxLayout(self)
+        # =====================================================
+        # ROOT LAYOUT
+        # =====================================================
+
+        root = QVBoxLayout(
+            self
+        )
 
         root.setContentsMargins(
             6,
@@ -60,48 +96,95 @@ class LeftPanelWidget(QWidget):
             8
         )
 
-        root.setSpacing(16)
+        root.setSpacing(
+            16
+        )
 
-        # -------------------------------------------------
-        # Title
-        # -------------------------------------------------
+        # =====================================================
+        # SYSTEM STATUS TITLE
+        # =====================================================
+        #
+        # Strong dark indigo is used so the heading remains
+        # clearly visible over the bright purple / blue
+        # background image.
+        #
+        # Lightweight:
+        # - No shadow
+        # - No blur
+        # - No animation
+        #
 
-        title = QLabel("SYSTEM STATUS")
+        self.title = QLabel(
+            "SYSTEM STATUS"
+        )
 
-        title.setAlignment(
+        self.title.setAlignment(
             Qt.AlignLeft |
             Qt.AlignVCenter
         )
 
-        title.setStyleSheet("""
+        self.title.setContentsMargins(
+            8,
+            0,
+            0,
+            0
+        )
 
-        color:#7C3AED;
+        self.title.setStyleSheet("""
 
-        font-size:20px;
+        QLabel {
 
-        font-weight:700;
+            color: #2E1065;
 
-        padding-left:18px;
+            font-size: 22px;
 
-        background:transparent;
+            font-weight: 800;
+
+            letter-spacing: 1px;
+
+            padding-left: 10px;
+
+            background: transparent;
+
+            border: none;
+
+        }
 
         """)
 
-        root.addWidget(title)
+        root.addWidget(
+            self.title
+        )
 
-        # -------------------------------------------------
-        # Dashboard Grid
-        # -------------------------------------------------
+        # =====================================================
+        # DASHBOARD GRID CONTAINER
+        # =====================================================
 
         self.grid_container = QWidget()
 
+        self.grid_container.setObjectName(
+            "SystemStatusGrid"
+        )
+
         self.grid_container.setStyleSheet("""
 
-        background:transparent;
+        QWidget#SystemStatusGrid {
+
+            background: transparent;
+
+            border: none;
+
+        }
 
         """)
 
-        self.grid = QGridLayout(self.grid_container)
+        # =====================================================
+        # GRID
+        # =====================================================
+
+        self.grid = QGridLayout(
+            self.grid_container
+        )
 
         self.grid.setSizeConstraint(
             QGridLayout.SetMinimumSize
@@ -114,27 +197,26 @@ class LeftPanelWidget(QWidget):
             0
         )
 
-        self.grid.setHorizontalSpacing(12)
+        # =====================================================
+        # LIGHTWEIGHT GLASS SPACING
+        # =====================================================
 
-        self.grid.setVerticalSpacing(12)
-
-        self.grid.setContentsMargins(
-            0,
-            0,
-            0,
-            0
+        self.grid.setHorizontalSpacing(
+            12
         )
 
-        self.grid.setSpacing(12)
+        self.grid.setVerticalSpacing(
+            12
+        )
 
         root.addWidget(
             self.grid_container,
             stretch=1
         )
 
-        # -------------------------------------------------
-        # Dashboard Tiles
-        # -------------------------------------------------
+        # =====================================================
+        # STATUS TILES
+        # =====================================================
 
         self.listening = StatusTileWidget(
             title="Listening",
@@ -184,121 +266,225 @@ class LeftPanelWidget(QWidget):
             icon="📶"
         )
 
-        # -------------------------------------------------
-        # 2 × 4 Premium Dashboard
-        # -------------------------------------------------
+        # =====================================================
+        # 2 × 4 DASHBOARD
+        # =====================================================
 
-        self.grid.addWidget(self.listening, 0, 0)
-        self.grid.addWidget(self.thinking, 0, 1)
+        self.grid.addWidget(
+            self.listening,
+            0,
+            0
+        )
 
-        self.grid.addWidget(self.speaking, 1, 0)
-        self.grid.addWidget(self.whisper, 1, 1)
+        self.grid.addWidget(
+            self.thinking,
+            0,
+            1
+        )
 
-        self.grid.addWidget(self.automation, 2, 0)
-        self.grid.addWidget(self.browser, 2, 1)
+        self.grid.addWidget(
+            self.speaking,
+            1,
+            0
+        )
 
-        self.grid.addWidget(self.database, 3, 0)
-        self.grid.addWidget(self.internet, 3, 1)
+        self.grid.addWidget(
+            self.whisper,
+            1,
+            1
+        )
 
-        # -------------------------------------------------
-        # Equal Dashboard Stretch
-        # -------------------------------------------------
+        self.grid.addWidget(
+            self.automation,
+            2,
+            0
+        )
+
+        self.grid.addWidget(
+            self.browser,
+            2,
+            1
+        )
+
+        self.grid.addWidget(
+            self.database,
+            3,
+            0
+        )
+
+        self.grid.addWidget(
+            self.internet,
+            3,
+            1
+        )
+
+        # =====================================================
+        # EQUAL COLUMN STRETCH
+        # =====================================================
 
         for column in range(2):
-            self.grid.setColumnStretch(column, 1)
+
+            self.grid.setColumnStretch(
+                column,
+                1
+            )
+
+        # =====================================================
+        # EQUAL ROW STRETCH
+        # =====================================================
 
         for row in range(4):
-            self.grid.setRowStretch(row, 1)
 
-    # ---------------------------------------------------------
-    # Public API
-    # ---------------------------------------------------------
+            self.grid.setRowStretch(
+                row,
+                1
+            )
 
-    def set_listening(self, status):
+    # =========================================================
+    # PUBLIC API
+    # =========================================================
+
+    def set_listening(
+        self,
+        status
+    ):
 
         if self.listening.status != status:
 
-            self.listening.update_status(status)
+            self.listening.update_status(
+                status
+            )
 
+    # ---------------------------------------------------------
 
-    def set_thinking(self, status):
+    def set_thinking(
+        self,
+        status
+    ):
 
         if self.thinking.status != status:
 
-            self.thinking.update_status(status)
+            self.thinking.update_status(
+                status
+            )
 
+    # ---------------------------------------------------------
 
-    def set_speaking(self, status):
+    def set_speaking(
+        self,
+        status
+    ):
 
         if self.speaking.status != status:
 
-            self.speaking.update_status(status)
+            self.speaking.update_status(
+                status
+            )
 
+    # ---------------------------------------------------------
 
-    def set_whisper(self, status):
+    def set_whisper(
+        self,
+        status
+    ):
 
         if self.whisper.status != status:
 
-            self.whisper.update_status(status)
+            self.whisper.update_status(
+                status
+            )
 
+    # ---------------------------------------------------------
 
-    def set_automation(self, status):
+    def set_automation(
+        self,
+        status
+    ):
 
         if self.automation.status != status:
 
-            self.automation.update_status(status)
+            self.automation.update_status(
+                status
+            )
 
+    # ---------------------------------------------------------
 
-    def set_browser(self, status):
+    def set_browser(
+        self,
+        status
+    ):
 
         if self.browser.status != status:
 
-            self.browser.update_status(status)
+            self.browser.update_status(
+                status
+            )
 
+    # ---------------------------------------------------------
 
-    def set_database(self, status):
+    def set_database(
+        self,
+        status
+    ):
 
         if self.database.status != status:
 
-            self.database.update_status(status)
+            self.database.update_status(
+                status
+            )
 
+    # ---------------------------------------------------------
 
-    def set_internet(self, status):
+    def set_internet(
+        self,
+        status
+    ):
 
         if self.internet.status != status:
 
-            self.internet.update_status(status)
+            self.internet.update_status(
+                status
+            )
 
-    # ---------------------------------------------------------
-    # Generic Backend Updater
-    # ---------------------------------------------------------
+    # =========================================================
+    # GENERIC BACKEND UPDATER
+    # =========================================================
 
     def update_status(
         self,
         module,
         status
     ):
+
         """
         Generic updater used by MainWindow.
         """
 
         cards = {
 
-            "listening": self.listening,
+            "listening":
+                self.listening,
 
-            "thinking": self.thinking,
+            "thinking":
+                self.thinking,
 
-            "speaking": self.speaking,
+            "speaking":
+                self.speaking,
 
-            "whisper": self.whisper,
+            "whisper":
+                self.whisper,
 
-            "automation": self.automation,
+            "automation":
+                self.automation,
 
-            "browser": self.browser,
+            "browser":
+                self.browser,
 
-            "database": self.database,
+            "database":
+                self.database,
 
-            "internet": self.internet,
+            "internet":
+                self.internet,
 
         }
 
@@ -306,13 +492,18 @@ class LeftPanelWidget(QWidget):
             module.lower()
         )
 
-        if card and card.status != status:
+        if (
+            card
+            and card.status != status
+        ):
 
-            card.update_status(status)
+            card.update_status(
+                status
+            )
 
-    # ---------------------------------------------------------
-    # Enable / Disable All Tiles
-    # ---------------------------------------------------------
+    # =========================================================
+    # ENABLE / DISABLE ALL TILES
+    # =========================================================
 
     def set_all_enabled(
         self,
@@ -339,26 +530,44 @@ class LeftPanelWidget(QWidget):
 
         ]:
 
-            tile.set_card_enabled(enabled)
+            tile.set_card_enabled(
+                enabled
+            )
 
-    # ---------------------------------------------------------
-    # Dashboard Reset
-    # ---------------------------------------------------------
+    # =========================================================
+    # DASHBOARD RESET
+    # =========================================================
 
     def reset(self):
 
-        self.set_listening("Idle")
+        self.set_listening(
+            "Idle"
+        )
 
-        self.set_thinking("Inactive")
+        self.set_thinking(
+            "Inactive"
+        )
 
-        self.set_speaking("Silent")
+        self.set_speaking(
+            "Silent"
+        )
 
-        self.set_whisper("Loaded")
+        self.set_whisper(
+            "Loaded"
+        )
 
-        self.set_automation("Ready")
+        self.set_automation(
+            "Ready"
+        )
 
-        self.set_browser("Standby")
+        self.set_browser(
+            "Standby"
+        )
 
-        self.set_database("Connected")
+        self.set_database(
+            "Connected"
+        )
 
-        self.set_internet("Online")
+        self.set_internet(
+            "Online"
+        )

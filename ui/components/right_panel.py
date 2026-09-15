@@ -1,7 +1,20 @@
 """
-ASTRA-AI
-Premium Right Status Panel
-Review 1 Production UI
+DHEEPTHI-AI
+Lightweight Glass Right Status Panel
+--------------------------------------------
+
+Features
+✓ Lightweight Glass-Compatible Right Panel
+✓ Transparent Panel Background
+✓ Premium QUICK STATUS Title
+✓ Strong QUICK STATUS Visibility
+✓ Existing 2 × 4 Metric Layout Preserved
+✓ Existing Live System Monitoring Preserved
+✓ Existing Fade In / Fade Out Preserved
+✓ Existing Public API Preserved
+✓ No Heavy Panel Effects
+✓ No Additional Animations
+✓ i3-Friendly Rendering
 """
 
 from PySide6.QtCore import (
@@ -10,8 +23,6 @@ from PySide6.QtCore import (
     QPropertyAnimation,
     QEasingCurve,
 )
-
-from PySide6.QtGui import QColor
 
 from PySide6.QtWidgets import (
     QWidget,
@@ -30,13 +41,20 @@ from ui.widgets.status_metric_tile import StatusMetricTile
 
 class RightPanelWidget(QWidget):
 
-    def __init__(self, parent=None):
+    def __init__(
+        self,
+        parent=None
+    ):
 
         super().__init__(parent)
 
         self.setObjectName(
             "RightPanel"
         )
+
+        # =====================================================
+        # PANEL SIZE
+        # =====================================================
 
         self.setMinimumWidth(
             360
@@ -51,9 +69,9 @@ class RightPanelWidget(QWidget):
             QSizePolicy.Expanding
         )
 
-        # -------------------------------------------------
-        # Fade State
-        # -------------------------------------------------
+        # =====================================================
+        # FADE STATE
+        # =====================================================
 
         self._fade_effect = None
 
@@ -63,15 +81,15 @@ class RightPanelWidget(QWidget):
 
         self._tile_effects_disabled = False
 
-        # -------------------------------------------------
-        # Build UI
-        # -------------------------------------------------
+        # =====================================================
+        # BUILD UI
+        # =====================================================
 
         self.build_ui()
 
-        # -------------------------------------------------
-        # Live System Monitor
-        # -------------------------------------------------
+        # =====================================================
+        # LIVE SYSTEM MONITOR
+        # =====================================================
 
         self.monitor_timer = QTimer(
             self
@@ -87,19 +105,23 @@ class RightPanelWidget(QWidget):
 
         self.update_system_metrics()
 
-    # =====================================================
-    # Build UI
-    # =====================================================
+    # =========================================================
+    # BUILD UI
+    # =========================================================
 
     def build_ui(self):
 
+        # =====================================================
+        # TRANSPARENT PANEL
+        # =====================================================
+
         self.setStyleSheet("""
 
-        QWidget#RightPanel{
+        QWidget#RightPanel {
 
-            background:transparent;
+            background: transparent;
 
-            border:none;
+            border: none;
 
         }
 
@@ -110,7 +132,7 @@ class RightPanelWidget(QWidget):
         )
 
         root.setContentsMargins(
-            20,
+            18,
             8,
             10,
             8
@@ -120,9 +142,16 @@ class RightPanelWidget(QWidget):
             16
         )
 
-        # -------------------------------------------------
-        # Title
-        # -------------------------------------------------
+        # =====================================================
+        # QUICK STATUS TITLE
+        # =====================================================
+        #
+        # Strong dark indigo is used here because the
+        # background image is bright purple / blue.
+        #
+        # This keeps QUICK STATUS clearly readable without
+        # adding shadow, blur, or heavy graphics.
+        #
 
         self.title = QLabel(
             "QUICK STATUS"
@@ -134,7 +163,7 @@ class RightPanelWidget(QWidget):
         )
 
         self.title.setContentsMargins(
-            10,
+            8,
             0,
             0,
             0
@@ -142,15 +171,23 @@ class RightPanelWidget(QWidget):
 
         self.title.setStyleSheet("""
 
-        color:#7C3AED;
+        QLabel {
 
-        font-size:20px;
+            color: #2E1065;
 
-        font-weight:700;
+            font-size: 22px;
 
-        padding-left:4px;
+            font-weight: 800;
 
-        background:transparent;
+            letter-spacing: 1px;
+
+            padding-left: 2px;
+
+            background: transparent;
+
+            border: none;
+
+        }
 
         """)
 
@@ -158,15 +195,21 @@ class RightPanelWidget(QWidget):
             self.title
         )
 
-        # -------------------------------------------------
-        # Dashboard Grid
-        # -------------------------------------------------
+        # =====================================================
+        # DASHBOARD GRID CONTAINER
+        # =====================================================
 
         self.grid_container = QWidget()
 
         self.grid_container.setStyleSheet("""
 
-        background:transparent;
+        QWidget {
+
+            background: transparent;
+
+            border: none;
+
+        }
 
         """)
 
@@ -175,7 +218,7 @@ class RightPanelWidget(QWidget):
         )
 
         self.grid.setContentsMargins(
-            10,
+            8,
             0,
             0,
             0
@@ -200,9 +243,9 @@ class RightPanelWidget(QWidget):
             alignment=Qt.AlignTop
         )
 
-        # -------------------------------------------------
-        # Metric Tiles
-        # -------------------------------------------------
+        # =====================================================
+        # METRIC TILES
+        # =====================================================
 
         self.health = StatusMetricTile(
             title="Health",
@@ -260,9 +303,9 @@ class RightPanelWidget(QWidget):
             color="#0891B2"
         )
 
-        # -------------------------------------------------
-        # Dashboard
-        # -------------------------------------------------
+        # =====================================================
+        # 2 × 4 DASHBOARD
+        # =====================================================
 
         self.grid.addWidget(
             self.health,
@@ -312,9 +355,9 @@ class RightPanelWidget(QWidget):
             1
         )
 
-        # -------------------------------------------------
-        # Equal Grid Stretch
-        # -------------------------------------------------
+        # =====================================================
+        # EQUAL GRID STRETCH
+        # =====================================================
 
         for column in range(2):
 
@@ -330,9 +373,9 @@ class RightPanelWidget(QWidget):
                 1
             )
 
-        # -------------------------------------------------
-        # Store Metric Tiles
-        # -------------------------------------------------
+        # =====================================================
+        # METRIC TILE COLLECTION
+        # =====================================================
 
         self._metric_tiles = [
 
@@ -354,19 +397,11 @@ class RightPanelWidget(QWidget):
 
         ]
 
-    # =====================================================
-    # Fade Helpers
-    # =====================================================
+    # =========================================================
+    # FADE HELPERS
+    # =========================================================
 
     def _disable_tile_effects(self):
-
-        """
-        Temporarily remove StatusMetricTile graphics
-        effects while the parent opacity animation runs.
-
-        This keeps the fade animation independent from the
-        child drop-shadow effects.
-        """
 
         if self._tile_effects_disabled:
 
@@ -386,14 +421,9 @@ class RightPanelWidget(QWidget):
 
         self._tile_effects_disabled = True
 
-    # -----------------------------------------------------
+    # ---------------------------------------------------------
 
     def _restore_tile_effects(self):
-
-        """
-        Restore the original StatusMetricTile shadow
-        effects after the fade animation completes.
-        """
 
         if not self._tile_effects_disabled:
 
@@ -421,24 +451,14 @@ class RightPanelWidget(QWidget):
 
         self._tile_effects_disabled = False
 
-    # =====================================================
-    # Fade Out
-    # =====================================================
+    # =========================================================
+    # FADE OUT
+    # =========================================================
 
     def fade_out(
         self,
         duration=650
     ):
-
-        """
-        Fade the complete Right Status Panel out.
-
-        Used when Conversation Panel opens.
-        """
-
-        # -------------------------------------------------
-        # Stop previous animation
-        # -------------------------------------------------
 
         if self._fade_animation is not None:
 
@@ -450,23 +470,11 @@ class RightPanelWidget(QWidget):
 
                 pass
 
-        # -------------------------------------------------
-        # Already hidden
-        # -------------------------------------------------
-
         if self._fade_hidden:
 
             return
 
-        # -------------------------------------------------
-        # Disable nested tile graphics effects
-        # -------------------------------------------------
-
         self._disable_tile_effects()
-
-        # -------------------------------------------------
-        # Create opacity effect
-        # -------------------------------------------------
 
         if self._fade_effect is None:
 
@@ -489,10 +497,6 @@ class RightPanelWidget(QWidget):
             self._fade_effect.setOpacity(
                 1.0
             )
-
-        # -------------------------------------------------
-        # Animation
-        # -------------------------------------------------
 
         self._fade_animation = (
             QPropertyAnimation(
@@ -524,9 +528,9 @@ class RightPanelWidget(QWidget):
 
         self._fade_animation.start()
 
-    # =====================================================
-    # Fade Out Finished
-    # =====================================================
+    # =========================================================
+    # FADE OUT FINISHED
+    # =========================================================
 
     def _fade_out_finished(self):
 
@@ -538,24 +542,14 @@ class RightPanelWidget(QWidget):
                 0.0
             )
 
-    # =====================================================
-    # Fade In
-    # =====================================================
+    # =========================================================
+    # FADE IN
+    # =========================================================
 
     def fade_in(
         self,
         duration=650
     ):
-
-        """
-        Fade the complete Right Status Panel back in.
-
-        Used when Conversation Panel closes.
-        """
-
-        # -------------------------------------------------
-        # Stop previous animation
-        # -------------------------------------------------
 
         if self._fade_animation is not None:
 
@@ -566,10 +560,6 @@ class RightPanelWidget(QWidget):
             except Exception:
 
                 pass
-
-        # -------------------------------------------------
-        # Create effect if required
-        # -------------------------------------------------
 
         if self._fade_effect is None:
 
@@ -593,15 +583,7 @@ class RightPanelWidget(QWidget):
                 0.0
             )
 
-        # -------------------------------------------------
-        # Keep child effects disabled during fade
-        # -------------------------------------------------
-
         self._disable_tile_effects()
-
-        # -------------------------------------------------
-        # Animation
-        # -------------------------------------------------
 
         self._fade_animation = (
             QPropertyAnimation(
@@ -633,9 +615,9 @@ class RightPanelWidget(QWidget):
 
         self._fade_animation.start()
 
-    # =====================================================
-    # Fade In Finished
-    # =====================================================
+    # =========================================================
+    # FADE IN FINISHED
+    # =========================================================
 
     def _fade_in_finished(self):
 
@@ -646,10 +628,6 @@ class RightPanelWidget(QWidget):
             self._fade_effect.setOpacity(
                 1.0
             )
-
-        # -------------------------------------------------
-        # Remove parent opacity effect
-        # -------------------------------------------------
 
         try:
 
@@ -663,17 +641,13 @@ class RightPanelWidget(QWidget):
 
         self._fade_effect = None
 
-        # -------------------------------------------------
-        # Restore tile shadows
-        # -------------------------------------------------
-
         self._restore_tile_effects()
 
         self.update()
 
-    # =====================================================
-    # Public API
-    # =====================================================
+    # =========================================================
+    # PUBLIC API
+    # =========================================================
 
     def set_cpu(
         self,
@@ -686,7 +660,7 @@ class RightPanelWidget(QWidget):
                 value
             )
 
-    # -----------------------------------------------------
+    # ---------------------------------------------------------
 
     def set_memory(
         self,
@@ -699,7 +673,7 @@ class RightPanelWidget(QWidget):
                 value
             )
 
-    # -----------------------------------------------------
+    # ---------------------------------------------------------
 
     def set_storage(
         self,
@@ -712,7 +686,7 @@ class RightPanelWidget(QWidget):
                 value
             )
 
-    # -----------------------------------------------------
+    # ---------------------------------------------------------
 
     def set_battery(
         self,
@@ -725,7 +699,7 @@ class RightPanelWidget(QWidget):
                 value
             )
 
-    # -----------------------------------------------------
+    # ---------------------------------------------------------
 
     def set_temperature(
         self,
@@ -738,7 +712,7 @@ class RightPanelWidget(QWidget):
                 value
             )
 
-    # -----------------------------------------------------
+    # ---------------------------------------------------------
 
     def set_network(
         self,
@@ -751,7 +725,7 @@ class RightPanelWidget(QWidget):
                 value
             )
 
-    # -----------------------------------------------------
+    # ---------------------------------------------------------
 
     def set_processes(
         self,
@@ -764,9 +738,9 @@ class RightPanelWidget(QWidget):
                 value
             )
 
-    # =====================================================
-    # WiFi
-    # =====================================================
+    # =========================================================
+    # WIFI NAME
+    # =========================================================
 
     def get_wifi_name(self):
 
@@ -801,9 +775,9 @@ class RightPanelWidget(QWidget):
 
         return "Not Connected"
 
-    # =====================================================
-    # Live System Monitor
-    # =====================================================
+    # =========================================================
+    # LIVE SYSTEM MONITOR
+    # =========================================================
 
     def update_system_metrics(self):
 
@@ -843,9 +817,9 @@ class RightPanelWidget(QWidget):
                 str(process_count)
             )
 
-            # -------------------------------------------------
-            # Battery
-            # -------------------------------------------------
+            # =================================================
+            # BATTERY
+            # =================================================
 
             battery = (
                 psutil.sensors_battery()
@@ -875,9 +849,9 @@ class RightPanelWidget(QWidget):
                     "N/A"
                 )
 
-            # -------------------------------------------------
-            # Health
-            # -------------------------------------------------
+            # =================================================
+            # HEALTH
+            # =================================================
 
             if cpu < 40 and memory < 60:
 
@@ -915,9 +889,9 @@ class RightPanelWidget(QWidget):
                         "#F59E0B"
                     )
 
-            # -------------------------------------------------
-            # WiFi
-            # -------------------------------------------------
+            # =================================================
+            # WIFI
+            # =================================================
 
             if not hasattr(
                 self,
@@ -940,9 +914,9 @@ class RightPanelWidget(QWidget):
                     wifi
                 )
 
-            # -------------------------------------------------
-            # Network Speed
-            # -------------------------------------------------
+            # =================================================
+            # NETWORK SPEED
+            # =================================================
 
             net1 = (
                 psutil.net_io_counters()

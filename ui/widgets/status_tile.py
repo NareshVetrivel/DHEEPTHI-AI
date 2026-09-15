@@ -1,27 +1,36 @@
 """
-ASTRA-AI
-Premium Status Tile
-Review-1 Production
+DHEEPTHI-AI
+Lightweight Glass Status Tile
+--------------------------------------------
+
+Features
+✓ Lightweight Glass Card
+✓ Transparent / Frosted Glass Feel
+✓ Lavender Glass Border
+✓ Static Hover Feedback
+✓ No Real-Time Blur
+✓ No Graphics Shadow Effects
+✓ No Hover Animation
+✓ i3-Friendly Rendering
+✓ Existing Status Colors Preserved
+✓ Existing Public API Preserved
 """
 
-from PySide6.QtCore import (
-    Qt,
-    QPropertyAnimation,
-    QEasingCurve,
-)
+from PySide6.QtCore import Qt
 
-
-from PySide6.QtGui import QColor
 from PySide6.QtWidgets import (
     QFrame,
     QLabel,
     QVBoxLayout,
     QSizePolicy,
-    QGraphicsDropShadowEffect,
 )
 
 
 class StatusTileWidget(QFrame):
+
+    # =========================================================
+    # STATUS COLORS
+    # =========================================================
 
     STATUS_COLORS = {
 
@@ -43,6 +52,10 @@ class StatusTileWidget(QFrame):
 
     }
 
+    # =========================================================
+    # INITIALIZATION
+    # =========================================================
+
     def __init__(
         self,
         title,
@@ -50,117 +63,209 @@ class StatusTileWidget(QFrame):
         icon="⚙",
         parent=None
     ):
+
         super().__init__(parent)
 
         self.title = title
+
         self.status = status
+
         self.icon = icon
 
-        self.setObjectName("StatusTile")
+        self.setObjectName(
+            "StatusTile"
+        )
 
-        self.setCursor(Qt.PointingHandCursor)
+        # -----------------------------------------------------
+        # Cursor
+        # -----------------------------------------------------
+
+        self.setCursor(
+            Qt.PointingHandCursor
+        )
+
+        # -----------------------------------------------------
+        # Hover support
+        #
+        # No animation.
+        # No graphics effect.
+        # -----------------------------------------------------
 
         self.setAttribute(
             Qt.WA_Hover,
             True
         )
 
-        self.setMinimumSize(150, 118)
-        self.setMaximumSize(150, 118)
+        # -----------------------------------------------------
+        # Existing card dimensions preserved
+        # -----------------------------------------------------
+
+        self.setMinimumSize(
+            150,
+            118
+        )
+
+        self.setMaximumSize(
+            150,
+            118
+        )
 
         self.setSizePolicy(
             QSizePolicy.Expanding,
             QSizePolicy.Fixed
         )
 
+        # =====================================================
+        # LIGHTWEIGHT GLASS STYLE
+        # =====================================================
+
         self.NORMAL_STYLE = """
-        QFrame#StatusTile{
 
-            background:qlineargradient(
-                x1:0,
-                y1:0,
-                x2:1,
-                y2:1,
+        QFrame#StatusTile {
 
-                stop:0 rgba(255,255,255,.98),
-                stop:1 rgba(245,243,255,.95)
+            background-color: rgba(
+                255,
+                255,
+                255,
+                145
             );
 
-            border:1px solid #DDD6FE;
+            border: 1px solid rgba(
+                255,
+                255,
+                255,
+                205
+            );
 
-            border-radius:20px;
+            border-radius: 20px;
+
         }
+
         """
+
+        # =====================================================
+        # STATIC HOVER STYLE
+        # =====================================================
+        #
+        # No shadow.
+        # No animation.
+        # Only a slightly stronger glass border.
+        #
 
         self.HOVER_STYLE = """
-        QFrame#StatusTile{
 
-            background:white;
+        QFrame#StatusTile {
 
-            border:2px solid #C4B5FD;
+            background-color: rgba(
+                255,
+                255,
+                255,
+                175
+            );
 
-            border-radius:20px;
+            border: 2px solid rgba(
+                196,
+                181,
+                253,
+                225
+            );
+
+            border-radius: 20px;
+
         }
+
         """
+
+        # =====================================================
+        # ICON GLASS STYLE
+        # =====================================================
 
         self.ICON_NORMAL_STYLE = """
-        QLabel{
 
-            background:#EEF2FF;
+        QLabel {
 
-            border:1px solid #DDD6FE;
+            background-color: rgba(
+                238,
+                242,
+                255,
+                175
+            );
 
-            border-radius:23px;
+            border: 1px solid rgba(
+                221,
+                214,
+                254,
+                210
+            );
 
-            font-size:22px;
+            border-radius: 23px;
+
+            font-size: 22px;
+
         }
+
         """
+
+        # =====================================================
+        # ICON HOVER STYLE
+        # =====================================================
+        #
+        # Static change only.
+        #
 
         self.ICON_HOVER_STYLE = """
-        QLabel{
 
-            background:#EDE9FE;
+        QLabel {
 
-            border:2px solid #C4B5FD;
+            background-color: rgba(
+                237,
+                233,
+                254,
+                205
+            );
 
-            border-radius:23px;
+            border: 2px solid rgba(
+                196,
+                181,
+                253,
+                225
+            );
 
-            font-size:24px;
+            border-radius: 23px;
+
+            font-size: 24px;
+
         }
+
         """
+
+        # =====================================================
+        # BUILD
+        # =====================================================
 
         self.build_ui()
 
+    # =========================================================
+    # BUILD UI
+    # =========================================================
+
     def build_ui(self):
 
-        self.setStyleSheet(self.NORMAL_STYLE)
+        # -----------------------------------------------------
+        # Apply normal glass style
+        # -----------------------------------------------------
 
-        self.shadow = QGraphicsDropShadowEffect(self)
-
-        self.shadow.setBlurRadius(22)
-
-        self.shadow.setOffset(0,5)
-
-        self.shadow.setColor(
-            QColor(124,58,237,28)
+        self.setStyleSheet(
+            self.NORMAL_STYLE
         )
 
-        self.setGraphicsEffect(
-            self.shadow
+        # =====================================================
+        # ROOT LAYOUT
+        # =====================================================
+
+        root = QVBoxLayout(
+            self
         )
-
-        self.border_animation = QPropertyAnimation(
-            self.shadow,
-            b"blurRadius"
-        )
-
-        self.border_animation.setDuration(120)
-
-        self.border_animation.setEasingCurve(
-            QEasingCurve.OutCubic
-        )
-
-        root = QVBoxLayout(self)
 
         root.setContentsMargins(
             14,
@@ -169,17 +274,30 @@ class StatusTileWidget(QFrame):
             12
         )
 
-        root.setSpacing(8)
+        root.setSpacing(
+            8
+        )
 
-        root.setAlignment(Qt.AlignCenter)
+        root.setAlignment(
+            Qt.AlignCenter
+        )
 
-        self.icon_label = QLabel(self.icon)
+        # =====================================================
+        # ICON
+        # =====================================================
+
+        self.icon_label = QLabel(
+            self.icon
+        )
 
         self.icon_label.setAlignment(
             Qt.AlignCenter
         )
 
-        self.icon_label.setFixedSize(46,46)
+        self.icon_label.setFixedSize(
+            46,
+            46
+        )
 
         self.icon_label.setStyleSheet(
             self.ICON_NORMAL_STYLE
@@ -190,27 +308,47 @@ class StatusTileWidget(QFrame):
             alignment=Qt.AlignCenter
         )
 
-        self.title_label = QLabel(self.title)
+        # =====================================================
+        # TITLE
+        # =====================================================
+
+        self.title_label = QLabel(
+            self.title
+        )
 
         self.title_label.setAlignment(
             Qt.AlignCenter
         )
 
-        self.title_label.setWordWrap(True)
+        self.title_label.setWordWrap(
+            True
+        )
 
         self.title_label.setStyleSheet("""
 
-        color:#111827;
+        QLabel {
 
-        font-size:14px;
+            color: #172554;
 
-        font-weight:700;
+            font-size: 14px;
 
-        background:transparent;
+            font-weight: 700;
+
+            background: transparent;
+
+            border: none;
+
+        }
 
         """)
 
-        root.addWidget(self.title_label)
+        root.addWidget(
+            self.title_label
+        )
+
+        # =====================================================
+        # STATUS
+        # =====================================================
 
         self.status_label = QLabel()
 
@@ -218,89 +356,152 @@ class StatusTileWidget(QFrame):
             Qt.AlignCenter
         )
 
-        root.addWidget(self.status_label)
+        self.status_label.setStyleSheet("""
 
-        self.update_status(self.status)
+        QLabel {
 
-    # -----------------------------------------------------
-    # Update Status
-    # -----------------------------------------------------
+            background: transparent;
 
-    def update_status(self, status):
+            border: none;
+
+        }
+
+        """)
+
+        root.addWidget(
+            self.status_label
+        )
+
+        # =====================================================
+        # INITIAL STATUS
+        # =====================================================
+
+        self.update_status(
+            self.status
+        )
+
+    # =========================================================
+    # UPDATE STATUS
+    # =========================================================
+
+    def update_status(
+        self,
+        status
+    ):
 
         self.status = status
 
+        # -----------------------------------------------------
+        # Preserve existing status color behavior
+        # -----------------------------------------------------
+
         color = self.STATUS_COLORS.get(
             status.title(),
-            "#64748B"
+            "#475569"
         )
 
-        self.status_label.setText(status)
+        self.status_label.setText(
+            status
+        )
 
         self.status_label.setStyleSheet(
-            f"color:{color};"
-            "font-size:12px;"
-            "font-weight:700;"
-            "background:transparent;"
+            f"""
+            QLabel {{
+
+                color: {color};
+
+                font-size: 12px;
+
+                font-weight: 700;
+
+                background: transparent;
+
+                border: none;
+
+            }}
+            """
         )
 
+    # =========================================================
+    # PUBLIC API
+    # =========================================================
 
-    # -----------------------------------------------------
-    # Public API
-    # -----------------------------------------------------
-
-    def set_title(self, title):
+    def set_title(
+        self,
+        title
+    ):
 
         self.title = title
 
-        self.title_label.setText(title)
+        self.title_label.setText(
+            title
+        )
 
+    # ---------------------------------------------------------
 
-    def set_icon(self, icon):
+    def set_icon(
+        self,
+        icon
+    ):
 
         self.icon = icon
 
-        self.icon_label.setText(icon)
+        self.icon_label.setText(
+            icon
+        )
 
+    # ---------------------------------------------------------
 
-    def set_status(self, status):
+    def set_status(
+        self,
+        status
+    ):
 
-        self.update_status(status)
+        self.update_status(
+            status
+        )
 
+    # ---------------------------------------------------------
 
-    def set_card_enabled(self, enabled):
+    def set_card_enabled(
+        self,
+        enabled
+    ):
 
-        self.setEnabled(enabled)
+        self.setEnabled(
+            enabled
+        )
 
         if enabled:
 
-            self.setWindowOpacity(1.0)
+            self.setWindowOpacity(
+                1.0
+            )
 
         else:
 
-            self.setWindowOpacity(0.55)
+            self.setWindowOpacity(
+                0.55
+            )
 
-    # -----------------------------------------------------
-    # Hover Enter
-    # -----------------------------------------------------
+    # =========================================================
+    # HOVER ENTER
+    # =========================================================
+    #
+    # IMPORTANT:
+    #
+    # This is intentionally static.
+    #
+    # No QPropertyAnimation.
+    # No shadow.
+    # No graphics effect.
+    #
+    # =========================================================
 
-    def enterEvent(self, event):
-
-        self.border_animation.stop()
-
-        self.border_animation.setStartValue(
-            self.shadow.blurRadius()
-        )
-
-        self.border_animation.setEndValue(42)
-
-        self.border_animation.start()
-
-        self.shadow.setOffset(0, 8)
-
-        self.shadow.setColor(
-            QColor(124,58,237,80)
-        )
+    def enterEvent(
+        self,
+        event
+    ):
 
         self.setStyleSheet(
             self.HOVER_STYLE
@@ -310,29 +511,18 @@ class StatusTileWidget(QFrame):
             self.ICON_HOVER_STYLE
         )
 
-        super().enterEvent(event)
-
-    # -----------------------------------------------------
-    # Hover Leave
-    # -----------------------------------------------------
-
-    def leaveEvent(self, event):
-
-        self.border_animation.stop()
-
-        self.border_animation.setStartValue(
-            self.shadow.blurRadius()
+        super().enterEvent(
+            event
         )
 
-        self.border_animation.setEndValue(22)
+    # =========================================================
+    # HOVER LEAVE
+    # =========================================================
 
-        self.border_animation.start()
-
-        self.shadow.setOffset(0,4)
-
-        self.shadow.setColor(
-            QColor(124,58,237,28)
-        )
+    def leaveEvent(
+        self,
+        event
+    ):
 
         self.setStyleSheet(
             self.NORMAL_STYLE
@@ -342,4 +532,6 @@ class StatusTileWidget(QFrame):
             self.ICON_NORMAL_STYLE
         )
 
-        super().leaveEvent(event)
+        super().leaveEvent(
+            event
+        )

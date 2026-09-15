@@ -162,6 +162,16 @@ CLOSE_GREETINGS = [
 # =====================================================
 
 class WakeWordWorker(QThread):
+
+    @staticmethod
+    def _safe_qfont(family: str, pixel_size: int, *, bold: bool = False) -> QFont:
+        """Create a Qt font with an explicit, always-positive pixel size."""
+        font = QFont(family)
+        font.setPixelSize(max(1, int(pixel_size)))
+        font.setBold(bool(bold))
+        return font
+
+
     """Background worker dedicated to the production DHEEPTHI detector.
 
     Wake detection is completely separate from command STT:
@@ -198,43 +208,82 @@ class WakeWordWorker(QThread):
             pass
 
     def run(self):
+        """
+        Run the production DHEEPTHI wake-word detector.
+
+        WakeWordDetector owns the actual microphone stream and blocks
+        inside detector.start() until stop() is requested.
+
+        This worker must NEVER use SpeechRecognizer or wake_word_mode.
+        """
+
         try:
-            if self._stop or self.isInterruptionRequested():
+
+            if (
+                self._stop
+                or self.isInterruptionRequested()
+            ):
                 return
 
             if self.detector is None:
-                print("❌ WakeWordDetector is not available.")
+
+                print(
+                    "❌ WakeWordWorker cannot start: "
+                    "WakeWordDetector is unavailable."
+                )
+
                 return
 
-            print("\n========== DHEEPTHI / OPENWAKEWORD ==========")
-            print("DHEEPTHI standby: Production openWakeWord + TFLite.")
-            print("Threshold: 0.000250")
-            print("STT wake detection: DISABLED")
+            print(
+                "🎤 Production DHEEPTHI listener active."
+            )
 
-            if not self.detector.start():
-                print("❌ Production DHEEPTHI detector failed to start.")
+            started = self.detector.start()
+
+            if not started:
+
+                print(
+                    "⚠️ Production DHEEPTHI listener "
+                    "could not start."
+                )
+
                 return
 
-            print("🎤 Production DHEEPTHI listener active.")
-
-            # WakeWordDetector.start() opens the sounddevice stream and
-            # returns immediately. Keep this QThread alive until the detector
-            # is stopped, so MainWindow does not accidentally restart it.
+            # detector.start() returns after the detector has been
+            # stopped. Keep the worker alive while the detector owns
+            # the microphone.
             while (
                 not self._stop
                 and not self.isInterruptionRequested()
-                and self.detector.is_running()
             ):
-                self.msleep(40)
+
+                if not self.detector.is_running():
+
+                    break
+
+                self.msleep(100)
 
         except Exception as error:
-            print(f"WakeWordWorker Error : {error}")
+
+            print(
+                f"WakeWordWorker Error : {error}"
+            )
+
         finally:
+
+            # Make sure the production detector releases the microphone
+            # if the worker exits for any reason.
             try:
-                if self.detector is not None and self.detector.is_running():
+
+                if self.detector is not None:
+
                     self.detector.stop()
-            except Exception:
-                pass
+
+            except Exception as error:
+
+                print(
+                    f"Wake detector final stop error: {error}"
+                )
 
             self.finished.emit()
 
@@ -270,6 +319,8 @@ class VoiceWorker(QThread):
         self.wake_word_mode = bool(wake_word_mode)
         self._stop = False
         self._command_emitted = False
+        self.timed_out = False
+        self.command_captured = False
 
         try:
             self.recognizer.level_callback = self.audio_level.emit
@@ -277,23 +328,29 @@ class VoiceWorker(QThread):
             print(f"VoiceWorker Audio Callback Error : {error}")
 
     def run(self):
+        """
+        Capture exactly one manual voice command.
+
+        A silent microphone timeout is treated as a normal cancelled
+        listening session. It is NOT an application shutdown condition.
+        """
+
         try:
-            if self._stop or self.isInterruptionRequested():
+
+            if (
+                self._stop
+                or self.isInterruptionRequested()
+            ):
                 return
 
-            # Wake mode is intentionally rejected here. The production
-            # detector has its own worker and microphone owner.
-            if self.wake_word_mode:
-                print(
-                    "⚠️ VoiceWorker received wake mode unexpectedly; "
-                    "use WakeWordWorker for DHEEPTHI detection."
-                )
-                return
-
-            # Existing manual microphone command capture.
+            # Give the GUI/TTS transition a short moment to settle before
+            # opening the command microphone.
             self.msleep(180)
 
-            if self._stop or self.isInterruptionRequested():
+            if (
+                self._stop
+                or self.isInterruptionRequested()
+            ):
                 return
 
             command = self.recognizer.listen(
@@ -302,24 +359,75 @@ class VoiceWorker(QThread):
                 calibrate=False,
             )
 
-            if self._stop or self.isInterruptionRequested():
+            if (
+                self._stop
+                or self.isInterruptionRequested()
+            ):
                 return
 
             if command:
-                command = str(command).strip()
 
-                if command and not self._command_emitted:
+                command = str(
+                    command
+                ).strip()
+
+                if (
+                    command
+                    and not self._command_emitted
+                ):
+
                     self._command_emitted = True
-                    print(f"Command Ready : {command}")
-                    self.command_ready.emit(command)
+                    self.command_captured = True
+                    self.timed_out = False
+
+                    print(
+                        f"Command Ready : {command}"
+                    )
+
+                    self.command_ready.emit(
+                        command
+                    )
+
+            else:
+
+                self.timed_out = True
+                self.command_captured = False
+
+                print(
+                    "Voice command capture timed out."
+                )
 
         except TypeError as error:
-            print(f"VoiceWorker API Error : {error}")
+
+            print(
+                f"VoiceWorker API Error : {error}"
+            )
 
         except Exception as error:
-            print(f"VoiceWorker Error : {error}")
+
+            print(
+                f"VoiceWorker Error : {error}"
+            )
+
+            error_text = str(
+                error
+            ).lower()
+
+            if (
+                "timeout" in error_text
+                or "timed out" in error_text
+                or "wait timed out" in error_text
+            ):
+
+                self.timed_out = True
+                self.command_captured = False
+
+                print(
+                    "Voice command capture timed out."
+                )
 
         finally:
+
             self.finished.emit()
 
     def stop(self):
@@ -1479,7 +1587,7 @@ class MainWindow(QMainWindow):
         self.loading_percent.setFont(
             QFont(
                 "Segoe UI",
-                24,
+                32,
                 QFont.Bold
             )
         )
@@ -1557,7 +1665,7 @@ class MainWindow(QMainWindow):
         self.loading_status.setFont(
             QFont(
                 "Segoe UI",
-                11
+                14
             )
         )
 
@@ -9062,6 +9170,214 @@ class MainWindow(QMainWindow):
             self.manual_listening_requested = False
 
             self.wake_word_running = False
+
+            # --------------------------------------------------
+            # SILENCE / COMMAND TIMEOUT
+            # --------------------------------------------------
+            #
+            # Silence after a manual microphone click is a normal
+            # cancelled listening session.
+            #
+            # Required V1 lifecycle:
+            #
+            #     LISTENING
+            #         ↓
+            #     timeout
+            #         ↓
+            #     ERROR avatar
+            #         ↓
+            #     IDLE avatar
+            #         ↓
+            #     microphone unlocked
+            #         ↓
+            #     DHEEPTHI wake listener restarted
+            #
+            # Never enter the processing/thinking state for a timeout.
+            # Never treat timeout as application shutdown.
+            # --------------------------------------------------
+
+            if (
+                current_worker is not None
+                and getattr(
+                    current_worker,
+                    "timed_out",
+                    False,
+                )
+                and not getattr(
+                    current_worker,
+                    "command_captured",
+                    False,
+                )
+            ):
+
+                print(
+                    "\n========== VOICE TIMEOUT =========="
+                )
+
+                print(
+                    "No command detected."
+                )
+
+                print(
+                    "Manual microphone session cancelled safely."
+                )
+
+                print(
+                    "Showing ERROR state before returning to IDLE."
+                )
+
+                print(
+                    "===================================\n"
+                )
+
+                # ------------------------------------------
+                # Reset voice ownership immediately
+                # ------------------------------------------
+
+                self.manual_listening_requested = False
+                self.wake_word_running = False
+                self._wake_command_transition_active = False
+
+                # A timeout means no command was handed to
+                # process_command(), so processing must remain false.
+                self.processing_voice = False
+
+                # ------------------------------------------
+                # Stop audio meter / microphone visual state
+                # ------------------------------------------
+
+                try:
+
+                    self.mic_widget.update_audio_level(
+                        0.0
+                    )
+
+                    self.mic_widget.set_listening(
+                        False
+                    )
+
+                except Exception as error:
+
+                    print(
+                        f"Voice timeout mic UI reset error : {error}"
+                    )
+
+                # ------------------------------------------
+                # ERROR state
+                # ------------------------------------------
+
+                try:
+
+                    self.status_label.setText(
+                        "Status : No command detected"
+                    )
+
+                    self.left_panel.set_listening(
+                        "No command"
+                    )
+
+                    self._set_thinking_state(
+                        "Inactive"
+                    )
+
+                    self.left_panel.set_speaking(
+                        "Silent"
+                    )
+
+                    self._set_avatar_state(
+                        "error"
+                    )
+
+                except Exception as error:
+
+                    print(
+                        f"Voice timeout ERROR state error : {error}"
+                    )
+
+                # ------------------------------------------
+                # Unlock immediately
+                # ------------------------------------------
+
+                self.unlock_microphone()
+
+                # ------------------------------------------
+                # ERROR -> IDLE
+                # ------------------------------------------
+                #
+                # Keep the error avatar visible briefly so the user
+                # can clearly see that the listening attempt ended.
+                # Then restore the normal idle avatar.
+                # ------------------------------------------
+
+                def _finish_voice_timeout():
+
+                    if self._closing:
+
+                        return
+
+                    try:
+
+                        self._set_avatar_state(
+                            "idle"
+                        )
+
+                        self.status_label.setText(
+                            "Status : Waiting for DHEEPTHI"
+                            if self.wake_word_enabled
+                            else "Status : Idle"
+                        )
+
+                        self.left_panel.set_listening(
+                            "Waiting for DHEEPTHI"
+                            if self.wake_word_enabled
+                            else "Idle"
+                        )
+
+                        self._set_thinking_state(
+                            "Inactive"
+                        )
+
+                        self.left_panel.set_speaking(
+                            "Silent"
+                        )
+
+                    except Exception as error:
+
+                        print(
+                            f"Voice timeout IDLE state error : {error}"
+                        )
+
+                    # --------------------------------------
+                    # Restart wake-word detection only after
+                    # the ERROR -> IDLE transition completes.
+                    # --------------------------------------
+
+                    if (
+                        self.wake_word_enabled
+                        and not self.manual_listening_requested
+                        and not self.processing_voice
+                        and not self._closing
+                    ):
+
+                        print(
+                            "Voice timeout recovery complete."
+                        )
+
+                        print(
+                            "Restarting DHEEPTHI wake listener..."
+                        )
+
+                        QTimer.singleShot(
+                            150,
+                            self.start_wake_word_worker
+                        )
+
+                QTimer.singleShot(
+                    1200,
+                    _finish_voice_timeout
+                )
+
+                return
 
             # --------------------------------------------------
             # Pending YES/NO confirmation

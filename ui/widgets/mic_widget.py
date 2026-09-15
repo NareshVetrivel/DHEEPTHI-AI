@@ -1,12 +1,22 @@
 """
 ui/widgets/mic_widget.py
 
-ASTRA-AI
-Premium Microphone Widget
+DHEEPTHI-AI
+Lightweight Microphone Widget
 
-PART 1
+Features
 ---------------------------------
-Foundation
+✓ Lightweight microphone UI
+✓ Lightweight audio waves
+✓ Unified DHEEPTHI-AI purple wave color
+✓ Mic and waves use matching purple
+✓ No heavy graphics effects on waves
+✓ No wave shadows
+✓ No wave glow
+✓ Existing microphone functionality preserved
+✓ Existing backend API preserved
+✓ Existing conversation API preserved
+✓ i3-friendly rendering
 """
 
 from PySide6.QtCore import (
@@ -15,7 +25,7 @@ from PySide6.QtCore import (
     QTimer,
     Property,
     QPropertyAnimation,
-    QEasingCurve
+    QEasingCurve,
 )
 
 from PySide6.QtWidgets import (
@@ -24,15 +34,14 @@ from PySide6.QtWidgets import (
     QLabel,
     QHBoxLayout,
     QVBoxLayout,
-    QStackedLayout,
     QSizePolicy,
-    QGraphicsDropShadowEffect
+    QGraphicsDropShadowEffect,
 )
 
 from PySide6.QtGui import (
     QPainter,
     QColor,
-    QPen
+    QPen,
 )
 
 from PySide6.QtSvg import QSvgRenderer
@@ -41,18 +50,73 @@ import os
 
 
 # ==========================================================
+# DHEEPTHI-AI COLOR
+# ==========================================================
+#
+# One common purple is used by:
+#
+#   Microphone
+#   Left Wave
+#   Right Wave
+#
+# This keeps the microphone area visually unified.
+#
+
+DHEEPTHI_PURPLE = QColor(
+    124,
+    58,
+    237
+)
+
+
+# ==========================================================
 # Wave Widget
 # ==========================================================
 
 class WaveWidget(QWidget):
 
-    def __init__(self, parent=None):
+    # ------------------------------------------------------
+    # MATCH MICROPHONE PURPLE
+    # ------------------------------------------------------
+    #
+    # Same exact color as the microphone circle:
+    #
+    # #7C3AED
+    #
 
-        super().__init__(parent)
+    WAVE_COLOR = QColor(
+        124,
+        58,
+        237
+    )
 
-        self.setFixedSize(150, 70)
+    def __init__(
+        self,
+        parent=None
+    ):
+
+        super().__init__(
+            parent
+        )
+
+        # ==================================================
+        # FIXED WAVE AREA
+        # ==================================================
+
+        self.setFixedSize(
+            150,
+            70
+        )
+
+        # ==================================================
+        # AUDIO STATE
+        # ==================================================
 
         self.audio_level = 0.0
+
+        # ==================================================
+        # STATIC WAVE PATTERN
+        # ==================================================
 
         self.base_levels = [
 
@@ -62,23 +126,34 @@ class WaveWidget(QWidget):
             40,
             28,
             16,
-            8
+            8,
 
         ]
 
-    # ------------------------------------------------------
+    # ======================================================
+    # UPDATE AUDIO LEVEL
+    # ======================================================
 
     def update_level(
         self,
         level
     ):
 
+        # --------------------------------------------------
+        # Keep level between 0 and 1
+        # --------------------------------------------------
+
         target = max(
             0.0,
-            min(level, 1.0)
+            min(
+                level,
+                1.0
+            )
         )
 
-        # Smooth animation
+        # --------------------------------------------------
+        # Lightweight smoothing
+        # --------------------------------------------------
 
         self.audio_level = (
 
@@ -92,27 +167,48 @@ class WaveWidget(QWidget):
 
         self.update()
 
-    # ------------------------------------------------------
+    # ======================================================
+    # PAINT WAVE
+    # ======================================================
 
-    def paintEvent(self, event):
+    def paintEvent(
+        self,
+        event
+    ):
 
-        painter = QPainter(self)
+        painter = QPainter(
+            self
+        )
+
+        # --------------------------------------------------
+        # Anti aliasing
+        # --------------------------------------------------
 
         painter.setRenderHint(
             QPainter.Antialiasing,
             True
         )
 
-        painter.setRenderHint(
-            QPainter.SmoothPixmapTransform,
-            True
+        painter.setPen(
+            Qt.NoPen
         )
 
-        painter.setPen(Qt.NoPen)
+        # ==================================================
+        # MATCHING PURPLE
+        # ==================================================
+        #
+        # Exact same purple as microphone:
+        #
+        # #7C3AED
+        #
 
         painter.setBrush(
-            QColor("#8B5CF6")
+            self.WAVE_COLOR
         )
+
+        # ==================================================
+        # WAVE POSITION
+        # ==================================================
 
         if self.objectName() == "leftWave":
 
@@ -122,15 +218,23 @@ class WaveWidget(QWidget):
 
             x = 8
 
+        # ==================================================
+        # DRAW WAVE BARS
+        # ==================================================
+
         for base in self.base_levels:
 
-            height = base + (
+            height = (
 
-                self.audio_level
+                base
 
-                * base
+                +
 
-                * 2.2
+                (
+                    self.audio_level
+                    * base
+                    * 2.2
+                )
 
             )
 
@@ -152,15 +256,25 @@ class WaveWidget(QWidget):
 
             x += 16
 
+
 # ==========================================================
-# Premium Microphone Button
+# Lightweight Microphone Button
 # ==========================================================
 
 class MicrophoneButton(QPushButton):
 
-    def __init__(self, parent=None):
+    def __init__(
+        self,
+        parent=None
+    ):
 
-        super().__init__(parent)
+        super().__init__(
+            parent
+        )
+
+        # ==================================================
+        # BASIC BUTTON
+        # ==================================================
 
         self.setCursor(
             Qt.PointingHandCursor
@@ -171,35 +285,37 @@ class MicrophoneButton(QPushButton):
             150
         )
 
-        self.setFlat(True)
+        self.setFlat(
+            True
+        )
 
         self.setStyleSheet("""
 
-        QPushButton{
+        QPushButton {
 
-            background:transparent;
+            background: transparent;
 
-            border:none;
-
-        }
-
-        QPushButton:hover{
-
-            background:transparent;
+            border: none;
 
         }
 
-        QPushButton:pressed{
+        QPushButton:hover {
 
-            background:transparent;
+            background: transparent;
+
+        }
+
+        QPushButton:pressed {
+
+            background: transparent;
 
         }
 
         """)
 
-        # -----------------------------------------
-        # States
-        # -----------------------------------------
+        # ==================================================
+        # STATES
+        # ==================================================
 
         self._listening = False
 
@@ -207,9 +323,9 @@ class MicrophoneButton(QPushButton):
 
         self.glow_radius = 0.0
 
-        # -----------------------------------------
-        # Ripple Animation
-        # -----------------------------------------
+        # ==================================================
+        # RIPPLE
+        # ==================================================
 
         self._ripple_radius = 0.0
 
@@ -218,11 +334,17 @@ class MicrophoneButton(QPushButton):
             b"rippleRadius"
         )
 
-        self.ripple_animation.setDuration(900)
+        self.ripple_animation.setDuration(
+            900
+        )
 
-        self.ripple_animation.setStartValue(0)
+        self.ripple_animation.setStartValue(
+            0
+        )
 
-        self.ripple_animation.setEndValue(42)
+        self.ripple_animation.setEndValue(
+            42
+        )
 
         self.ripple_animation.setEasingCurve(
             QEasingCurve.OutCubic
@@ -232,33 +354,49 @@ class MicrophoneButton(QPushButton):
             self.restart_ripple
         )
 
-        # -----------------------------------------
-        # Glow
-        # -----------------------------------------
+        # ==================================================
+        # MICROPHONE SHADOW
+        # ==================================================
+        #
+        # Shadow is kept only for the microphone.
+        #
+        # WaveWidget does NOT use a graphics effect.
+        #
 
         self.shadow = QGraphicsDropShadowEffect()
 
-        self.shadow.setBlurRadius(28)
+        self.shadow.setBlurRadius(
+            28
+        )
 
-        self.shadow.setOffset(0)
+        self.shadow.setOffset(
+            0
+        )
 
         self.shadow.setColor(
-            QColor(124, 58, 237, 0)
+            QColor(
+                124,
+                58,
+                237,
+                0
+            )
         )
 
         self.setGraphicsEffect(
             self.shadow
         )
 
-        # -----------------------------------------
-        # SVG
-        # -----------------------------------------
+        # ==================================================
+        # MICROPHONE SVG
+        # ==================================================
 
         svg_path = os.path.abspath(
             "ui/assets/icons/mic_trace.svg"
         )
 
-        self.svg = QSvgRenderer(svg_path)
+        self.svg = QSvgRenderer(
+            svg_path
+        )
 
         if not self.svg.isValid():
 
@@ -266,32 +404,30 @@ class MicrophoneButton(QPushButton):
                 "Warning : mic_trace.svg not found."
             )
 
-        # -----------------------------------------
-        # Live Glow Timer
-        # -----------------------------------------
+        # ==================================================
+        # LIVE GLOW TIMER
+        # ==================================================
 
-        self.glow_timer = QTimer(self)
+        self.glow_timer = QTimer(
+            self
+        )
 
         self.glow_timer.timeout.connect(
             self.animate_glow
         )
 
-        self.glow_timer.start(33)
+        self.glow_timer.start(
+            33
+        )
 
-    # ------------------------------------------------------
-    # Hover Events
-    # ------------------------------------------------------
+    # ======================================================
+    # HOVER ENTER
+    # ======================================================
 
     def enterEvent(
         self,
         event
     ):
-        """
-        Handle mouse hover.
-
-        Disabled button must remain visually blocked
-        and must not receive the normal hover glow.
-        """
 
         if not self.isEnabled():
 
@@ -320,9 +456,9 @@ class MicrophoneButton(QPushButton):
 
             return
 
-        # ---------------------------------
-        # Enabled Hover
-        # ---------------------------------
+        # --------------------------------------------------
+        # Enabled hover
+        # --------------------------------------------------
 
         if not self._listening:
 
@@ -349,14 +485,14 @@ class MicrophoneButton(QPushButton):
             event
         )
 
+    # ======================================================
+    # HOVER LEAVE
+    # ======================================================
+
     def leaveEvent(
         self,
         event
     ):
-        """
-        Reset hover state when mouse leaves
-        the microphone button.
-        """
 
         if not self.isEnabled():
 
@@ -402,9 +538,9 @@ class MicrophoneButton(QPushButton):
             event
         )
 
-    # ------------------------------------------------------
-    # Listening State
-    # ------------------------------------------------------
+    # ======================================================
+    # LISTENING STATE
+    # ======================================================
 
     def set_listening(
         self,
@@ -413,9 +549,9 @@ class MicrophoneButton(QPushButton):
 
         self._listening = listening
 
-        # ---------------------------------
+        # --------------------------------------------------
         # Listening = Button Busy
-        # ---------------------------------
+        # --------------------------------------------------
 
         if listening:
 
@@ -429,9 +565,15 @@ class MicrophoneButton(QPushButton):
                 True
             )
 
+        # --------------------------------------------------
+        # Listening effects
+        # --------------------------------------------------
+
         if listening:
 
-            self.shadow.setBlurRadius(60)
+            self.shadow.setBlurRadius(
+                60
+            )
 
             self.shadow.setColor(
                 QColor(
@@ -450,7 +592,9 @@ class MicrophoneButton(QPushButton):
 
             self._ripple_radius = 0
 
-            self.shadow.setBlurRadius(28)
+            self.shadow.setBlurRadius(
+                28
+            )
 
             self.shadow.setColor(
                 QColor(
@@ -465,9 +609,9 @@ class MicrophoneButton(QPushButton):
 
         self.update()
 
-    # ------------------------------------------------------
-    # Audio Level
-    # ------------------------------------------------------
+    # ======================================================
+    # AUDIO LEVEL
+    # ======================================================
 
     def update_level(
         self,
@@ -482,28 +626,44 @@ class MicrophoneButton(QPushButton):
 
             max(
                 0.0,
-                min(level, 1.0)
+                min(
+                    level,
+                    1.0
+                )
             ) * 0.25
 
         )
 
-    # ------------------------------------------------------
-    # Live Glow Animation
-    # ------------------------------------------------------
+        self.update()
 
-    def animate_glow(self):
+    # ======================================================
+    # LIVE GLOW ANIMATION
+    # ======================================================
+
+    def animate_glow(
+        self
+    ):
 
         if self._listening:
 
-            target = 16 + (
+            target = (
 
-                self.audio_level * 30
+                16
+
+                +
+
+                (
+                    self.audio_level
+                    * 30
+                )
 
             )
 
             self.glow_radius += (
 
-                target - self.glow_radius
+                target
+                -
+                self.glow_radius
 
             ) * 0.22
 
@@ -513,7 +673,10 @@ class MicrophoneButton(QPushButton):
 
                 -
 
-                self.audio_level * 500
+                (
+                    self.audio_level
+                    * 500
+                )
 
             )
 
@@ -548,19 +711,28 @@ class MicrophoneButton(QPushButton):
 
         self.update()
 
-    # ------------------------------------------------------
-    # Ripple Property
-    # ------------------------------------------------------
+    # ======================================================
+    # RIPPLE PROPERTY
+    # ======================================================
 
-    def getRippleRadius(self):
+    def getRippleRadius(
+        self
+    ):
 
         return self._ripple_radius
 
-    def setRippleRadius(self, value):
+    # ------------------------------------------------------
+
+    def setRippleRadius(
+        self,
+        value
+    ):
 
         self._ripple_radius = value
 
         self.update()
+
+    # ------------------------------------------------------
 
     rippleRadius = Property(
         float,
@@ -568,9 +740,13 @@ class MicrophoneButton(QPushButton):
         setRippleRadius
     )
 
-    # ------------------------------------------------------
+    # ======================================================
+    # RIPPLE RESTART
+    # ======================================================
 
-    def restart_ripple(self):
+    def restart_ripple(
+        self
+    ):
 
         if self._listening:
 
@@ -580,7 +756,10 @@ class MicrophoneButton(QPushButton):
 
                 -
 
-                self.audio_level * 500
+                (
+                    self.audio_level
+                    * 500
+                )
 
             )
 
@@ -601,28 +780,14 @@ class MicrophoneButton(QPushButton):
 
             self.update()
 
-    # ------------------------------------------------------
-    # Enabled / Disabled State
-    # ------------------------------------------------------
+    # ======================================================
+    # ENABLE / DISABLE
+    # ======================================================
 
     def setEnabled(
         self,
         enabled: bool
     ):
-        """
-        Enable or disable the microphone button.
-
-        Enabled:
-            - Pointing-hand cursor
-            - Normal purple appearance
-            - Clickable
-
-        Disabled:
-            - Forbidden cursor
-            - Grey appearance
-            - No hover glow
-            - Cannot be clicked
-        """
 
         super().setEnabled(
             enabled
@@ -630,17 +795,9 @@ class MicrophoneButton(QPushButton):
 
         if enabled:
 
-            # ---------------------------------
-            # Normal Cursor
-            # ---------------------------------
-
             self.setCursor(
                 Qt.PointingHandCursor
             )
-
-            # ---------------------------------
-            # Normal Appearance
-            # ---------------------------------
 
             self.shadow.setColor(
                 QColor(
@@ -657,17 +814,9 @@ class MicrophoneButton(QPushButton):
 
         else:
 
-            # ---------------------------------
-            # Blocked Cursor
-            # ---------------------------------
-
             self.setCursor(
                 Qt.ForbiddenCursor
             )
-
-            # ---------------------------------
-            # Disabled Appearance
-            # ---------------------------------
 
             self.shadow.setColor(
                 QColor(
@@ -682,10 +831,6 @@ class MicrophoneButton(QPushButton):
                 18
             )
 
-            # ---------------------------------
-            # Stop Hover/Ripple Effects
-            # ---------------------------------
-
             self.ripple_animation.stop()
 
             self._ripple_radius = 0
@@ -694,29 +839,31 @@ class MicrophoneButton(QPushButton):
 
         self.update()
 
-    # ------------------------------------------------------
-    # Paint
-    # ------------------------------------------------------
+    # ======================================================
+    # PAINT
+    # ======================================================
 
-    def paintEvent(self, event):
+    def paintEvent(
+        self,
+        event
+    ):
 
-        painter = QPainter(self)
+        painter = QPainter(
+            self
+        )
 
         painter.setRenderHint(
             QPainter.Antialiasing,
             True
         )
 
-        painter.setRenderHint(
-            QPainter.SmoothPixmapTransform,
-            True
+        painter.setPen(
+            Qt.NoPen
         )
 
-        painter.setPen(Qt.NoPen)
-
-        # --------------------------------------
-        # Ripple Ring
-        # --------------------------------------
+        # ==================================================
+        # RIPPLE RING
+        # ==================================================
 
         if self._listening:
 
@@ -727,7 +874,9 @@ class MicrophoneButton(QPushButton):
                 45
             )
 
-            painter.setBrush(Qt.NoBrush)
+            painter.setBrush(
+                Qt.NoBrush
+            )
 
             painter.setPen(
                 QPen(
@@ -744,17 +893,21 @@ class MicrophoneButton(QPushButton):
 
                     18 - self._ripple_radius,
 
-                    114 + self._ripple_radius * 2,
+                    114 + (
+                        self._ripple_radius * 2
+                    ),
 
-                    114 + self._ripple_radius * 2
+                    114 + (
+                        self._ripple_radius * 2
+                    )
 
                 )
 
             )
 
-        # --------------------------------------
-        # Live Circular Glow
-        # --------------------------------------
+        # ==================================================
+        # LIVE CIRCULAR GLOW
+        # ==================================================
 
         if self.glow_radius > 0:
 
@@ -765,7 +918,9 @@ class MicrophoneButton(QPushButton):
                 45
             )
 
-            painter.setBrush(glow_color)
+            painter.setBrush(
+                glow_color
+            )
 
             painter.drawEllipse(
 
@@ -775,114 +930,121 @@ class MicrophoneButton(QPushButton):
 
                     18 - self.glow_radius,
 
-                    114 + self.glow_radius * 2,
+                    114 + (
+                        self.glow_radius * 2
+                    ),
 
-                    114 + self.glow_radius * 2
+                    114 + (
+                        self.glow_radius * 2
+                    )
 
                 )
 
             )
 
-        # --------------------------------------
-        # Outer Ring
-        # --------------------------------------
+        # ==================================================
+        # OUTER WHITE RING
+        # ==================================================
 
         painter.setPen(
-
             QPen(
-
                 QColor(
                     255,
                     255,
                     255,
                     235
                 ),
-
                 8
-
             )
-
         )
 
-        painter.setBrush(Qt.NoBrush)
+        painter.setBrush(
+            Qt.NoBrush
+        )
 
         painter.drawEllipse(
 
             QRectF(
-
                 8,
-
                 8,
-
                 134,
-
                 134
-
             )
 
         )
 
-        # --------------------------------------
-        # Main Circle
-        # --------------------------------------
+        # ==================================================
+        # MAIN MICROPHONE CIRCLE
+        # ==================================================
 
-        painter.setPen(Qt.NoPen)
+        painter.setPen(
+            Qt.NoPen
+        )
 
         if self.isEnabled():
 
-            color = QColor("#7C3AED")
+            # ------------------------------------------------
+            # SAME PURPLE AS WAVES
+            # ------------------------------------------------
+
+            color = QColor(
+                124,
+                58,
+                237
+            )
 
         else:
 
-            color = QColor("#9CA3AF")
+            color = QColor(
+                156,
+                163,
+                175
+            )
 
-        painter.setBrush(color)
+        painter.setBrush(
+            color
+        )
 
         painter.drawEllipse(
 
             QRectF(
-
                 18,
-
                 18,
-
                 114,
-
                 114
-
             )
 
         )
 
-        # --------------------------------------
-        # SVG
-        # --------------------------------------
+        # ==================================================
+        # MICROPHONE SVG
+        # ==================================================
 
         if self.svg.isValid():
 
             if not self.isEnabled():
 
-                painter.setOpacity(0.45)
+                painter.setOpacity(
+                    0.45
+                )
 
             self.svg.render(
 
                 painter,
 
                 QRectF(
-
                     49,
-
                     37,
-
                     52,
-
                     76
-
                 )
 
             )
 
-            painter.setOpacity(1.0)
+            painter.setOpacity(
+                1.0
+            )
+
 
 # ==========================================================
 # Main Mic Widget
@@ -890,9 +1052,18 @@ class MicrophoneButton(QPushButton):
 
 class MicWidget(QWidget):
 
-    def __init__(self, parent=None):
+    def __init__(
+        self,
+        parent=None
+    ):
 
-        super().__init__(parent)
+        super().__init__(
+            parent
+        )
+
+        # ==================================================
+        # TRANSPARENT BACKGROUND
+        # ==================================================
 
         self.setAttribute(
             Qt.WA_TranslucentBackground
@@ -903,18 +1074,27 @@ class MicWidget(QWidget):
             QSizePolicy.Fixed
         )
 
-        self.setMinimumHeight(250)
-        self.setMaximumHeight(320)
+        self.setMinimumHeight(
+            250
+        )
+
+        self.setMaximumHeight(
+            320
+        )
 
         self.listening = False
 
         self.build_ui()
 
-    # ------------------------------------------------------
+    # ======================================================
+    # BUILD UI
+    # ======================================================
 
     def build_ui(self):
 
-        self.root_layout = QVBoxLayout(self)
+        self.root_layout = QVBoxLayout(
+            self
+        )
 
         self.root_layout.setContentsMargins(
             0,
@@ -923,20 +1103,24 @@ class MicWidget(QWidget):
             0
         )
 
-        self.root_layout.setSpacing(16)
+        self.root_layout.setSpacing(
+            16
+        )
 
         self.root_layout.setAlignment(
-            Qt.AlignBottom | Qt.AlignHCenter
+            Qt.AlignBottom |
+            Qt.AlignHCenter
         )
 
         # ==================================================
-        # Single Layout
-        # (Mic Always Center)
+        # MAIN ROW
         # ==================================================
 
         self.main_row = QWidget()
 
-        main_layout = QHBoxLayout(self.main_row)
+        main_layout = QHBoxLayout(
+            self.main_row
+        )
 
         main_layout.setContentsMargins(
             0,
@@ -945,19 +1129,23 @@ class MicWidget(QWidget):
             0
         )
 
-        main_layout.setSpacing(24)
+        main_layout.setSpacing(
+            24
+        )
 
         main_layout.setAlignment(
             Qt.AlignCenter
         )
 
-        # --------------------------------------------------
+        # ==================================================
         # LEFT CONTAINER
-        # --------------------------------------------------
+        # ==================================================
 
         self.left_container = QWidget()
 
-        left_layout = QVBoxLayout(self.left_container)
+        left_layout = QVBoxLayout(
+            self.left_container
+        )
 
         left_layout.setContentsMargins(
             0,
@@ -966,7 +1154,9 @@ class MicWidget(QWidget):
             0
         )
 
-        left_layout.setSpacing(0)
+        left_layout.setSpacing(
+            0
+        )
 
         left_layout.setAlignment(
             Qt.AlignCenter
@@ -978,29 +1168,42 @@ class MicWidget(QWidget):
             "leftWave"
         )
 
+        # ==================================================
+        # USER LABEL
+        # ==================================================
+
         self.user_label = QLabel()
 
-        self.user_label.setWordWrap(True)
+        self.user_label.setWordWrap(
+            True
+        )
 
-        self.user_label.setMaximumWidth(260)
+        self.user_label.setMaximumWidth(
+            260
+        )
 
         self.user_label.setAlignment(
-            Qt.AlignRight | Qt.AlignVCenter
+            Qt.AlignRight |
+            Qt.AlignVCenter
         )
 
         self.user_label.setStyleSheet("""
 
-        background:transparent;
+        background: transparent;
 
-        color:#374151;
+        color: #374151;
 
-        font-size:14px;
+        font-size: 14px;
 
-        font-weight:600;
+        font-weight: 600;
 
         """)
 
         self.user_label.hide()
+
+        # ==================================================
+        # LEFT LAYOUT
+        # ==================================================
 
         left_layout.addWidget(
             self.left_wave,
@@ -1012,19 +1215,21 @@ class MicWidget(QWidget):
             alignment=Qt.AlignCenter
         )
 
-        # --------------------------------------------------
-        # MIC
-        # --------------------------------------------------
+        # ==================================================
+        # MICROPHONE
+        # ==================================================
 
         self.mic_button = MicrophoneButton()
 
-        # --------------------------------------------------
+        # ==================================================
         # RIGHT CONTAINER
-        # --------------------------------------------------
+        # ==================================================
 
         self.right_container = QWidget()
 
-        right_layout = QVBoxLayout(self.right_container)
+        right_layout = QVBoxLayout(
+            self.right_container
+        )
 
         right_layout.setContentsMargins(
             0,
@@ -1033,7 +1238,9 @@ class MicWidget(QWidget):
             0
         )
 
-        right_layout.setSpacing(0)
+        right_layout.setSpacing(
+            0
+        )
 
         right_layout.setAlignment(
             Qt.AlignCenter
@@ -1045,29 +1252,42 @@ class MicWidget(QWidget):
             "rightWave"
         )
 
+        # ==================================================
+        # AI LABEL
+        # ==================================================
+
         self.ai_label = QLabel()
 
-        self.ai_label.setWordWrap(True)
+        self.ai_label.setWordWrap(
+            True
+        )
 
-        self.ai_label.setMaximumWidth(260)
+        self.ai_label.setMaximumWidth(
+            260
+        )
 
         self.ai_label.setAlignment(
-            Qt.AlignLeft | Qt.AlignVCenter
+            Qt.AlignLeft |
+            Qt.AlignVCenter
         )
 
         self.ai_label.setStyleSheet("""
 
-        background:transparent;
+        background: transparent;
 
-        color:#7C3AED;
+        color: #7C3AED;
 
-        font-size:14px;
+        font-size: 14px;
 
-        font-weight:600;
+        font-weight: 600;
 
         """)
 
         self.ai_label.hide()
+
+        # ==================================================
+        # RIGHT LAYOUT
+        # ==================================================
 
         right_layout.addWidget(
             self.right_wave,
@@ -1078,6 +1298,10 @@ class MicWidget(QWidget):
             self.ai_label,
             alignment=Qt.AlignCenter
         )
+
+        # ==================================================
+        # MAIN ROW
+        # ==================================================
 
         main_layout.addWidget(
             self.left_container
@@ -1091,57 +1315,75 @@ class MicWidget(QWidget):
             self.right_container
         )
 
+        # ==================================================
+        # ROOT
+        # ==================================================
+
         self.root_layout.addStretch()
 
         self.root_layout.addWidget(
             self.main_row,
-            alignment=Qt.AlignBottom | Qt.AlignHCenter
+            alignment=(
+                Qt.AlignBottom |
+                Qt.AlignHCenter
+            )
         )
 
     # ======================================================
-    # Backend API
+    # BACKEND API
     # ======================================================
 
     def button(self):
+
         """
         Return microphone button.
         """
 
         return self.mic_button
 
-    # ------------------------------------------------------
+    # ======================================================
+    # CONVERSATION
+    # ======================================================
 
     def show_conversation(
         self,
         user_text,
         ai_text=""
     ):
+
         """
         Show current conversation.
-        This remains visible until the
-        next microphone click.
+
+        Conversation remains visible until
+        the next microphone click.
         """
 
-        self.user_label.setText(user_text)
-        self.ai_label.setText(ai_text)
+        self.user_label.setText(
+            user_text
+        )
+
+        self.ai_label.setText(
+            ai_text
+        )
 
         self.left_wave.hide()
+
         self.right_wave.hide()
 
         self.user_label.show()
+
         self.ai_label.show()
 
         self.update()
 
-    # ------------------------------------------------------
+    # ======================================================
+    # UPDATE AI MESSAGE
+    # ======================================================
 
     def update_ai_message(
         self,
         text
     ):
-        """
-        Update AI reply.
-        """
 
         self.ai_label.setText(
             text
@@ -1149,15 +1391,17 @@ class MicWidget(QWidget):
 
         self.update()
 
-    # ------------------------------------------------------
+    # ======================================================
+    # LISTENING DISPLAY
+    # ======================================================
 
     def show_listening(self):
+
         """
         Show idle/listening waves.
 
-        DO NOT clear conversation here.
-        Conversation is cleared only
-        when a new listening session starts.
+        Conversation is cleared only when
+        a new listening session starts.
         """
 
         self.user_label.hide()
@@ -1168,7 +1412,9 @@ class MicWidget(QWidget):
 
         self.right_wave.show()
 
-    # ------------------------------------------------------
+    # ======================================================
+    # LISTENING STATE
+    # ======================================================
 
     def set_listening(
         self,
@@ -1187,11 +1433,19 @@ class MicWidget(QWidget):
 
         if listening:
 
+            # ------------------------------------------------
             # Clear previous conversation
+            # ------------------------------------------------
+
             self.user_label.clear()
+
             self.ai_label.clear()
 
             self.show_listening()
+
+        # --------------------------------------------------
+        # Reset visual audio level
+        # --------------------------------------------------
 
         self.left_wave.update_level(
             0.0
@@ -1201,7 +1455,9 @@ class MicWidget(QWidget):
             0.0
         )
 
-    # ------------------------------------------------------
+    # ======================================================
+    # AUDIO LEVEL
+    # ======================================================
 
     def update_audio_level(
         self,
@@ -1224,7 +1480,9 @@ class MicWidget(QWidget):
             level
         )
 
-    # ------------------------------------------------------
+    # ======================================================
+    # ENABLE / DISABLE
+    # ======================================================
 
     def set_enabled(
         self,
@@ -1235,13 +1493,17 @@ class MicWidget(QWidget):
             enabled
         )
 
-    # ------------------------------------------------------
+    # ======================================================
+    # RESET
+    # ======================================================
 
     def reset(self):
 
         self.show_listening()
 
-        self.set_listening(False)
+        self.set_listening(
+            False
+        )
 
         self.left_wave.update_level(
             0.0

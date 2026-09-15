@@ -1,17 +1,21 @@
 """
-ASTRA-AI
-Premium Header V3
+DHEEPTHI-AI
+Lightweight Glass Header V5
 --------------------------------------------
 
 Features
-✓ Glass Header
-✓ Premium Logo Glow
+✓ Lightweight Glass Header
+✓ Transparent / Frosted Glass Feel
+✓ Improved Text Visibility
+✓ No Real-Time Blur
+✓ No Graphics Shadow Effects
 ✓ Dynamic Greeting
 ✓ Live Clock
 ✓ Responsive Layout
 ✓ Lavender Conversation SVG Icon
 ✓ Conversation Callback
-✓ Clean Architecture
+✓ i3-Friendly Visual Rendering
+✓ Existing Public API Preserved
 """
 
 import os
@@ -24,8 +28,6 @@ from PySide6.QtCore import (
 )
 
 from PySide6.QtGui import (
-    QColor,
-    QFont,
     QPixmap,
     QIcon,
 )
@@ -37,7 +39,6 @@ from PySide6.QtWidgets import (
     QSizePolicy,
     QHBoxLayout,
     QVBoxLayout,
-    QGraphicsDropShadowEffect,
 )
 
 
@@ -67,65 +68,44 @@ class HeaderWidget(QFrame):
         )
 
         # ======================================================
-        # HEADER STYLE
+        # LIGHTWEIGHT GLASS HEADER
         # ======================================================
-
+        #
+        # This is a simulated glass effect.
+        #
+        # We intentionally DO NOT use:
+        #
+        #   QGraphicsBlurEffect
+        #   QGraphicsDropShadowEffect
+        #   animated opacity
+        #   animated gradients
+        #
+        # Slightly higher transparency than V4 gives better
+        # text contrast while keeping the background visible.
+        #
         self.setStyleSheet("""
 
         QFrame#HeaderWidget {
 
-            background: qlineargradient(
-
-                x1: 0,
-                y1: 0,
-                x2: 1,
-                y2: 1,
-
-                stop: 0 rgba(255, 250, 255, 235),
-                stop: 0.18 rgba(250, 245, 255, 230),
-                stop: 0.45 rgba(243, 238, 255, 220),
-                stop: 0.72 rgba(240, 236, 255, 225),
-                stop: 1 rgba(255, 252, 255, 235)
-
+            background-color: rgba(
+                255,
+                255,
+                255,
+                115
             );
 
-            border: 2px solid rgba(255, 255, 255, 210);
+            border: 1px solid rgba(
+                255,
+                255,
+                255,
+                210
+            );
 
-            border-radius: 32px;
+            border-radius: 30px;
 
         }
 
         """)
-
-        # ======================================================
-        # HEADER SHADOW
-        # ======================================================
-
-        shadow = QGraphicsDropShadowEffect(
-            self
-        )
-
-        shadow.setBlurRadius(
-            40
-        )
-
-        shadow.setOffset(
-            0,
-            12
-        )
-
-        shadow.setColor(
-            QColor(
-                170,
-                155,
-                255,
-                60
-            )
-        )
-
-        self.setGraphicsEffect(
-            shadow
-        )
 
         # ======================================================
         # BUILD
@@ -232,29 +212,14 @@ class HeaderWidget(QFrame):
         }
         """)
 
-        glow = QGraphicsDropShadowEffect()
-
-        glow.setBlurRadius(
-            90
-        )
-
-        glow.setOffset(
-            0,
-            0
-        )
-
-        glow.setColor(
-            QColor(
-                146,
-                96,
-                255,
-                210
-            )
-        )
-
-        self.logo.setGraphicsEffect(
-            glow
-        )
+        # ======================================================
+        # PERFORMANCE
+        # ======================================================
+        #
+        # No QGraphicsDropShadowEffect.
+        #
+        # The logo PNG already contains its visual glow.
+        #
 
         self.load_logo()
 
@@ -273,42 +238,66 @@ class HeaderWidget(QFrame):
             Qt.AlignVCenter
         )
 
+        # ======================================================
+        # TITLE
+        # ======================================================
+
         self.title = QLabel(
             "DHEEPTHI-AI"
         )
 
-        self.title.setFont(
-            QFont(
-                "Segoe UI Variable",
-                31,
-                QFont.Bold
-            )
-        )
+        # Font is defined by the stylesheet with an explicit
+        # positive pixel size. This avoids QFont construction
+        # and Qt point-size initialization for this widget.
+
+        # ======================================================
+        # TITLE COLOUR
+        # ======================================================
 
         self.title.setStyleSheet("""
         QLabel {
-            color: #1F2937;
+
+            color: #1E0A4F;
+
+            font-family: "Segoe UI Variable";
+            font-size: 31px;
+            font-weight: 700;
+
             background: transparent;
+
             border: none;
+
         }
         """)
+
+        # ======================================================
+        # SUBTITLE
+        # ======================================================
 
         self.subtitle = QLabel(
             "Your Personal AI Desktop Assistant"
         )
 
-        self.subtitle.setFont(
-            QFont(
-                "Segoe UI",
-                14
-            )
-        )
+        # Font is defined by the stylesheet with an explicit
+        # positive pixel size.
+
+        # ======================================================
+        # SUBTITLE COLOUR
+        # ======================================================
 
         self.subtitle.setStyleSheet("""
         QLabel {
-            color: #64748B;
+
+            color: #26324A;
+
+            font-family: "Segoe UI";
+            font-size: 14px;
+            font-weight: 700;
+
             background: transparent;
+
             border: none;
+
         }
         """)
 
@@ -346,19 +335,26 @@ class HeaderWidget(QFrame):
             Qt.AlignCenter
         )
 
-        self.greeting_label.setFont(
-            QFont(
-                "Segoe UI Variable",
-                22,
-                QFont.Bold
-            )
-        )
+        # Font is defined by the stylesheet with an explicit
+        # positive pixel size.
+
+        # ======================================================
+        # GREETING COLOUR
+        # ======================================================
 
         self.greeting_label.setStyleSheet("""
         QLabel {
-            color: #111827;
+
+            color: #2B0A63;
+
+            font-family: "Segoe UI Variable";
+            font-size: 22px;
+            font-weight: 700;
+
             background: transparent;
+
             border: none;
+
         }
         """)
 
@@ -409,43 +405,53 @@ class HeaderWidget(QFrame):
         ]
 
         # ======================================================
-        # GLASS CARD STYLE
+        # LIGHTWEIGHT GLASS CHIP
         # ======================================================
-
+        #
+        # No blur.
+        # No shadow.
+        # No gradient.
+        #
+        # ONLY text visibility is improved here:
+        #
+        #   font-size  : 14px
+        #   weight     : 700
+        #   color      : deep navy-indigo
+        #
         chip_style = """
 
         QLabel {
 
-            background: qlineargradient(
-
-                x1: 0,
-                y1: 0,
-                x2: 1,
-                y2: 1,
-
-                stop: 0 rgba(255, 255, 255, 245),
-                stop: 1 rgba(246, 243, 255, 225)
-
+            background-color: rgba(
+                255,
+                255,
+                255,
+                110
             );
 
-            border: 1px solid rgba(255, 255, 255, 220);
+            border: 1px solid rgba(
+                255,
+                255,
+                255,
+                190
+            );
 
-            border-radius: 18px;
+            border-radius: 17px;
 
-            color: #374151;
+            color: #172554;
 
             padding: 8px 18px;
 
-            font-size: 13px;
+            font-size: 14px;
 
-            font-weight: 600;
+            font-weight: 700;
 
         }
 
         """
 
         # ======================================================
-        # APPLY CARD STYLE
+        # APPLY CHIP STYLE
         # ======================================================
 
         for chip in chips:
@@ -464,32 +470,6 @@ class HeaderWidget(QFrame):
 
             chip.setStyleSheet(
                 chip_style
-            )
-
-            chip_shadow = QGraphicsDropShadowEffect(
-                chip
-            )
-
-            chip_shadow.setBlurRadius(
-                20
-            )
-
-            chip_shadow.setOffset(
-                0,
-                5
-            )
-
-            chip_shadow.setColor(
-                QColor(
-                    180,
-                    170,
-                    255,
-                    35
-                )
-            )
-
-            chip.setGraphicsEffect(
-                chip_shadow
             )
 
         # ======================================================
@@ -564,28 +544,28 @@ class HeaderWidget(QFrame):
             )
 
         # ======================================================
-        # CONVERSATION BUTTON STYLE
+        # LIGHTWEIGHT GLASS BUTTON
         # ======================================================
 
         self.power_button.setStyleSheet("""
 
         QPushButton#ConversationButton {
 
-            background: qlineargradient(
-
-                x1: 0,
-                y1: 0,
-                x2: 1,
-                y2: 1,
-
-                stop: 0 #FFFFFF,
-                stop: 1 #F7F2FF
-
+            background-color: rgba(
+                255,
+                255,
+                255,
+                130
             );
 
-            border: 2px solid #DDD6FE;
+            border: 1px solid rgba(
+                255,
+                255,
+                255,
+                205
+            );
 
-            border-radius: 22px;
+            border-radius: 21px;
 
             padding: 6px;
 
@@ -593,69 +573,66 @@ class HeaderWidget(QFrame):
 
         QPushButton#ConversationButton:hover {
 
-            background: qlineargradient(
-
-                x1: 0,
-                y1: 0,
-                x2: 1,
-                y2: 1,
-
-                stop: 0 #FFFFFF,
-                stop: 1 #F1EBFF
-
+            background-color: rgba(
+                255,
+                255,
+                255,
+                175
             );
 
-            border: 2px solid #A78BFA;
+            border: 1px solid rgba(
+                167,
+                139,
+                250,
+                220
+            );
 
         }
 
         QPushButton#ConversationButton:pressed {
 
-            background: #EDE5FF;
+            background-color: rgba(
+                237,
+                229,
+                255,
+                185
+            );
 
-            border: 2px solid #7C3AED;
+            border: 1px solid rgba(
+                124,
+                58,
+                237,
+                220
+            );
 
         }
 
         QPushButton#ConversationButton:disabled {
 
-            background: #F3F4F6;
+            background-color: rgba(
+                243,
+                244,
+                246,
+                105
+            );
 
-            border: 2px solid #E5E7EB;
+            border: 1px solid rgba(
+                229,
+                231,
+                235,
+                140
+            );
 
         }
 
         """)
 
         # ======================================================
-        # LAVENDER GLOW
+        # PERFORMANCE
         # ======================================================
-
-        conversation_glow = QGraphicsDropShadowEffect(
-            self.power_button
-        )
-
-        conversation_glow.setBlurRadius(
-            28
-        )
-
-        conversation_glow.setOffset(
-            0,
-            4
-        )
-
-        conversation_glow.setColor(
-            QColor(
-                139,
-                92,
-                246,
-                90
-            )
-        )
-
-        self.power_button.setGraphicsEffect(
-            conversation_glow
-        )
+        #
+        # No QGraphicsDropShadowEffect.
+        #
 
         # ======================================================
         # ADD TIME / DATE / DAY CARDS
@@ -777,7 +754,7 @@ class HeaderWidget(QFrame):
             greeting = "Good Night"
 
         self.greeting_label.setText(
-            f"{greeting}, {self.username} 👋"
+            f"{greeting}, {self.username} 👋🏻"
         )
 
         self.time_chip.setText(

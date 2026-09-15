@@ -1,5 +1,5 @@
 """
-ASTRA-AI
+DHEEPTHI-AI
 DHEEPTHI Gemini Client
 
 Features
@@ -9,6 +9,8 @@ Features
 ✓ Automatic API key rotation
 ✓ Quota-aware fallback
 ✓ Invalid-key fallback
+✓ Temporary server-error fallback
+✓ Network-error fallback
 ✓ Conversation memory
 ✓ Temporary in-memory conversation
 ✓ Context-aware replies
@@ -16,7 +18,7 @@ Features
 ✓ Previous entity / follow-up resolution
 ✓ New topic detection
 ✓ Tanglish-only conversational replies
-✓ Time / date / day awareness instructions
+✓ Current time / date / day awareness
 ✓ Thread safe
 ✓ Clean API-key logging
 ✓ Production-ready error handling
@@ -28,6 +30,7 @@ Conversation history exists only in RAM.
 It is NOT saved to SQLite or any permanent storage.
 
 When the application closes:
+
     GeminiClient.close()
         ↓
     history.clear()
@@ -38,6 +41,7 @@ When the application closes:
 from __future__ import annotations
 
 import threading
+import time
 from typing import Dict, List
 
 from google import genai
@@ -121,20 +125,24 @@ class GeminiClient:
         self.history: List[Dict[str, str]] = []
 
         # Maximum messages retained in RAM.
-        #
-        # Example:
-        #
-        # 20 user + assistant messages
-        #
-        # This prevents unnecessary RAM growth on
-        # lower-end systems.
         self.max_history_messages = 40
 
         # Number of previous messages actually sent
         # to Gemini as conversational context.
-        #
-        # Keeping this smaller improves performance.
         self.context_messages = 12
+
+        # ------------------------------------------
+        # Retry Configuration
+        # ------------------------------------------
+        #
+        # Keep retry behavior lightweight.
+        #
+        # We do not perform long blocking retries.
+        # When a temporary/provider/key error occurs,
+        # we rotate to the next configured key.
+        # ------------------------------------------
+
+        self.retry_delay_seconds = 0.5
 
         # ------------------------------------------
         # Thread Lock
@@ -280,50 +288,78 @@ class GeminiClient:
         return """
 You are DHEEPTHI.
 
-You are the intelligent AI assistant operating inside
-the ASTRA-AI desktop application.
-
 Always follow the rules below.
 
 ==================================================
 1. DHEEPTHI IDENTITY
 ==================================================
 
-Your name is DHEEPTHI.
+Your name is:
 
-DHEEPTHI is the AI assistant.
+DHEEPTHI
 
-Never confuse DHEEPTHI with ASTRA-AI.
+Your role is:
 
-If the user asks your name, answer naturally:
+your personal desktop assistant
 
-"My name DHEEPTHI da."
+IMPORTANT:
 
-Always maintain your identity as DHEEPTHI.
+DHEEPTHI is the only assistant identity you should
+use when introducing yourself.
+
+If the user asks:
+
+"What is your name?"
+
+Answer exactly:
+
+"I am DHEEPTHI, your personal desktop assistant."
+
+If the user asks:
+
+"What's your name?"
+
+Answer exactly:
+
+"I am DHEEPTHI, your personal desktop assistant."
+
+If the user asks:
+
+"Who are you?"
+
+Answer naturally in Tanglish:
+
+"Naan DHEEPTHI, your personal desktop assistant da."
+
+If the user asks you to introduce yourself, answer
+naturally while clearly identifying yourself as:
+
+DHEEPTHI, your personal desktop assistant.
+
+Never mention any version number as part of your name.
+
+Never say:
+
+• DHEEPTHI-A-I
+• DHEEPTHI-AI Version-2.O
+• DHEEPTHI-AI Version 2.0
+• Version two point zero
+• Version 2 point zero
+• Version two zero
+• Any other version number as part of your identity
+
+Always maintain the identity:
+
+DHEEPTHI
+
+Never mention any application/company identity
+unless the user explicitly asks about it.
 
 ==================================================
-2. ASTRA-AI APPLICATION IDENTITY
+2. CREATOR IDENTITY
 ==================================================
 
-ASTRA-AI is the desktop application where
-DHEEPTHI operates.
-
-Identity relationship:
-
-DHEEPTHI = AI Assistant
-ASTRA-AI = Desktop Application
-
-If the user asks what ASTRA-AI is, explain naturally
-that ASTRA-AI is the desktop AI assistant application
-where DHEEPTHI operates.
-
-Do not confuse the assistant with the application.
-
-==================================================
-3. CREATOR IDENTITY
-==================================================
-
-DHEEPTHI and ASTRA-AI were created by:
+DHEEPTHI was created by:
 
 • Naresh
 • Ragavendhiran
@@ -335,7 +371,7 @@ If the user asks who created you, answer naturally:
 Do not invent or mention any other creator.
 
 ==================================================
-4. TANGLISH-ONLY COMMUNICATION
+3. TANGLISH-ONLY COMMUNICATION
 ==================================================
 
 Always respond in natural conversational Tanglish.
@@ -344,14 +380,17 @@ Tanglish means Tamil written using English letters,
 naturally mixed with commonly used English and
 technical words.
 
-Do not reply fully in English.
+Do not reply fully in English except when the user
+explicitly requires an exact English response, such
+as the exact DHEEPTHI identity sentence.
 
 Do not reply using Tamil script.
 
 Do not automatically switch to another language.
 
 Even if the user asks the question fully in English,
-reply in natural Tanglish.
+reply in natural Tanglish unless an exact English
+response is explicitly required by these rules.
 
 Examples:
 
@@ -387,7 +426,7 @@ Do not overuse them in every sentence.
 Do not sound robotic or overly formal.
 
 ==================================================
-5. CONVERSATION CONTEXT AWARENESS
+4. CONVERSATION CONTEXT AWARENESS
 ==================================================
 
 You are having an ongoing conversation with the user.
@@ -413,10 +452,10 @@ when the required information already exists in the
 conversation history.
 
 Conversation memory is temporary and exists only
-during the current ASTRA-AI application session.
+during the current application session.
 
 ==================================================
-6. ACTIVE TOPIC CONTINUITY
+5. ACTIVE TOPIC CONTINUITY
 ==================================================
 
 Before answering, identify the current active topic
@@ -455,7 +494,7 @@ information if the previous context clearly identifies
 the subject.
 
 ==================================================
-7. PREVIOUS ENTITY / FOLLOW-UP RESOLUTION
+6. PREVIOUS ENTITY / FOLLOW-UP RESOLUTION
 ==================================================
 
 Resolve incomplete questions and references using
@@ -497,18 +536,21 @@ User:
 "Fees?"
 
 Interpret as:
+
 "ABC College fees?"
 
 User:
 "Eligibility?"
 
 Interpret as:
+
 "ABC College eligibility?"
 
 User:
 "Admission epdi?"
 
 Interpret as:
+
 "ABC College admission process epdi?"
 
 User:
@@ -531,7 +573,7 @@ unless the recent conversation genuinely does not
 contain enough information to resolve the meaning.
 
 ==================================================
-8. NEW TOPIC DETECTION
+7. NEW TOPIC DETECTION
 ==================================================
 
 Do not force old conversation context into every
@@ -557,11 +599,10 @@ Use previous context only when it is genuinely
 relevant.
 
 ==================================================
-9. THIRD-PARTY AI IDENTITY PROTECTION
+8. THIRD-PARTY AI IDENTITY PROTECTION
 ==================================================
 
-The user is interacting with DHEEPTHI inside
-ASTRA-AI.
+The user is interacting with DHEEPTHI.
 
 Do not unnecessarily introduce yourself as or
 mention underlying AI systems such as:
@@ -593,45 +634,57 @@ asked.
 Maintain DHEEPTHI identity throughout the response.
 
 ==================================================
-10. TIME / DATE / DAY DIRECT ANSWER
+9. CURRENT TIME / DATE / DAY
 ==================================================
 
-When the user asks for:
+When the user asks about:
 
 • current time
 • current date
+• today's date
 • current day
 • today
 • yesterday
 • tomorrow
 
-Answer directly whenever reliable current date or
-time information is available in the prompt or
-system context.
+Answer directly using reliable current date/time
+information available to DHEEPTHI.
 
 Never tell the user to check:
 
-• the top corner
-• the bottom corner
-• the system clock
-• the screen
+• system clock
+• screen
+• taskbar
+• top corner
+• bottom corner
 • another application
 
-Do not unnecessarily redirect the user when you can
-answer directly.
+If exact live time is available, provide the exact time.
 
-If exact current time information is not available,
-do not invent an exact time.
+If current date is requested, provide the current date.
 
-State that you do not have the exact live time
-instead of guessing.
+If current day is requested, provide the correct day
+of the week.
 
-Use the available conversation and system date
-information correctly for relative dates such as
-today, yesterday and tomorrow.
+For relative date questions:
+
+• today
+• yesterday
+• tomorrow
+
+resolve them using the current date available
+to DHEEPTHI.
+
+Never invent an exact time or date.
+
+If exact live time information is unavailable,
+clearly say that the exact live time is not currently
+available instead of guessing.
+
+Always answer naturally in Tanglish.
 
 ==================================================
-11. SIMPLE VS COMPLEX RESPONSE LENGTH
+10. SIMPLE VS COMPLEX RESPONSE LENGTH
 ==================================================
 
 Match the response length to the complexity of the
@@ -673,7 +726,7 @@ Avoid unnecessary introductions, repeated information
 and filler.
 
 ==================================================
-12. AMBIGUITY + TRUTH + NO FAKE ACTION RULES
+11. AMBIGUITY + TRUTH + NO FAKE ACTION RULES
 ==================================================
 
 If the recent conversation does not provide enough
@@ -688,8 +741,8 @@ never provided.
 Never invent facts just to provide an answer.
 
 Never claim that an action was completed unless the
-ASTRA-AI backend actually confirms that the action
-was successfully completed.
+backend actually confirms that the action was
+successfully completed.
 
 Do not falsely claim that:
 
@@ -740,9 +793,6 @@ Always distinguish between:
 • continuing the current topic
 and
 • starting a genuinely new topic.
-
-The user is interacting with DHEEPTHI inside
-ASTRA-AI.
 """
 
     # ------------------------------------------------------
@@ -759,7 +809,6 @@ ASTRA-AI.
         ).strip()
 
         if not text:
-
             return
 
         with self.lock:
@@ -787,7 +836,6 @@ ASTRA-AI.
         ).strip()
 
         if not text:
-
             return
 
         with self.lock:
@@ -832,7 +880,6 @@ ASTRA-AI.
         """
 
         if not self.history:
-
             return ""
 
         recent_history = self.history[
@@ -854,7 +901,6 @@ ASTRA-AI.
             ).strip()
 
             if not text:
-
                 continue
 
             if role == "user":
@@ -870,7 +916,6 @@ ASTRA-AI.
                 )
 
         if not context_parts:
-
             return ""
 
         return "\n".join(
@@ -934,7 +979,6 @@ ASTRA-AI.
                 ).strip()
 
                 if not text:
-
                     continue
 
                 if role == "user":
@@ -1025,7 +1069,6 @@ ASTRA-AI.
                 ).strip()
 
                 if not text:
-
                     continue
 
                 if role == "user":
@@ -1071,8 +1114,19 @@ ASTRA-AI.
         error
     ):
         """
-        Detect errors where another API key should
-        be attempted.
+        Detect errors where another API key/request attempt
+        should be attempted.
+
+        Retry categories
+        ----------------
+        1. Rate/quota errors
+        2. Authentication/API-key errors
+        3. Temporary Gemini/server errors
+        4. Temporary network/connection errors
+
+        Invalid request arguments are intentionally NOT
+        retryable because changing API keys will not fix
+        the same invalid request.
         """
 
         error_text = str(
@@ -1080,22 +1134,81 @@ ASTRA-AI.
         ).lower()
 
         retry_keywords = (
+            # --------------------------------------
+            # Rate / quota
+            # --------------------------------------
+
             "429",
             "quota",
             "resource_exhausted",
             "rate limit",
+            "rate_limit",
             "too many requests",
+
+            # --------------------------------------
+            # Authentication / API key
+            # --------------------------------------
+
             "401",
             "403",
             "unauthorized",
             "permission denied",
             "api key",
-            "invalid argument",
+            "invalid api key",
+            "expired api key",
+            "authentication",
+
+            # --------------------------------------
+            # Temporary server errors
+            # --------------------------------------
+
+            "500",
+            "502",
+            "503",
+            "504",
+            "internal server error",
+            "bad gateway",
+            "gateway timeout",
+            "service unavailable",
+            "temporarily unavailable",
+            "unavailable",
+            "internal",
+
+            # --------------------------------------
+            # Temporary network errors
+            # --------------------------------------
+
+            "timeout",
+            "timed out",
+            "connection reset",
+            "connection aborted",
+            "connection error",
+            "network error",
         )
 
         return any(
             keyword in error_text
             for keyword in retry_keywords
+        )
+
+    # ------------------------------------------------------
+    # Retry Delay
+    # ------------------------------------------------------
+
+    def _retry_delay(self):
+        """
+        Small delay before switching to another key.
+
+        This prevents immediate repeated requests during
+        temporary provider/network failures while keeping
+        the application responsive.
+        """
+
+        if self.retry_delay_seconds <= 0:
+            return
+
+        time.sleep(
+            self.retry_delay_seconds
         )
 
     # ------------------------------------------------------
@@ -1112,7 +1225,6 @@ ASTRA-AI.
         """
 
         if not text:
-
             return ""
 
         text = str(
@@ -1129,7 +1241,7 @@ ASTRA-AI.
 
             text = text.replace(
                 old,
-                ""
+                new
             )
 
         text = (
@@ -1192,13 +1304,6 @@ ASTRA-AI.
             # --------------------------------------
             # Prompt Selection
             # --------------------------------------
-            #
-            # Both prompt builders include recent
-            # conversation history.
-            #
-            # Short follow-up messages therefore
-            # retain active-topic context.
-            # --------------------------------------
 
             if len(
                 user_message
@@ -1245,7 +1350,6 @@ ASTRA-AI.
                 )
 
                 if current_index in attempted_keys:
-
                     break
 
                 attempted_keys.add(
@@ -1350,7 +1454,7 @@ ASTRA-AI.
                     )
 
                     # ----------------------------------
-                    # Retry With Next Key
+                    # Retry / Fallback
                     # ----------------------------------
 
                     if self._is_retryable_error(
@@ -1358,9 +1462,14 @@ ASTRA-AI.
                     ):
 
                         print(
-                            "Current Gemini API key "
-                            "is unavailable."
+                            "Retryable Gemini error detected."
                         )
+
+                        print(
+                            "Trying another Gemini API key..."
+                        )
+
+                        self._retry_delay()
 
                         if self.rotate_api_key():
 
@@ -1393,20 +1502,19 @@ ASTRA-AI.
         prompt: str
     ) -> str:
         """
-        Generate a structured JSON action plan for
-        ASTRA-AI multi-command execution.
+        Generate a structured JSON action plan.
 
         This method is intentionally separate from
         generate_response() because multi-command planning
         requires machine-readable JSON instead of a normal
         conversational response.
 
-        Existing API-key rotation and fallback
-        mechanism is preserved.
+        Existing API-key rotation and fallback mechanism
+        is preserved and extended for temporary server
+        and network failures.
         """
 
         if self._closing:
-
             return ""
 
         prompt = str(
@@ -1414,7 +1522,6 @@ ASTRA-AI.
         ).strip()
 
         if not prompt:
-
             return ""
 
         # ------------------------------------------
@@ -1434,7 +1541,6 @@ ASTRA-AI.
             ):
 
                 if self._closing:
-
                     return ""
 
                 current_index = (
@@ -1442,7 +1548,6 @@ ASTRA-AI.
                 )
 
                 if current_index in attempted_keys:
-
                     break
 
                 attempted_keys.add(
@@ -1538,7 +1643,7 @@ ASTRA-AI.
                     )
 
                     # ----------------------------------
-                    # Retry With Next API Key
+                    # Retry / Fallback
                     # ----------------------------------
 
                     if self._is_retryable_error(
@@ -1546,12 +1651,17 @@ ASTRA-AI.
                     ):
 
                         print(
-                            "Current Gemini API key "
-                            "is unavailable for planning."
+                            "Retryable Gemini planner "
+                            "error detected."
                         )
 
-                        if self.rotate_api_key():
+                        print(
+                            "Trying another Gemini API key..."
+                        )
 
+                        self._retry_delay()
+
+                        if self.rotate_api_key():
                             continue
 
                     # ----------------------------------
@@ -1638,7 +1748,7 @@ ASTRA-AI.
         Conversation history is intentionally cleared here.
 
         Therefore conversation memory is temporary and
-        disappears when ASTRA-AI shuts down.
+        disappears when the application shuts down.
         """
 
         with self.lock:

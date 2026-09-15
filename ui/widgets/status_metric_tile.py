@@ -1,31 +1,36 @@
 """
-ASTRA-AI
-Premium Status Metric Tile
-Review-1 Production
+DHEEPTHI-AI
+Lightweight Glass Status Metric Tile
+--------------------------------------------
+
+Features
+✓ Lightweight Glass Metric Card
+✓ Transparent / Frosted Glass Feel
+✓ Background Remains Visible
+✓ Strong Text Visibility
+✓ High Contrast Titles
+✓ High Contrast Metric Values
+✓ No Real-Time Blur
+✓ No Graphics Drop Shadow
+✓ No Hover Animation
+✓ Lightweight Hover State
+✓ Existing Public API Preserved
+✓ i3-Friendly Rendering
+✓ Existing Right Panel Integration Preserved
 """
 
 from __future__ import annotations
 
 from PySide6.QtCore import (
     Qt,
-    QPropertyAnimation,
-    QEasingCurve,
 )
-
-from PySide6.QtGui import QColor
 
 from PySide6.QtWidgets import (
     QFrame,
     QLabel,
     QVBoxLayout,
     QSizePolicy,
-    QGraphicsDropShadowEffect,
 )
-
-try:
-    import shiboken6
-except ImportError:
-    shiboken6 = None
 
 
 class StatusMetricTile(QFrame):
@@ -38,12 +43,26 @@ class StatusMetricTile(QFrame):
         color="#16A34A",
         parent=None,
     ):
-        super().__init__(parent)
+
+        super().__init__(
+            parent
+        )
+
+        # =====================================================
+        # DATA
+        # =====================================================
 
         self.title = title
+
         self.value = value
+
         self.icon = icon
+
         self.value_color = color
+
+        # =====================================================
+        # OBJECT
+        # =====================================================
 
         self.setObjectName(
             "MetricTile"
@@ -58,9 +77,9 @@ class StatusMetricTile(QFrame):
             True
         )
 
-        # -------------------------------------------------
-        # Fixed tile size
-        # -------------------------------------------------
+        # =====================================================
+        # FIXED TILE SIZE
+        # =====================================================
 
         self.setMinimumSize(
             150,
@@ -77,223 +96,172 @@ class StatusMetricTile(QFrame):
             QSizePolicy.Fixed
         )
 
-        # -------------------------------------------------
-        # Styles
+        # =====================================================
+        # RUNTIME STATE
+        # =====================================================
+
+        self._hovered = False
+
+        # -----------------------------------------------------
+        # Compatibility with RightPanelWidget
+        # -----------------------------------------------------
         #
-        # IMPORTANT:
-        # Qt stylesheet rgba alpha uses integer values.
-        # Do NOT use .98 / .95 here.
-        # -------------------------------------------------
+        # RightPanelWidget checks tile.shadow.
+        #
+        # We intentionally do not create a graphics effect.
+        #
+
+        self.shadow = None
+
+        # =====================================================
+        # NORMAL GLASS STYLE
+        # =====================================================
+        #
+        # Slightly stronger glass layer than previous version.
+        #
+        # This keeps the background visible while improving
+        # readability of the metric card.
+        #
 
         self.NORMAL_STYLE = """
+
         QFrame#MetricTile {
 
-            background: qlineargradient(
-                x1: 0,
-                y1: 0,
-                x2: 1,
-                y2: 1,
-
-                stop: 0 rgba(255, 255, 255, 250),
-                stop: 1 rgba(245, 243, 255, 242)
+            background-color: rgba(
+                248,
+                247,
+                255,
+                168
             );
 
-            border: 1px solid #DDD6FE;
+            border: 1px solid rgba(
+                255,
+                255,
+                255,
+                225
+            );
 
             border-radius: 20px;
+
         }
+
         """
+
+        # =====================================================
+        # HOVER GLASS STYLE
+        # =====================================================
 
         self.HOVER_STYLE = """
+
         QFrame#MetricTile {
 
-            background: rgba(255, 255, 255, 255);
+            background-color: rgba(
+                255,
+                255,
+                255,
+                190
+            );
 
-            border: 2px solid #C4B5FD;
+            border: 2px solid rgba(
+                124,
+                58,
+                237,
+                210
+            );
 
             border-radius: 20px;
+
         }
+
         """
 
+        # =====================================================
+        # ICON NORMAL STYLE
+        # =====================================================
+
         self.ICON_NORMAL_STYLE = """
+
         QLabel {
 
-            background: #EEF2FF;
+            background-color: rgba(
+                255,
+                255,
+                255,
+                155
+            );
 
-            border: 1px solid #DDD6FE;
+            border: 1px solid rgba(
+                221,
+                214,
+                254,
+                220
+            );
 
             border-radius: 23px;
 
             font-size: 22px;
+
+            color: #17142F;
+
         }
+
         """
+
+        # =====================================================
+        # ICON HOVER STYLE
+        # =====================================================
 
         self.ICON_HOVER_STYLE = """
+
         QLabel {
 
-            background: #EDE9FE;
+            background-color: rgba(
+                255,
+                255,
+                255,
+                180
+            );
 
-            border: 2px solid #C4B5FD;
-
-            border-radius: 23px;
-
-            font-size: 24px;
-        }
-        """
-
-        # -------------------------------------------------
-        # Runtime state
-        # -------------------------------------------------
-
-        self._hovered = False
-
-        self.shadow = None
-
-        self.hover_animation = None
-
-        # -------------------------------------------------
-        # Build UI
-        # -------------------------------------------------
-
-        self.build_ui()
-
-    # =====================================================
-    # Shadow
-    # =====================================================
-
-    def _create_shadow(self):
-        """
-        Create a fresh shadow effect.
-
-        Qt owns the graphics effect after setGraphicsEffect().
-        A Python wrapper can therefore become invalid if Qt
-        deletes/replaces the underlying C++ object.
-
-        This method safely creates a new effect whenever needed.
-        """
-
-        shadow = QGraphicsDropShadowEffect()
-
-        shadow.setBlurRadius(
-            22
-        )
-
-        shadow.setOffset(
-            0,
-            5
-        )
-
-        shadow.setColor(
-            QColor(
+            border: 2px solid rgba(
                 124,
                 58,
                 237,
-                28
-            )
-        )
+                220
+            );
 
-        shadow.setParent(
-            self
-        )
+            border-radius: 23px;
 
-        self.shadow = shadow
+            font-size: 23px;
 
-        self.setGraphicsEffect(
-            shadow
-        )
+            color: #17142F;
 
-        return shadow
+        }
 
-    # -----------------------------------------------------
-
-    def _shadow_is_valid(self):
-        """
-        Check whether the Python wrapper still points to a
-        valid Qt C++ QGraphicsDropShadowEffect.
         """
 
-        if self.shadow is None:
-            return False
+        # =====================================================
+        # BUILD
+        # =====================================================
 
-        if shiboken6 is None:
-            return True
+        self.build_ui()
 
-        try:
-            return shiboken6.isValid(
-                self.shadow
-            )
-
-        except Exception:
-            return False
-
-    # -----------------------------------------------------
-
-    def _ensure_shadow(self):
-        """
-        Return a valid shadow object.
-
-        If Qt already deleted the previous effect, create
-        a fresh one instead of allowing a RuntimeError.
-        """
-
-        if self._shadow_is_valid():
-
-            return self.shadow
-
-        try:
-
-            self._create_shadow()
-
-        except Exception as error:
-
-            print(
-                f"Metric Tile Shadow Error : {error}"
-            )
-
-            self.shadow = None
-
-        return self.shadow
-
-    # =====================================================
-    # Build UI
-    # =====================================================
+    # =========================================================
+    # BUILD UI
+    # =========================================================
 
     def build_ui(self):
+
+        # =====================================================
+        # CARD STYLE
+        # =====================================================
 
         self.setStyleSheet(
             self.NORMAL_STYLE
         )
 
-        # -------------------------------------------------
-        # Shadow
-        # -------------------------------------------------
-
-        self._create_shadow()
-
-        # -------------------------------------------------
-        # Hover animation
-        #
-        # Only blurRadius is animated.
-        # Short duration keeps the UI responsive.
-        # -------------------------------------------------
-
-        self.hover_animation = QPropertyAnimation(
-            self.shadow,
-            b"blurRadius",
-            self
-        )
-
-        self.hover_animation.setDuration(
-            120
-        )
-
-        self.hover_animation.setEasingCurve(
-            QEasingCurve.OutCubic
-        )
-
-        # -------------------------------------------------
-        # Root Layout
-        # -------------------------------------------------
+        # =====================================================
+        # ROOT LAYOUT
+        # =====================================================
 
         root = QVBoxLayout(
             self
@@ -314,9 +282,9 @@ class StatusMetricTile(QFrame):
             Qt.AlignCenter
         )
 
-        # =================================================
-        # Icon
-        # =================================================
+        # =====================================================
+        # ICON
+        # =====================================================
 
         self.icon_label = QLabel(
             self.icon
@@ -340,9 +308,21 @@ class StatusMetricTile(QFrame):
             alignment=Qt.AlignCenter
         )
 
-        # =================================================
-        # Title
-        # =================================================
+        # =====================================================
+        # TITLE
+        # =====================================================
+        #
+        # Increased contrast:
+        #
+        # Old:
+        #   #17142F
+        #
+        # New:
+        #   #0B0820
+        #
+        # This makes Health / CPU / Memory / Storage etc.
+        # clearly readable over the glass background.
+        #
 
         self.title_label = QLabel(
             self.title
@@ -358,18 +338,21 @@ class StatusMetricTile(QFrame):
 
         self.title_label.setStyleSheet(
             """
+
             QLabel {
 
-                color: #111827;
+                color: #0B0820;
 
-                font-size: 14px;
+                font-size: 15px;
 
-                font-weight: 700;
+                font-weight: 800;
 
                 background: transparent;
 
                 border: none;
+
             }
+
             """
         )
 
@@ -377,9 +360,9 @@ class StatusMetricTile(QFrame):
             self.title_label
         )
 
-        # =================================================
-        # Value
-        # =================================================
+        # =====================================================
+        # VALUE
+        # =====================================================
 
         self.value_label = QLabel()
 
@@ -391,14 +374,18 @@ class StatusMetricTile(QFrame):
             self.value_label
         )
 
+        # =====================================================
+        # INITIAL VALUE
+        # =====================================================
+
         self.update_value(
             self.value,
             self.value_color
         )
 
-    # =====================================================
-    # Update Value
-    # =====================================================
+    # =========================================================
+    # UPDATE VALUE
+    # =========================================================
 
     def update_value(
         self,
@@ -408,34 +395,49 @@ class StatusMetricTile(QFrame):
 
         self.value = value
 
+        # -----------------------------------------------------
+        # Update color
+        # -----------------------------------------------------
+
         if color is not None:
 
             self.value_color = color
+
+        # -----------------------------------------------------
+        # Set value
+        # -----------------------------------------------------
 
         self.value_label.setText(
             str(value)
         )
 
+        # -----------------------------------------------------
+        # Strong readable metric value
+        # -----------------------------------------------------
+
         self.value_label.setStyleSheet(
             f"""
+
             QLabel {{
 
                 color: {self.value_color};
 
-                font-size: 12px;
+                font-size: 13px;
 
-                font-weight: 700;
+                font-weight: 800;
 
                 background: transparent;
 
                 border: none;
+
             }}
+
             """
         )
 
-    # =====================================================
-    # Public API
-    # =====================================================
+    # =========================================================
+    # PUBLIC API
+    # =========================================================
 
     def set_title(
         self,
@@ -448,7 +450,7 @@ class StatusMetricTile(QFrame):
             title
         )
 
-    # -----------------------------------------------------
+    # ---------------------------------------------------------
 
     def set_icon(
         self,
@@ -461,7 +463,7 @@ class StatusMetricTile(QFrame):
             icon
         )
 
-    # -----------------------------------------------------
+    # ---------------------------------------------------------
 
     def set_value(
         self,
@@ -474,7 +476,7 @@ class StatusMetricTile(QFrame):
             color
         )
 
-    # -----------------------------------------------------
+    # ---------------------------------------------------------
 
     def set_card_enabled(
         self,
@@ -485,108 +487,21 @@ class StatusMetricTile(QFrame):
             enabled
         )
 
-        self.setWindowOpacity(
-            1.0 if enabled else 0.55
-        )
+        if enabled:
 
-    # =====================================================
-    # Hover Animation
-    # =====================================================
-
-    def _animate_shadow(
-        self,
-        end_value
-    ):
-        """
-        Safely animate shadow blur.
-
-        If the old QGraphicsEffect was deleted by Qt,
-        recreate it before accessing it.
-        """
-
-        shadow = self._ensure_shadow()
-
-        if shadow is None:
-            return
-
-        try:
-
-            if self.hover_animation is not None:
-
-                self.hover_animation.stop()
-
-        except RuntimeError:
-
-            self.hover_animation = None
-
-        # -------------------------------------------------
-        # Recreate animation if its target was deleted.
-        # -------------------------------------------------
-
-        if (
-            self.hover_animation is None
-            or (
-                shiboken6 is not None
-                and not shiboken6.isValid(
-                    self.hover_animation
-                )
-            )
-        ):
-
-            self.hover_animation = QPropertyAnimation(
-                shadow,
-                b"blurRadius",
-                self
+            self.setWindowOpacity(
+                1.0
             )
 
-            self.hover_animation.setDuration(
-                120
+        else:
+
+            self.setWindowOpacity(
+                0.55
             )
 
-            self.hover_animation.setEasingCurve(
-                QEasingCurve.OutCubic
-            )
-
-        try:
-
-            current_value = shadow.blurRadius()
-
-        except RuntimeError:
-
-            shadow = self._create_shadow()
-
-            if shadow is None:
-                return
-
-            current_value = 22
-
-            self.hover_animation = QPropertyAnimation(
-                shadow,
-                b"blurRadius",
-                self
-            )
-
-            self.hover_animation.setDuration(
-                120
-            )
-
-            self.hover_animation.setEasingCurve(
-                QEasingCurve.OutCubic
-            )
-
-        self.hover_animation.setStartValue(
-            current_value
-        )
-
-        self.hover_animation.setEndValue(
-            end_value
-        )
-
-        self.hover_animation.start()
-
-    # =====================================================
-    # Hover Enter
-    # =====================================================
+    # =========================================================
+    # HOVER ENTER
+    # =========================================================
 
     def enterEvent(
         self,
@@ -595,53 +510,17 @@ class StatusMetricTile(QFrame):
 
         self._hovered = True
 
-        # -------------------------------------------------
-        # Shadow
-        # -------------------------------------------------
-
-        self._animate_shadow(
-            36
-        )
-
-        # -------------------------------------------------
-        # Hover shadow appearance
-        # -------------------------------------------------
-
-        shadow = self._ensure_shadow()
-
-        if shadow is not None:
-
-            try:
-
-                shadow.setOffset(
-                    0,
-                    7
-                )
-
-                shadow.setColor(
-                    QColor(
-                        124,
-                        58,
-                        237,
-                        65
-                    )
-                )
-
-            except RuntimeError:
-
-                pass
-
-        # -------------------------------------------------
-        # Card
-        # -------------------------------------------------
+        # -----------------------------------------------------
+        # Lightweight hover.
+        #
+        # No shadow.
+        # No animation.
+        # No blur.
+        # -----------------------------------------------------
 
         self.setStyleSheet(
             self.HOVER_STYLE
         )
-
-        # -------------------------------------------------
-        # Icon
-        # -------------------------------------------------
 
         self.icon_label.setStyleSheet(
             self.ICON_HOVER_STYLE
@@ -651,9 +530,9 @@ class StatusMetricTile(QFrame):
             event
         )
 
-    # =====================================================
-    # Hover Leave
-    # =====================================================
+    # =========================================================
+    # HOVER LEAVE
+    # =========================================================
 
     def leaveEvent(
         self,
@@ -662,53 +541,13 @@ class StatusMetricTile(QFrame):
 
         self._hovered = False
 
-        # -------------------------------------------------
-        # Shadow
-        # -------------------------------------------------
-
-        self._animate_shadow(
-            22
-        )
-
-        # -------------------------------------------------
-        # Restore shadow
-        # -------------------------------------------------
-
-        shadow = self._ensure_shadow()
-
-        if shadow is not None:
-
-            try:
-
-                shadow.setOffset(
-                    0,
-                    5
-                )
-
-                shadow.setColor(
-                    QColor(
-                        124,
-                        58,
-                        237,
-                        28
-                    )
-                )
-
-            except RuntimeError:
-
-                pass
-
-        # -------------------------------------------------
-        # Card
-        # -------------------------------------------------
+        # -----------------------------------------------------
+        # Restore normal glass.
+        # -----------------------------------------------------
 
         self.setStyleSheet(
             self.NORMAL_STYLE
         )
-
-        # -------------------------------------------------
-        # Icon
-        # -------------------------------------------------
 
         self.icon_label.setStyleSheet(
             self.ICON_NORMAL_STYLE

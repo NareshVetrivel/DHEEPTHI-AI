@@ -1,8 +1,6 @@
 """
-ASTRA-AI
+DHEEPTHI
 Premium Conversation Panel
-Company: ASTRA-AI
-Product: DHEEPTHI
 
 Lightweight ChatGPT/WhatsApp-style conversation UI.
 
@@ -30,12 +28,12 @@ from PySide6.QtCore import (
     Signal,
     QTimer,
     QPropertyAnimation,
+    QMimeData,
 )
 
 from PySide6.QtGui import (
     QColor,
-    QFont,
-    QFontMetrics,
+    QPalette,
 )
 
 from PySide6.QtWidgets import (
@@ -49,6 +47,7 @@ from PySide6.QtWidgets import (
     QFrame,
     QSizePolicy,
     QGraphicsDropShadowEffect,
+    QMessageBox,
 )
 
 
@@ -214,9 +213,9 @@ class MessageBubble(QFrame):
 
             QFrame#UserMessage {
 
-                background:#F0E8FF;
+                background:rgba(124,58,237,175);
 
-                border:1px solid #DDD0FF;
+                border:1px solid rgba(255,255,255,175);
 
                 border-radius:16px;
 
@@ -224,9 +223,9 @@ class MessageBubble(QFrame):
 
             QFrame#AssistantMessage {
 
-                background:#F7F7FA;
+                background:rgba(255,255,255,105);
 
-                border:1px solid #E6E6EC;
+                border:1px solid rgba(255,255,255,190);
 
                 border-radius:16px;
 
@@ -234,7 +233,7 @@ class MessageBubble(QFrame):
 
             QLabel#MessageSender {
 
-                color:#7C3AED;
+                color:#21134F;
 
                 font-family:"Poppins";
 
@@ -248,7 +247,7 @@ class MessageBubble(QFrame):
 
             QLabel#MessageText {
 
-                color:#1F2937;
+                color:#17142F;
 
                 font-family:"Poppins";
 
@@ -289,25 +288,19 @@ class MessageBubble(QFrame):
             # --------------------------------------------------
             # Fonts
             # --------------------------------------------------
+            #
+            # Keep font configuration in the stylesheet below.
+            # This intentionally avoids constructing QFont objects
+            # at runtime. Qt's family-only/default font paths can
+            # temporarily carry a point size of -1 and produce:
+            #   QFont::setPointSize: Point size <= 0 (-1)
+            #
+            # The stylesheet uses explicit positive pixel sizes for
+            # MessageText (13px) and MessageSender (11px).
+            # --------------------------------------------------
 
-            text_font = QFont(
-                "Poppins",
-                13
-            )
-
-            sender_font = QFont(
-                "Poppins",
-                11,
-                QFont.Bold
-            )
-
-            self.text_label.setFont(
-                text_font
-            )
-
-            self.sender_label.setFont(
-                sender_font
-            )
+            self.text_label.ensurePolished()
+            self.sender_label.ensurePolished()
 
             # --------------------------------------------------
             # Bubble horizontal padding
@@ -330,34 +323,50 @@ class MessageBubble(QFrame):
             spacing = 1
 
             # --------------------------------------------------
-            # Calculate natural width
+            # Calculate natural width without QFont/QFontMetrics.
+            # --------------------------------------------------
+            # QLabel sizeHint() uses the active stylesheet, so font
+            # configuration remains entirely stylesheet-driven.
+            # This avoids runtime font metric construction.
             # --------------------------------------------------
 
-            text_metrics = QFontMetrics(
-                text_font
-            )
+            longest_line = 0
 
-            sender_metrics = QFontMetrics(
-                sender_font
-            )
+            for line in self.message.split("\n"):
 
-            longest_line = max(
-                (
-                    text_metrics.horizontalAdvance(
-                        line
-                    )
-                    for line in self.message.split(
-                        "\n"
-                    )
-                ),
-                default=0
-            )
-
-            sender_width = (
-                sender_metrics.horizontalAdvance(
-                    self.sender_label.text()
+                probe = QLabel(line)
+                probe.setObjectName("MessageText")
+                probe.setStyleSheet(
+                    "QLabel#MessageText { "
+                    "font-family: \"Poppins\"; "
+                    "font-size: 13px; "
+                    "font-weight: 400; }"
                 )
+                probe.ensurePolished()
+
+                longest_line = max(
+                    longest_line,
+                    probe.sizeHint().width()
+                )
+
+                probe.deleteLater()
+
+            sender_probe = QLabel(
+                self.sender_label.text()
             )
+            sender_probe.setObjectName(
+                "MessageSender"
+            )
+            sender_probe.setStyleSheet(
+                "QLabel#MessageSender { "
+                "font-family: \"Poppins\"; "
+                "font-size: 11px; "
+                "font-weight: 700; }"
+            )
+            sender_probe.ensurePolished()
+
+            sender_width = sender_probe.sizeHint().width()
+            sender_probe.deleteLater()
 
             natural_width = max(
                 self.MIN_BUBBLE_WIDTH,
@@ -536,9 +545,9 @@ class TypingBubble(QFrame):
 
             QFrame#TypingBubble {
 
-                background:#F7F7FA;
+                background:rgba(255,255,255,95);
 
-                border:1px solid #E6E6EC;
+                border:1px solid rgba(255,255,255,175);
 
                 border-radius:16px;
 
@@ -546,7 +555,7 @@ class TypingBubble(QFrame):
 
             QLabel#TypingSender {
 
-                color:#7C3AED;
+                color:#21134F;
 
                 font-family:"Poppins";
 
@@ -638,12 +647,12 @@ class TypingBubble(QFrame):
         # Calculate compact width
         # ------------------------------------------------------
 
+        # Use the stylesheet-resolved QLabel size instead of
+        # QLabel.fontMetrics().
+        self.sender_label.ensurePolished()
+
         natural_width = (
-            self.sender_label
-            .fontMetrics()
-            .horizontalAdvance(
-                "DHEEPTHI"
-            )
+            self.sender_label.sizeHint().width()
             +
             48
             +
@@ -763,6 +772,9 @@ class TypingBubble(QFrame):
 class MessageComposer(QPlainTextEdit):
 
     send_requested = Signal()
+    limit_exceeded = Signal()
+
+    MAX_WORDS = 1000
 
     MIN_HEIGHT = 42
 
@@ -810,6 +822,95 @@ class MessageComposer(QPlainTextEdit):
             0,
             self._update_height
         )
+
+    # ==========================================================
+    # WORD LIMIT HELPERS
+    # ==========================================================
+
+    @staticmethod
+    def _word_count(text: str) -> int:
+
+        return len(
+            str(text).split()
+        )
+
+    def _text_after_replacement(
+        self,
+        inserted_text: str
+    ) -> str:
+        """Return the document text after replacing the current selection."""
+
+        cursor = self.textCursor()
+
+        start = cursor.selectionStart()
+        end = cursor.selectionEnd()
+
+        current = self.toPlainText()
+
+        return (
+            current[:start]
+            + str(inserted_text)
+            + current[end:]
+        )
+
+    def _would_exceed_limit(
+        self,
+        inserted_text: str
+    ) -> bool:
+
+        candidate = self._text_after_replacement(
+            inserted_text
+        )
+
+        return (
+            self._word_count(candidate)
+            >
+            self.MAX_WORDS
+        )
+
+    def _notify_limit_exceeded(self):
+
+        self.limit_exceeded.emit()
+
+    # ==========================================================
+    # PASTE PROTECTION
+    # ==========================================================
+
+    def insertFromMimeData(
+        self,
+        source: QMimeData
+    ):
+        """
+        Reject a paste that would push the message beyond
+        1000 words. The pasted content is not partially trimmed.
+        """
+
+        try:
+
+            if source is None:
+
+                return
+
+            pasted_text = source.text()
+
+            if not pasted_text:
+
+                return
+
+            if self._would_exceed_limit(
+                pasted_text
+            ):
+
+                self._notify_limit_exceeded()
+                return
+
+            super().insertFromMimeData(
+                source
+            )
+
+        except RuntimeError:
+
+            pass
 
     # ==========================================================
     # ADAPTIVE HEIGHT
@@ -882,41 +983,84 @@ class MessageComposer(QPlainTextEdit):
     # KEYBOARD
     # ==========================================================
 
+    def _show_parent_limit_popup(self):
+        parent = self.parentWidget()
+        while parent is not None and not hasattr(parent, "_show_word_limit_popup"):
+            parent = parent.parentWidget()
+        if parent is not None:
+            parent._show_word_limit_popup()
+
+    def insertFromMimeData(self, source):
+        current = self.toPlainText()
+        incoming = source.text() if source is not None else ""
+        cursor = self.textCursor()
+        selected = cursor.selectedText()
+        candidate = current[:cursor.selectionStart()] + incoming + current[cursor.selectionEnd():]
+
+        if len(candidate.split()) > self.MAX_WORDS:
+            self._show_parent_limit_popup()
+            return
+
+        super().insertFromMimeData(source)
+
+    def _would_exceed_word_limit(self, text: str) -> bool:
+        return len(str(text).split()) > self.MAX_WORDS
+
     def keyPressEvent(
         self,
         event
     ):
-
-        if event.key() in (
-            Qt.Key_Return,
-            Qt.Key_Enter,
-        ):
-
-            if (
-                event.modifiers()
-                &
-                Qt.ShiftModifier
-            ):
-
-                super().keyPressEvent(
-                    event
+        if event.key() in (Qt.Key_Return, Qt.Key_Enter):
+            if event.modifiers() & Qt.ShiftModifier:
+                cursor = self.textCursor()
+                candidate = (
+                    self.toPlainText()[:cursor.selectionStart()]
+                    + "\n"
+                    + self.toPlainText()[cursor.selectionEnd():]
                 )
+                if self._would_exceed_word_limit(candidate):
+                    self._show_parent_limit_popup()
+                    event.accept()
+                    return
+                cursor.insertText("\n")
+                self.setTextCursor(cursor)
+                return
 
+            if self._would_exceed_word_limit(self.toPlainText()):
+                self._show_parent_limit_popup()
+                event.accept()
                 return
 
             self.send_requested.emit()
-
             event.accept()
-
             return
 
-        super().keyPressEvent(
-            event
-        )
+        # Block normal typing once the next edit would cross 1000 words.
+        # Navigation, deletion and shortcuts remain available.
+        if (
+            not (
+                event.modifiers()
+                & (Qt.ControlModifier | Qt.AltModifier | Qt.MetaModifier)
+            )
+            and event.text()
+        ):
+            cursor = self.textCursor()
+            current = self.toPlainText()
+            candidate = (
+                current[:cursor.selectionStart()]
+                + event.text()
+                + current[cursor.selectionEnd():]
+            )
+            if self._would_exceed_word_limit(candidate):
+                self._show_parent_limit_popup()
+                event.accept()
+                return
+
+        super().keyPressEvent(event)
 
 
 # ==============================================================
-# PREMIUM RED CLOSE BUTTON
+# PREMIUM GLASS CLOSE BUTTON
 # ==============================================================
 
 class PremiumCloseButton(QPushButton):
@@ -957,11 +1101,11 @@ class PremiumCloseButton(QPushButton):
 
             QPushButton#PremiumCloseButton {
 
-                background:#EF4444;
+                background:#DC2626;
 
                 color:white;
 
-                border:2px solid #FCA5A5;
+                border:2px solid rgba(255,255,255,170);
 
                 border-radius:19px;
 
@@ -977,17 +1121,17 @@ class PremiumCloseButton(QPushButton):
 
             QPushButton#PremiumCloseButton:hover {
 
-                background:#DC2626;
+                background:#B91C1C;
 
-                border:2px solid #F87171;
+                border:2px solid rgba(255,255,255,210);
 
             }
 
             QPushButton#PremiumCloseButton:pressed {
 
-                background:#B91C1C;
+                background:#991B1B;
 
-                border:2px solid #EF4444;
+                border:2px solid rgba(255,255,255,190);
 
             }
 
@@ -995,7 +1139,7 @@ class PremiumCloseButton(QPushButton):
         )
 
         # ------------------------------------------------------
-        # Lightweight red glow
+        # Lightweight purple glow
         # ------------------------------------------------------
 
         self.shadow = QGraphicsDropShadowEffect(
@@ -1013,9 +1157,9 @@ class PremiumCloseButton(QPushButton):
 
         self.shadow.setColor(
             QColor(
-                239,
-                68,
-                68,
+                124,
+                58,
+                237,
                 0
             )
         )
@@ -1047,10 +1191,10 @@ class PremiumCloseButton(QPushButton):
 
         self.shadow.setColor(
             QColor(
-                239,
-                68,
-                68,
-                190
+                124,
+                58,
+                237,
+                170
             )
         )
 
@@ -1119,7 +1263,7 @@ class ConversationPanel(QWidget):
 
     close_requested = Signal()
 
-    MAX_WORDS = 5000
+    MAX_WORDS = 1000
 
     GREETINGS = (
 
@@ -1241,22 +1385,35 @@ class ConversationPanel(QWidget):
 
             QFrame#ConversationCard {
 
-                background:rgba(
-                    255,
-                    255,
-                    255,
-                    250
-                );
+                background:rgba(255,255,255,128);
 
-                border:1px solid #DDD6FE;
+                border:1px solid rgba(255,255,255,205);
 
-                border-radius:20px;
+                border-radius:24px;
+
+            }
+
+            QLabel#ConversationTitle {
+
+                color:#21134F;
+
+                font-family:"Poppins";
+
+                font-size:18px;
+
+                font-weight:800;
+
+                letter-spacing:0px;
+
+                background:transparent;
+
+                padding-left:4px;
 
             }
 
             QLabel#WelcomeLabel {
 
-                color:#171B2D;
+                color:#21134F;
 
                 font-family:"Poppins";
 
@@ -1265,6 +1422,10 @@ class ConversationPanel(QWidget):
                 font-weight:600;
 
                 background:transparent;
+
+                padding-top:2px;
+
+                padding-bottom:2px;
 
             }
 
@@ -1286,9 +1447,9 @@ class ConversationPanel(QWidget):
 
             QFrame#ComposerFrame {
 
-                background:#FFFFFF;
+                background:rgba(255,255,255,105);
 
-                border:1px solid #E5E7EB;
+                border:1px solid rgba(255,255,255,190);
 
                 border-radius:18px;
 
@@ -1300,7 +1461,7 @@ class ConversationPanel(QWidget):
 
                 border:none;
 
-                color:#1F2937;
+                color:#17142F;
 
                 font-family:"Poppins";
 
@@ -1364,7 +1525,7 @@ class ConversationPanel(QWidget):
 
             QLabel#WordCounter {
 
-                color:#9CA3AF;
+                color:rgba(33,19,79,175);
 
                 font-family:"Poppins";
 
@@ -1394,7 +1555,7 @@ class ConversationPanel(QWidget):
 
             QScrollBar::handle:vertical {
 
-                background:#D8CCF8;
+                background:rgba(124,58,237,105);
 
                 border-radius:3px;
 
@@ -1404,7 +1565,7 @@ class ConversationPanel(QWidget):
 
             QScrollBar::handle:vertical:hover {
 
-                background:#B9A5F5;
+                background:rgba(124,58,237,155);
 
             }
 
@@ -1482,10 +1643,30 @@ class ConversationPanel(QWidget):
         header = QHBoxLayout()
 
         header.setContentsMargins(
-            0,
-            0,
-            0,
-            0
+            4,
+            2,
+            2,
+            2
+        )
+
+        # --------------------------------------------------
+        # Conversation heading
+        # --------------------------------------------------
+
+        self.conversation_title = QLabel(
+            "CONVERSATION"
+        )
+
+        self.conversation_title.setObjectName(
+            "ConversationTitle"
+        )
+
+        self.conversation_title.setAlignment(
+            Qt.AlignLeft | Qt.AlignVCenter
+        )
+
+        header.addWidget(
+            self.conversation_title
         )
 
         header.addStretch()
@@ -1612,6 +1793,27 @@ class ConversationPanel(QWidget):
             "Ask DHEEPTHI..."
         )
 
+        # --------------------------------------------------
+        # Readable placeholder on the dark glass composer.
+        # --------------------------------------------------
+
+        input_palette = self.message_input.palette()
+
+        input_palette.setColor(
+            QPalette.PlaceholderText,
+            QColor(255, 255, 255, 155)
+        )
+
+        self.message_input.setPalette(
+            input_palette
+        )
+
+        self.message_input.MAX_WORDS = self.MAX_WORDS
+
+        self.message_input.limit_exceeded.connect(
+            self._show_word_limit_popup
+        )
+
         self.message_input.textChanged.connect(
             self._on_text_changed
         )
@@ -1646,7 +1848,7 @@ class ConversationPanel(QWidget):
         # ======================================================
 
         self.word_counter = QLabel(
-            "0 / 5000 words"
+            "0 / 1000 words"
         )
 
         self.word_counter.setObjectName(
@@ -1863,9 +2065,24 @@ class ConversationPanel(QWidget):
                 True
             )
 
+            # --------------------------------------------------
+            # IMPORTANT:
+            # The greeting can wrap into two lines.  A QLabel with
+            # a Preferred vertical policy may receive an undersized
+            # height while the surrounding WelcomeWidget is being
+            # laid out, which causes the second line to be clipped.
+            #
+            # Keep enough vertical room for the two-line greeting
+            # while preserving the existing responsive width.
+            # --------------------------------------------------
+
+            welcome.setMinimumHeight(
+                64
+            )
+
             welcome.setSizePolicy(
                 QSizePolicy.Expanding,
-                QSizePolicy.Preferred
+                QSizePolicy.Fixed
             )
 
             # --------------------------------------------------
@@ -2789,104 +3006,45 @@ class ConversationPanel(QWidget):
         self
     ):
 
-        # ------------------------------------------------------
-        # Prevent double submit.
-        # ------------------------------------------------------
-
         if self._is_submitting:
-
             return
 
-        text = (
-            self.message_input
-            .toPlainText()
-            .strip()
-        )
+        text = self.message_input.toPlainText().strip()
 
         if not text:
-
             return
 
-        # ------------------------------------------------------
-        # Word limit.
-        # ------------------------------------------------------
-
-        if (
-            self._word_count(text)
-            >
-            self.MAX_WORDS
-        ):
-
-            self._trim_to_word_limit()
-
-            text = (
-                self.message_input
-                .toPlainText()
-                .strip()
-            )
-
-        if not text:
-
+        # Hard limit: never send an over-limit message.
+        if self._word_count(text) > self.MAX_WORDS:
+            self._show_word_limit_popup()
+            self._update_counter()
             return
 
         self._is_submitting = True
 
         try:
-
-            # --------------------------------------------------
-            # USER MESSAGE
-            # --------------------------------------------------
-
-            self.add_user_message(
-                text
-            )
-
-            # --------------------------------------------------
-            # Clear composer immediately.
-            # --------------------------------------------------
-
+            self.add_user_message(text)
             self.message_input.clear()
-
-            self.message_input.setFixedHeight(
-                MessageComposer.MIN_HEIGHT
-            )
-
-            # --------------------------------------------------
-            # Show lightweight loading indicator.
-            # --------------------------------------------------
-
+            self.message_input.setFixedHeight(MessageComposer.MIN_HEIGHT)
             self.show_loading()
+            self.send_requested.emit(text)
 
-            # --------------------------------------------------
-            # MainWindow / Gemini integration.
-            #
-            # ConversationPanel itself does NOT call Gemini.
-            # MainWindow will receive send_requested and call
-            # the Gemini client.
-            # --------------------------------------------------
-
-            self.send_requested.emit(
-                text
-            )
-
-            # --------------------------------------------------
-            # Optional existing callback integration.
-            # --------------------------------------------------
-
-            if (
-                self._send_callback
-                is not None
-            ):
-
-                self._send_callback(
-                    text
-                )
+            if self._send_callback is not None:
+                self._send_callback(text)
 
         finally:
-
             self._is_submitting = False
-
             self._update_counter()
+
+    def _show_word_limit_popup(self):
+        """Show a lightweight native Qt warning without blocking the UI."""
+        from PySide6.QtWidgets import QMessageBox
+
+        QMessageBox.warning(
+            self,
+            "Message Limit",
+            f"Limit is {self.MAX_WORDS} words.",
+        )
 
 
 # ==============================================================
@@ -2910,69 +3068,17 @@ class ConversationPanel(QWidget):
     def _on_text_changed(
         self
     ):
-
-        self._trim_to_word_limit()
-
         self._update_counter()
 
-
-# ==============================================================
-# TRIM WORD LIMIT
-# ==============================================================
-
-    def _trim_to_word_limit(
-        self
-    ):
-
-        text = (
-            self.message_input
-            .toPlainText()
+        count = self._word_count(
+            self.message_input.toPlainText()
         )
 
-        words = text.split()
-
-        if (
-            len(words)
-            <=
-            self.MAX_WORDS
-        ):
-
-            return
-
-        trimmed = " ".join(
-            words[
-                :self.MAX_WORDS
-            ]
+        self.send_button.setEnabled(
+            bool(
+                self.message_input.toPlainText().strip()
+            ) and count <= self.MAX_WORDS
         )
-
-        cursor = (
-            self.message_input
-            .textCursor()
-        )
-
-        self.message_input.blockSignals(
-            True
-        )
-
-        try:
-
-            self.message_input.setPlainText(
-                trimmed
-            )
-
-            cursor.setPosition(
-                len(trimmed)
-            )
-
-            self.message_input.setTextCursor(
-                cursor
-            )
-
-        finally:
-
-            self.message_input.blockSignals(
-                False
-            )
 
 
 # ==============================================================
@@ -3021,6 +3127,8 @@ class ConversationPanel(QWidget):
 
             self.send_button.setEnabled(
                 has_text
+                and
+                count <= self.MAX_WORDS
                 and
                 self.message_input.isEnabled()
             )
@@ -3121,11 +3229,17 @@ class ConversationPanel(QWidget):
                 .strip()
             )
 
+            count = self._word_count(
+                self.message_input.toPlainText()
+            )
+
             self.send_button.setEnabled(
                 bool(
                     enabled
                     and
                     has_text
+                    and
+                    count <= self.MAX_WORDS
                 )
             )
 
