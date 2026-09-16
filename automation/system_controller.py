@@ -1,7 +1,8 @@
 """
+DHEEPTHI-AI
 System Controller Module
 
-Provides Windows system automation for ASTRA-AI.
+Provides Windows system automation for DHEEPTHI-AI.
 
 Features
 --------
@@ -39,7 +40,7 @@ import pyautogui
 
 class SystemController:
     """
-    Controls Windows system functions.
+    Controls Windows system functions for DHEEPTHI-AI.
     """
 
     def __init__(self):
@@ -726,13 +727,13 @@ class SystemController:
         """
         Open the Windows Camera application if required,
         capture a new photo, wait until the file is fully
-        written, copy it into ASTRA-AI/camera_photos,
+        written, copy it into DHEEPTHI-AI/camera_photos,
         and verify the copied file.
 
         Returns
         -------
         str | None
-            Path of the copied ASTRA photo.
+            Path of the copied DHEEPTHI photo.
         """
 
         try:
@@ -740,10 +741,6 @@ class SystemController:
             import shutil
 
             from pywinauto import Desktop
-
-            # ---------------------------------
-            # Camera Roll Directory
-            # ---------------------------------
 
             # ---------------------------------
             # Locate Windows Camera Roll
@@ -927,10 +924,6 @@ class SystemController:
                         camera_roll.glob(pattern)
                     )
 
-                # ---------------------------------
-                # Detect Newly Created Photo
-                # ---------------------------------
-
                 created_files = (
                     current_files
                     - before_files
@@ -948,10 +941,6 @@ class SystemController:
                     break
 
                 time.sleep(0.5)
-
-            # ---------------------------------
-            # New Photo Not Found
-            # ---------------------------------
 
             if new_photo is None:
 
@@ -1030,7 +1019,7 @@ class SystemController:
                 return None
 
             # ---------------------------------
-            # Prepare ASTRA Destination
+            # Prepare Destination
             # ---------------------------------
 
             self.photo_directory.mkdir(
@@ -1056,11 +1045,11 @@ class SystemController:
 
             destination = (
                 self.photo_directory
-                / f"photo_{timestamp}{extension}"
+                / f"dheepthi_photo_{timestamp}{extension}"
             )
 
             # ---------------------------------
-            # Copy To ASTRA Camera Folder
+            # Copy To DHEEPTHI Camera Folder
             # ---------------------------------
 
             shutil.copy2(
@@ -1118,6 +1107,7 @@ class SystemController:
         Returns
         -------
         str | None
+            Absolute path of the saved screenshot when successful.
         """
 
         try:
@@ -1127,7 +1117,7 @@ class SystemController:
             )
 
             filename = (
-                f"screenshot_{timestamp}.png"
+                f"dheepthi_screenshot_{timestamp}.png"
             )
 
             filepath = (
@@ -1141,12 +1131,36 @@ class SystemController:
                 str(filepath)
             )
 
-            return str(filepath)
+            # ---------------------------------
+            # Verify Screenshot
+            # ---------------------------------
+
+            if not filepath.exists():
+
+                print(
+                    "DHEEPTHI Screenshot Error : "
+                    "Screenshot file was not created."
+                )
+
+                return None
+
+            if filepath.stat().st_size <= 0:
+
+                print(
+                    "DHEEPTHI Screenshot Error : "
+                    "Screenshot file is empty."
+                )
+
+                return None
+
+            return str(
+                filepath
+            )
 
         except Exception as error:
 
             print(
-                f"Screenshot Error : {error}"
+                f"DHEEPTHI Screenshot Error : {error}"
             )
 
             return None

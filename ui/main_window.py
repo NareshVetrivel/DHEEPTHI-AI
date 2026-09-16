@@ -102,6 +102,7 @@ from ui.widgets.conversation_panel import ConversationPanel
 from ui.widgets.background_widget import BackgroundWidget
 from ui.widgets.mic_widget import MicWidget
 from ui.widgets.file_selection_panel import FileSelectionPanel
+from ui.widgets.system_osd import SystemOSD
 
 from voice.speech_recognition import SpeechRecognizer
 from voice.text_to_speech import TextToSpeech
@@ -123,6 +124,7 @@ from automation.keyboard_controller import KeyboardController
 from automation.mouse_controller import MouseController
 from automation.window_controller import WindowController
 from automation.system_controller import SystemController
+from automation.screen_recorder import ScreenRecorder
 from automation.app_launcher import AppLauncher
 from automation.app_closer import AppCloser
 from automation.file_finder import FileFinder
@@ -962,6 +964,14 @@ class MainWindow(QMainWindow):
 
         self.system_controller = None
 
+        # ----------------------------------
+        # Screenshot / Screen Recording V1
+        # ----------------------------------
+        # SystemController owns screenshot capture. ScreenRecorder owns
+        # recording. MainWindow owns the voice routing and OSD lifecycle.
+        self.screen_recorder = None
+        self.system_osd = None
+
         self.file_finder = None
 
         self.folder_manager = None
@@ -1172,6 +1182,14 @@ class MainWindow(QMainWindow):
             ApplicationTitleBar.HEIGHT
         )
         self.application_title_bar.raise_()
+
+        # ----------------------------------
+        # Capture OSD / Recorder
+        # ----------------------------------
+        # Keep the OSD independent from the main content layout. It is a
+        # top-level Windows-style overlay and must never push UI widgets.
+        self.system_osd = SystemOSD(self)
+        self.system_osd.hide_osd()
 
     def setup_ui(self):
         """
@@ -1858,6 +1876,10 @@ class MainWindow(QMainWindow):
         self.window_controller = WindowController()
 
         self.system_controller = SystemController()
+
+        # Screenshot and recording backends are local and lightweight.
+        # They are created once and reused by voice/text command routing.
+        self.screen_recorder = ScreenRecorder()
 
         self.file_finder = FileFinder()
 
@@ -5091,6 +5113,758 @@ class MainWindow(QMainWindow):
 
         return self._start_code_agent_worker(command)
 
+    # =====================================================
+    # Screenshot / Screen Recording Voice Routes
+    # =====================================================
+
+    @staticmethod
+    def _normalized_capture_command(text):
+        """Return a lowercase command suitable for local capture routing."""
+
+        return re.sub(
+            r"\s+",
+            " ",
+            str(text or "").strip().lower(),
+        )
+
+    def _is_screenshot_command(self, text):
+        """Detect explicit screenshot commands before generic AI routing."""
+
+        cleaned = self._normalized_capture_command(text)
+
+        if not cleaned:
+            return False
+
+        screenshot_patterns = (
+            r"\btake (?:a )?screenshot\b",
+            r"\bcapture (?:a )?screenshot\b",
+            r"\bscreenshot (?:this|the screen|screen)\b",
+            r"\bcapture (?:this|the )?screen\b",
+            r"\btake (?:a )?screen ?shot\b",
+            r"\bscreen ?shot\b",
+        )
+
+        return any(
+            re.search(pattern, cleaned)
+            for pattern in screenshot_patterns
+        )
+
+    def _is_start_recording_command(self, text):
+        """Detect explicit screen-recording start commands."""
+
+        cleaned = self._normalized_capture_command(text)
+
+        if not cleaned:
+            return False
+
+        patterns = (
+            r"\bstart (?:a )?(?:screen )?record(?:ing)?\b",
+            r"\bbegin (?:a )?(?:screen )?record(?:ing)?\b",
+            r"\brecord (?:the )?(?:screen|desktop)\b",
+            r"\bstart screen capture\b",
+            r"\bstart capturing (?:the )?(?:screen|desktop)\b",
+        )
+
+        return any(
+            re.search(pattern, cleaned)
+            for pattern in patterns
+        )
+
+    def _is_stop_recording_command(self, text):
+        """Detect explicit screen-recording stop commands."""
+
+        cleaned = self._normalized_capture_command(text)
+
+        if not cleaned:
+            return False
+
+        patterns = (
+            r"\bstop (?:the )?(?:screen )?record(?:ing)?\b",
+            r"\bend (?:the )?(?:screen )?record(?:ing)?\b",
+            r"\bfinish (?:the )?(?:screen )?record(?:ing)?\b",
+            r"\bstop screen capture\b",
+            r"\bstop capturing (?:the )?(?:screen|desktop)\b",
+        )
+
+        return any(
+            re.search(pattern, cleaned)
+            for pattern in patterns
+        )
+
+    def _show_capture_error(self, title, detail):
+        """Show a short capture error through the DHEEPTHI OSD and TTS."""
+
+        try:
+            if self.system_osd is not None:
+                self.system_osd.show_message(
+                    title=title,
+                    detail=detail,
+                    icon="⚠️",
+                    duration_ms=2600,
+                )
+        except Exception as error:
+            print(
+                f"Capture OSD Error : {error}"
+            )
+
+        try:
+            self.mic_widget.update_ai_message(detail)
+        except Exception:
+            pass
+
+        try:
+            self.conversation_panel.show_error(detail)
+        except Exception:
+            pass
+
+        try:
+            self.status_label.setText(
+                f"Status : {title}"
+            )
+        except Exception:
+            pass
+
+    def _show_capture_osd(self, method_name, *args, **kwargs):
+        """Show the capture OSD reliably above the DHEEPTHI window.
+
+        The OSD is a separate top-level Qt tool window.  Keep its presentation
+        on the GUI thread and schedule one additional raise/show pass so that
+        the Windows-style overlay cannot remain behind the frameless MainWindow
+        when a capture command is completed.
+        """
+
+        osd = getattr(self, "system_osd", None)
+
+        if osd is None:
+            print("Capture OSD Error : SystemOSD is unavailable")
+            return False
+
+        try:
+            method = getattr(osd, method_name)
+            method(*args, **kwargs)
+
+            # The capture handlers always run on the Qt GUI thread.  Process
+            # the first paint immediately, then perform a second raise after
+            # the current event has completed.
+            QApplication.processEvents()
+
+            if osd.isVisible():
+                osd.raise_()
+
+            QTimer.singleShot(0, self._raise_capture_osd)
+            return True
+
+        except Exception as error:
+            print(
+                f"Capture OSD Error : {error}"
+            )
+            return False
+
+    def _raise_capture_osd(self):
+        """Raise the capture OSD without activating or stealing focus."""
+
+        if self._closing:
+            return
+
+        osd = getattr(self, "system_osd", None)
+
+        if osd is None:
+            return
+
+        try:
+            if osd.isVisible():
+                osd.raise_()
+        except RuntimeError:
+            self.system_osd = None
+
+    def _handle_screenshot_command(self, text):
+        """
+        Execute a real screenshot and immediately show the custom OSD.
+
+        Returns True when the command was consumed by this local route.
+        """
+
+        if self._closing:
+            return True
+
+        print(
+            "\n========== DHEEPTHI SCREENSHOT ROUTE =========="
+        )
+        print(
+            f"Voice/Text Command : {text}"
+        )
+        print(
+            "===============================================\n"
+        )
+
+        try:
+            self.status_label.setText(
+                "Status : Taking Screenshot..."
+            )
+            self.mic_widget.show_conversation(
+                text,
+                "Taking screenshot..."
+            )
+            self._set_thinking_state(
+                "Screenshot"
+            )
+            self._set_avatar_state(
+                "thinking_laptop"
+            )
+        except Exception:
+            pass
+
+        screenshot_path = None
+
+        try:
+            screenshot_path = (
+                self.system_controller.take_screenshot()
+                if self.system_controller is not None
+                else None
+            )
+        except Exception as error:
+            print(
+                f"Screenshot Capture Error : {error}"
+            )
+
+        if not screenshot_path:
+            message = (
+                "I could not take the screenshot."
+            )
+
+            self._show_capture_error(
+                "Screenshot Failed",
+                message,
+            )
+
+            try:
+                self.tts.speak(message)
+            except Exception:
+                pass
+
+            self._unlock_after_speech(
+                restart_wake=True,
+                terminal_avatar_state="error",
+            )
+
+            return True
+
+        screenshot_file = Path(
+            screenshot_path
+        )
+
+        if (
+            not screenshot_file.exists()
+            or screenshot_file.stat().st_size <= 0
+        ):
+            message = (
+                "The screenshot could not be saved correctly."
+            )
+
+            self._show_capture_error(
+                "Screenshot Failed",
+                message,
+            )
+
+            try:
+                self.tts.speak(message)
+            except Exception:
+                pass
+
+            self._unlock_after_speech(
+                restart_wake=True,
+                terminal_avatar_state="error",
+            )
+
+            return True
+
+        filename = screenshot_file.name
+
+        self._show_capture_osd(
+            "show_screenshot",
+            filename,
+        )
+
+        message = (
+            f"Screenshot taken and saved as {filename}."
+        )
+
+        try:
+            self.mic_widget.update_ai_message(
+                message
+            )
+        except Exception:
+            pass
+
+        try:
+            self.conversation_panel.show_ai_response(
+                message
+            )
+        except Exception:
+            pass
+
+        try:
+            self.conversation_label.setText(
+                "Screenshot Taken\n\n"
+                f"File:\n{filename}\n\n"
+                f"Saved to:\n{screenshot_file.parent}"
+            )
+            self.status_label.setText(
+                "Status : Screenshot Taken"
+            )
+            self._set_avatar_state(
+                "success"
+            )
+            self._set_thinking_state(
+                "Inactive"
+            )
+            self.left_panel.set_speaking(
+                "Speaking"
+            )
+        except Exception:
+            pass
+
+        print(
+            f"Screenshot Saved : {screenshot_file}"
+        )
+
+        try:
+            self.tts.speak(
+                "Screenshot taken successfully."
+            )
+        except Exception:
+            pass
+
+        self._unlock_after_speech(
+            restart_wake=True,
+            terminal_avatar_state="success",
+        )
+
+        return True
+
+    def _handle_start_recording_command(self, text):
+        """Start the real screen recorder and keep the recording OSD visible."""
+
+        if self._closing:
+            return True
+
+        if self.screen_recorder is None:
+            message = (
+                "Screen recording is not available."
+            )
+            self._show_capture_error(
+                "Recording Unavailable",
+                message,
+            )
+            try:
+                self.tts.speak(message)
+            except Exception:
+                pass
+            self._unlock_after_speech(
+                restart_wake=True,
+                terminal_avatar_state="error",
+            )
+            return True
+
+        if self.screen_recorder.is_recording():
+            message = (
+                "Screen recording is already running."
+            )
+
+            self._show_capture_osd(
+                "start_recording"
+            )
+
+            try:
+                self.mic_widget.update_ai_message(
+                    message
+                )
+                self.status_label.setText(
+                    "Status : Recording"
+                )
+            except Exception:
+                pass
+
+            try:
+                self.tts.speak(message)
+            except Exception:
+                pass
+
+            self._unlock_after_speech(
+                restart_wake=True,
+                terminal_avatar_state="success",
+            )
+
+            return True
+
+        print(
+            "\n========== DHEEPTHI RECORDING START =========="
+        )
+        print(
+            f"Voice/Text Command : {text}"
+        )
+        print(
+            "==============================================\n"
+        )
+
+        try:
+            self.status_label.setText(
+                "Status : Starting Recording..."
+            )
+            self.mic_widget.show_conversation(
+                text,
+                "Starting screen recording..."
+            )
+            self._set_thinking_state(
+                "Recording"
+            )
+            self._set_avatar_state(
+                "thinking_laptop"
+            )
+        except Exception:
+            pass
+
+        try:
+            output_path = (
+                self.screen_recorder.start_recording()
+            )
+        except Exception as error:
+            print(
+                f"Screen Recording Start Error : {error}"
+            )
+            output_path = None
+
+        if not output_path:
+            message = (
+                "I could not start screen recording."
+            )
+
+            self._show_capture_error(
+                "Recording Failed",
+                message,
+            )
+
+            try:
+                self.tts.speak(message)
+            except Exception:
+                pass
+
+            self._unlock_after_speech(
+                restart_wake=True,
+                terminal_avatar_state="error",
+            )
+
+            return True
+
+        self._show_capture_osd(
+            "start_recording"
+        )
+
+        filename = Path(
+            output_path
+        ).name
+
+        message = (
+            "Screen recording started."
+        )
+
+        try:
+            self.mic_widget.update_ai_message(
+                message
+            )
+            self.conversation_panel.show_ai_response(
+                message
+            )
+            self.conversation_label.setText(
+                "Recording\n\n"
+                f"File:\n{filename}\n\n"
+                "Recording is currently active."
+            )
+            self.status_label.setText(
+                "Status : Recording"
+            )
+            self._set_thinking_state(
+                "Inactive"
+            )
+            self._set_avatar_state(
+                "success"
+            )
+            self.left_panel.set_speaking(
+                "Speaking"
+            )
+        except Exception:
+            pass
+
+        print(
+            f"Screen Recording Started : {output_path}"
+        )
+
+        try:
+            self.tts.speak(
+                "Screen recording started."
+            )
+        except Exception:
+            pass
+
+        self._unlock_after_speech(
+            restart_wake=True,
+            terminal_avatar_state="success",
+        )
+
+        return True
+
+    def _handle_stop_recording_command(self, text):
+        """Stop the real recorder and show the saved-recording OSD."""
+
+        if self._closing:
+            return True
+
+        if self.screen_recorder is None:
+            message = (
+                "Screen recording is not available."
+            )
+            self._show_capture_error(
+                "Recording Unavailable",
+                message,
+            )
+            try:
+                self.tts.speak(message)
+            except Exception:
+                pass
+            self._unlock_after_speech(
+                restart_wake=True,
+                terminal_avatar_state="error",
+            )
+            return True
+
+        if not self.screen_recorder.is_recording():
+            message = (
+                "There is no active screen recording."
+            )
+
+            self._show_capture_osd(
+                "show_message",
+                title="No Active Recording",
+                detail=message,
+                icon="ℹ️",
+                duration_ms=2400,
+            )
+
+            try:
+                self.mic_widget.update_ai_message(
+                    message
+                )
+                self.status_label.setText(
+                    "Status : No Active Recording"
+                )
+            except Exception:
+                pass
+
+            try:
+                self.tts.speak(message)
+            except Exception:
+                pass
+
+            self._unlock_after_speech(
+                restart_wake=True,
+                terminal_avatar_state="idle",
+            )
+
+            return True
+
+        print(
+            "\n========== DHEEPTHI RECORDING STOP =========="
+        )
+        print(
+            f"Voice/Text Command : {text}"
+        )
+        print(
+            "============================================\n"
+        )
+
+        try:
+            self.status_label.setText(
+                "Status : Stopping Recording..."
+            )
+            self.mic_widget.update_ai_message(
+                "Stopping screen recording..."
+            )
+            self._set_thinking_state(
+                "Saving Recording"
+            )
+            self._set_avatar_state(
+                "thinking_laptop"
+            )
+        except Exception:
+            pass
+
+        try:
+            elapsed_seconds = (
+                self.screen_recorder.get_recording_elapsed_seconds()
+            )
+        except Exception:
+            elapsed_seconds = 0
+
+        try:
+            output_path = (
+                self.screen_recorder.stop_recording()
+            )
+        except Exception as error:
+            print(
+                f"Screen Recording Stop Error : {error}"
+            )
+            output_path = None
+
+        self._show_capture_osd(
+            "stop_recording",
+            Path(output_path).name
+            if output_path
+            else "",
+        )
+
+        if not output_path:
+            message = (
+                "I could not save the screen recording."
+            )
+
+            self._show_capture_error(
+                "Recording Failed",
+                message,
+            )
+
+            try:
+                self.tts.speak(message)
+            except Exception:
+                pass
+
+            self._unlock_after_speech(
+                restart_wake=True,
+                terminal_avatar_state="error",
+            )
+
+            return True
+
+        output_file = Path(
+            output_path
+        )
+
+        if (
+            not output_file.exists()
+            or output_file.stat().st_size <= 0
+        ):
+            message = (
+                "The recording file was not saved correctly."
+            )
+
+            self._show_capture_error(
+                "Recording Failed",
+                message,
+            )
+
+            try:
+                self.tts.speak(message)
+            except Exception:
+                pass
+
+            self._unlock_after_speech(
+                restart_wake=True,
+                terminal_avatar_state="error",
+            )
+
+            return True
+
+        filename = output_file.name
+
+        try:
+            duration = self._format_capture_duration(
+                elapsed_seconds
+            )
+        except Exception:
+            duration = "00:00"
+
+        message = (
+            "Screen recording saved successfully."
+        )
+
+        try:
+            self.mic_widget.update_ai_message(
+                message
+            )
+            self.conversation_panel.show_ai_response(
+                message
+            )
+            self.conversation_label.setText(
+                "Recording Saved\n\n"
+                f"File:\n{filename}\n\n"
+                f"Duration:\n{duration}\n\n"
+                f"Saved to:\n{output_file.parent}"
+            )
+            self.status_label.setText(
+                "Status : Recording Saved"
+            )
+            self._set_thinking_state(
+                "Inactive"
+            )
+            self._set_avatar_state(
+                "success"
+            )
+            self.left_panel.set_speaking(
+                "Speaking"
+            )
+        except Exception:
+            pass
+
+        print(
+            f"Screen Recording Saved : {output_file}"
+        )
+        print(
+            f"Recording Duration      : {duration}"
+        )
+
+        try:
+            self.tts.speak(
+                f"Screen recording saved successfully. Duration {duration}."
+            )
+        except Exception:
+            pass
+
+        self._unlock_after_speech(
+            restart_wake=True,
+            terminal_avatar_state="success",
+        )
+
+        return True
+
+    @staticmethod
+    def _format_capture_duration(seconds):
+        """Format a capture duration for the visible MainWindow status."""
+
+        total_seconds = max(
+            0,
+            int(seconds or 0),
+        )
+
+        hours, remainder = divmod(
+            total_seconds,
+            3600,
+        )
+        minutes, seconds = divmod(
+            remainder,
+            60,
+        )
+
+        if hours:
+            return (
+                f"{hours:02d}:"
+                f"{minutes:02d}:"
+                f"{seconds:02d}"
+            )
+
+        return (
+            f"{minutes:02d}:"
+            f"{seconds:02d}"
+        )
+
     def process_command(
         self,
         text
@@ -5209,6 +5983,32 @@ class MainWindow(QMainWindow):
 
             self.unlock_microphone()
 
+            return
+
+        # ------------------------------------------
+        # Local Screenshot / Recording Commands
+        # ------------------------------------------
+        # These explicit commands must be consumed locally before
+        # multi-command planning, Gemini chat, or generic dispatcher
+        # routing. Voice and typed commands therefore use the exact
+        # same capture implementation.
+
+        if self._is_stop_recording_command(text):
+            self._handle_stop_recording_command(
+                original_text
+            )
+            return
+
+        if self._is_start_recording_command(text):
+            self._handle_start_recording_command(
+                original_text
+            )
+            return
+
+        if self._is_screenshot_command(text):
+            self._handle_screenshot_command(
+                original_text
+            )
             return
 
         # ------------------------------------------
@@ -10842,6 +11642,54 @@ class MainWindow(QMainWindow):
         try:
 
             # =================================================
+            # Local Screenshot / Recording Commands
+            # =================================================
+            # Conversation-panel commands must use the exact same local
+            # capture route as voice commands.  Do this before entity
+            # extraction or CommandDispatcher so recording/screenshot
+            # actions cannot fall through to launch_application or CodeAgent.
+
+            if intent == "take_screenshot":
+                self._handle_screenshot_command(
+                    original_text
+                )
+                return
+
+            if intent == "start_screen_recording":
+                self._handle_start_recording_command(
+                    original_text
+                )
+                return
+
+            if intent == "stop_screen_recording":
+                self._handle_stop_recording_command(
+                    original_text
+                )
+                return
+
+            # Also keep a defensive phrase check here. This protects the
+            # conversation panel if an older/cached detector returns a
+            # generic intent for an explicit capture phrase.
+
+            if self._is_stop_recording_command(text):
+                self._handle_stop_recording_command(
+                    original_text
+                )
+                return
+
+            if self._is_start_recording_command(text):
+                self._handle_start_recording_command(
+                    original_text
+                )
+                return
+
+            if self._is_screenshot_command(text):
+                self._handle_screenshot_command(
+                    original_text
+                )
+                return
+
+            # =================================================
             # Typing Mode
             # =================================================
 
@@ -14272,6 +15120,39 @@ class MainWindow(QMainWindow):
 
             print(
                 f"Gemini Cleanup Error : {error}"
+            )
+
+        # ==================================================
+        # SCREEN RECORDING / OSD
+        # ==================================================
+
+        try:
+            screen_recorder = getattr(
+                self,
+                "screen_recorder",
+                None,
+            )
+
+            if screen_recorder is not None:
+                if screen_recorder.is_recording():
+                    print(
+                        "Stopping active screen recording..."
+                    )
+                    screen_recorder.stop_recording()
+
+            system_osd = getattr(
+                self,
+                "system_osd",
+                None,
+            )
+
+            if system_osd is not None:
+                system_osd.hide_osd()
+                system_osd.close()
+
+        except Exception as error:
+            print(
+                f"Capture OSD/Recorder Cleanup Error : {error}"
             )
 
         # ==================================================

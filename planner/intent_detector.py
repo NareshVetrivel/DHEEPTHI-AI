@@ -1,5 +1,5 @@
 """
-ASTRA-AI
+DHEEPTHI-AI
 DHEEPTHI Intent Detector
 
 Responsibilities
@@ -25,7 +25,7 @@ Gemini is used only when the local detector cannot
 confidently determine an executable intent.
 
 Gemini is NEVER allowed to return arbitrary intents.
-Only intents explicitly supported by ASTRA-AI are accepted.
+Only intents explicitly supported by DHEEPTHI-AI are accepted.
 """
 
 from __future__ import annotations
@@ -777,7 +777,7 @@ class IntentDetector:
     ) -> bool:
         """
         Return True only when the message clearly asks
-        ASTRA-AI to perform an action.
+        DHEEPTHI-AI to perform an action.
 
         This prevents normal questions such as:
 
@@ -820,7 +820,13 @@ class IntentDetector:
             r"(settings|task manager|file explorer|camera|"
             r"control panel|cmd|powershell)\b",
 
-            r"^(start|stop)\s+(screen )?recording\b",
+            r"^(start|stop|begin|end|finish)\s+"
+            r"((the|my)\s+)?(screen\s+)?record(ing)?\b",
+
+            r"^(record|recording)\s+"
+            r"(the\s+)?(screen)\b",
+
+            r"^(screenshot|screen shot)\b",
 
             # Word formatting/action commands.
             r"^(make|set|apply|change|turn|add|insert|create|"
@@ -1301,6 +1307,164 @@ class IntentDetector:
             or "archive file" in text
         ):
             return "compress_file"
+
+        return None
+
+    # ==========================================================
+    # SCREEN CAPTURE / RECORDING INTENTS
+    # ==========================================================
+
+    def _detect_capture_intent(
+        self,
+        text: str,
+    ) -> Optional[str]:
+        """
+        Detect screenshot and screen-recording commands with
+        explicit phrase matching.
+
+        This method is intentionally evaluated before generic
+        application detection. Without this priority, commands
+        beginning with ``start`` can be incorrectly classified as
+        ``launch_application``.
+
+        Stop phrases are checked before start phrases so that a
+        command such as ``stop recording`` can never be interpreted
+        as a start request.
+        """
+
+        if not text:
+            return None
+
+        text = self._basic_normalize(text)
+
+        if not text:
+            return None
+
+        # ------------------------------------------------------
+        # Screenshot
+        # ------------------------------------------------------
+
+        screenshot_phrases = (
+            "take screenshot",
+            "take a screenshot",
+            "take screen shot",
+            "take a screen shot",
+            "capture screenshot",
+            "capture a screenshot",
+            "capture screen shot",
+            "capture a screen shot",
+            "capture screen",
+            "screenshot this screen",
+            "screenshot this window",
+            "screenshot window",
+            "screen shot this screen",
+            "screen shot this window",
+            "take screenshot of",
+            "take a screenshot of",
+            "capture screenshot of",
+            "capture a screenshot of",
+            "take screenshot from",
+            "capture the screen",
+            "save screenshot",
+            "save a screenshot",
+        )
+
+        if any(
+            phrase in text
+            for phrase in screenshot_phrases
+        ):
+            return "take_screenshot"
+
+        # Short direct form after normalization.
+        if text in {
+            "screenshot",
+            "screen shot",
+        }:
+            return "take_screenshot"
+
+        # ------------------------------------------------------
+        # Stop recording
+        # ------------------------------------------------------
+
+        stop_recording_phrases = (
+            "stop screen recording",
+            "stop the screen recording",
+            "stop screen record",
+            "stop the screen record",
+            "stop recording screen",
+            "stop the recording screen",
+            "stop recording",
+            "stop the recording",
+            "stop this recording",
+            "stop current recording",
+            "end screen recording",
+            "end the screen recording",
+            "end screen record",
+            "end recording",
+            "finish screen recording",
+            "finish the screen recording",
+            "finish recording",
+            "stop screen capture",
+            "stop the screen capture",
+            "stop capturing screen",
+            "stop capturing the screen",
+            "screen recording stop",
+            "screen recording stop pannu",
+            "recording stop pannu",
+            "recording niruthu",
+            "screen recording niruthu",
+            "screen record niruthu",
+        )
+
+        if any(
+            phrase in text
+            for phrase in stop_recording_phrases
+        ):
+            return "stop_screen_recording"
+
+        # ------------------------------------------------------
+        # Start recording
+        # ------------------------------------------------------
+
+        start_recording_phrases = (
+            "start screen recording",
+            "start the screen recording",
+            "start screen record",
+            "start the screen record",
+            "start recording screen",
+            "start the recording screen",
+            "start recording",
+            "start the recording",
+            "begin screen recording",
+            "begin the screen recording",
+            "begin screen record",
+            "begin the screen record",
+            "begin recording",
+            "begin the recording",
+            "record screen",
+            "record the screen",
+            "record my screen",
+            "record my computer screen",
+            "record this screen",
+            "record the current screen",
+            "start screen capture",
+            "start the screen capture",
+            "start capturing screen",
+            "start capturing the screen",
+            "screen recording start",
+            "screen recording start pannu",
+            "recording start pannu",
+            "recording edu",
+            "screen recording edu",
+            "screen record edu",
+            "screen record start",
+        )
+
+        if any(
+            phrase in text
+            for phrase in start_recording_phrases
+        ):
+            return "start_screen_recording"
 
         return None
 
@@ -2719,6 +2883,28 @@ class IntentDetector:
                 return "ai_chat"
 
         # ------------------------------------------------------
+        # SCREEN CAPTURE / RECORDING FIRST
+        #
+        # These are direct desktop actions. They MUST be checked
+        # before generic application detection because phrases such
+        # as:
+        #
+        #   "start the screen recording"
+        #   "start recording"
+        #
+        # otherwise fall through to the generic "start ->
+        # launch_application" rule.
+        #
+        # Screenshot and recording are also intentionally kept
+        # local so Gemini cannot reinterpret them as another intent.
+        # ------------------------------------------------------
+
+        intent = self._detect_capture_intent(text)
+
+        if intent:
+            return intent
+
+        # ------------------------------------------------------
         # Code Agent FIRST
         #
         # Programming requests must be routed before generic
@@ -2986,7 +3172,7 @@ class IntentDetector:
         )
 
         return f"""
-You are the semantic intent classifier for ASTRA-AI.
+You are the semantic intent classifier for DHEEPTHI-AI.
 
 Your job is ONLY to identify what desktop action or
 conversation intent the user means.
@@ -3027,7 +3213,7 @@ IMPORTANT RULES
 
    "ai_chat"
 
-4. If the user clearly wants ASTRA-AI to perform an action,
+4. If the user clearly wants DHEEPTHI-AI to perform an action,
    identify the closest supported executable intent.
 
 5. Understand natural language, Tanglish and casual speech.
@@ -3308,6 +3494,36 @@ Normalized speech:
 
         # ==================================================
         # STEP 1
+        # DHEEPTHI SCREEN CAPTURE PRIORITY
+        # ==================================================
+        #
+        # Screenshot and screen-recording are direct local desktop
+        # actions. They must be resolved before conversation,
+        # fuzzy matching, Gemini fallback, or the generic
+        # "start -> launch_application" rule.
+        #
+        # This is especially important for natural commands such as:
+        #
+        #   start the screen recording
+        #   start recording
+        #   begin the screen recording
+        #   stop recording
+        #   take a screenshot of this window
+        #
+        # The capture detector is deterministic and therefore cannot
+        # accidentally be reinterpreted as launch_application or
+        # another semantic intent.
+        # ==================================================
+
+        capture_intent = self._detect_capture_intent(
+            normalized_text
+        )
+
+        if capture_intent:
+            return capture_intent
+
+        # ==================================================
+        # STEP 2
         # Explicit conversation protection
         # ==================================================
 

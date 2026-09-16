@@ -1,5 +1,5 @@
 """
-ASTRA-AI
+DHEEPTHI-AI
 DHEEPTHI Intent Detector
 
 Responsibilities
@@ -25,7 +25,7 @@ Gemini is used only when the local detector cannot
 confidently determine an executable intent.
 
 Gemini is NEVER allowed to return arbitrary intents.
-Only intents explicitly supported by ASTRA-AI are accepted.
+Only intents explicitly supported by DHEEPTHI-AI are accepted.
 """
 
 from __future__ import annotations
@@ -774,7 +774,7 @@ class IntentDetector:
     ) -> bool:
         """
         Return True only when the message clearly asks
-        ASTRA-AI to perform an action.
+        DHEEPTHI-AI to perform an action.
 
         This prevents normal questions such as:
 
@@ -2893,7 +2893,7 @@ class IntentDetector:
         )
 
         return f"""
-You are the semantic intent classifier for ASTRA-AI.
+You are the semantic intent classifier for DHEEPTHI-AI.
 
 Your job is ONLY to identify what desktop action or
 conversation intent the user means.
@@ -2934,7 +2934,7 @@ IMPORTANT RULES
 
    "ai_chat"
 
-4. If the user clearly wants ASTRA-AI to perform an action,
+4. If the user clearly wants DHEEPTHI-AI to perform an action,
    identify the closest supported executable intent.
 
 5. Understand natural language, Tanglish and casual speech.
@@ -3416,7 +3416,7 @@ Normalized speech:
         self.gemini_client = None
         self._gemini_initialized = False
 # ==============================================================
-# ASTRA-AI ENTITY EXTRACTOR
+# DHEEPTHI-AI ENTITY EXTRACTOR
 # ==============================================================
 #
 # NOTE:
@@ -3429,7 +3429,7 @@ Normalized speech:
 
 class EntityExtractor:
     """
-    Extract command entities required by ASTRA-AI V1.
+    Extract command entities required by DHEEPTHI-AI V1.
 
     IntentDetector decides WHAT action is requested.
     EntityExtractor decides the VALUE/OBJECT used by that action.
@@ -4391,7 +4391,7 @@ class EntityExtractor:
             ):
                 return browser
 
-        # ASTRA-AI browser commands default to Chrome
+        # DHEEPTHI-AI browser commands default to Chrome
         # when a website is being opened.
         if self.extract_website(value):
             return "chrome"
@@ -4447,6 +4447,120 @@ class EntityExtractor:
         return None
 
     # ==========================================================
+    # SCREENSHOT / SCREEN RECORDING
+    # ==========================================================
+
+    def extract_capture_action(
+        self,
+        text: str,
+    ) -> Optional[str]:
+        """
+        Extract the local screen-capture action from spoken text.
+
+        Returns:
+            take_screenshot
+            start_screen_recording
+            stop_screen_recording
+            None
+
+        These commands intentionally return only the action name.
+        They do not execute any system operation.
+        """
+
+        value = self._normalize(text)
+
+        if not value:
+            return None
+
+        # ------------------------------------------------------
+        # STOP recording MUST be checked first.
+        # ------------------------------------------------------
+
+        stop_patterns = (
+            "stop screen recording",
+            "stop screen record",
+            "stop recording the screen",
+            "stop recording screen",
+            "stop my screen recording",
+            "stop my screen record",
+            "end screen recording",
+            "end screen record",
+            "finish screen recording",
+            "finish screen record",
+            "stop recording",
+            "end recording",
+            "finish recording",
+            "stop screen capture",
+        )
+
+        if any(pattern in value for pattern in stop_patterns):
+            return "stop_screen_recording"
+
+        # ------------------------------------------------------
+        # START recording
+        # ------------------------------------------------------
+
+        start_patterns = (
+            "start screen recording",
+            "start screen record",
+            "start the screen recording",
+            "start the screen record",
+            "start recording the screen",
+            "start recording screen",
+            "start my screen recording",
+            "start my screen record",
+            "begin screen recording",
+            "begin screen record",
+            "begin recording the screen",
+            "record screen",
+            "record my screen",
+            "record the screen",
+            "start screen capture",
+            "start recording",
+            "begin recording",
+            "record my screen please",
+        )
+
+        if any(pattern in value for pattern in start_patterns):
+            return "start_screen_recording"
+
+        # ------------------------------------------------------
+        # Screenshot
+        # ------------------------------------------------------
+
+        screenshot_patterns = (
+            "take screenshot",
+            "take a screenshot",
+            "take the screenshot",
+            "take screen shot",
+            "take a screen shot",
+            "capture screen",
+            "capture the screen",
+            "capture my screen",
+            "capture this screen",
+            "screenshot this screen",
+            "screenshot this window",
+            "screen shot this window",
+            "take screenshot this window",
+            "take a screenshot of this window",
+            "capture this window",
+            "take a screen capture",
+        )
+
+        if any(pattern in value for pattern in screenshot_patterns):
+            return "take_screenshot"
+
+        return None
+
+    def extract_screen_capture(
+        self,
+        text: str,
+    ) -> Optional[str]:
+        """Backward-compatible alias for extract_capture_action."""
+
+        return self.extract_capture_action(text)
+
+    # ==========================================================
     # DEBUG
     # ==========================================================
 
@@ -4458,6 +4572,8 @@ class EntityExtractor:
         return {
             "original_text": text,
             "normalized_text": self._normalize(text),
+            "capture_action": self.extract_capture_action(text),
+            "screen_capture": self.extract_screen_capture(text),
             "percentage": self.extract_percentage(text),
             "application": self.extract_application(text),
             "file_query": self.extract_file_query(text),
