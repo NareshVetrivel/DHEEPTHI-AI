@@ -2586,6 +2586,264 @@ class CommandDispatcher:
             )
 
 
+    # ==================================================
+    # NATURAL ENGLISH DISPATCH NORMALIZATION
+    # ==================================================
+
+    @staticmethod
+    def _normalize_dispatch_intent(intent):
+        """
+        Normalize intent aliases emitted by older/newer planners.
+
+        This is intentionally additive: Tanglish and all existing canonical
+        intent names remain valid.  The dispatcher only maps clear aliases
+        to the canonical V1 names expected by the controllers.
+        """
+        if isinstance(intent, dict):
+            intent = (
+                intent.get("intent")
+                or intent.get("name")
+                or intent.get("action")
+            )
+
+        if intent is None:
+            return None
+
+        value = str(intent).strip().lower()
+        if not value:
+            return None
+
+        aliases = {
+            "take screenshot": "take_screenshot",
+            "screenshot": "take_screenshot",
+            "capture screenshot": "take_screenshot",
+            "screen capture": "take_screenshot",
+            "start recording": "start_screen_recording",
+            "record screen": "start_screen_recording",
+            "screen recording start": "start_screen_recording",
+            "stop recording": "stop_screen_recording",
+            "recording stop": "stop_screen_recording",
+            "google": "open_google",
+            "google home": "open_google",
+            "google homepage": "open_google",
+            "youtube": "open_youtube",
+            "youtube home": "open_youtube",
+            "youtube homepage": "open_youtube",
+            "search youtube": "youtube_search",
+            "youtube search": "youtube_search",
+            "search google": "google_search",
+            "browser history": "browser_history",
+            "show history": "browser_history",
+            "browser downloads": "browser_downloads",
+            "downloads": "browser_downloads",
+            "bookmark page": "bookmark_page",
+            "bookmark this page": "bookmark_page",
+            "new tab": "new_tab",
+            "close current tab": "close_tab",
+            "close tab": "close_tab",
+            "refresh page": "refresh",
+            "refresh browser": "refresh",
+            "open file explorer": "open_file_explorer",
+            "file explorer": "open_file_explorer",
+            "open command prompt": "open_cmd",
+            "command prompt": "open_cmd",
+            "open powershell": "open_powershell",
+            "powershell": "open_powershell",
+        }
+
+        return aliases.get(value, value)
+
+    @staticmethod
+    def _recover_explicit_natural_english_intent(
+        intent,
+        user_text=None,
+        typed_text=None,
+        entity=None,
+    ):
+        """
+        Recover only highly explicit English commands when an upstream
+        detector/planner returns a generic or conflicting intent.
+
+        This is a safety-oriented fallback, not a replacement for
+        IntentDetector.  Conversational questions are left untouched.
+
+        Tanglish is deliberately not removed or rewritten here.
+        """
+        command = str(user_text or typed_text or "").strip()
+        if not command:
+            return intent
+
+        text = re.sub(r"\s+", " ", command.lower()).strip()
+        current = CommandDispatcher._normalize_dispatch_intent(intent)
+
+        # --------------------------------------------------
+        # Explicit application launches.
+        # App names win over browser homepage phrases when the
+        # user explicitly names an application such as Chrome.
+        # --------------------------------------------------
+        app_patterns = (
+            (r"\b(?:open|launch|start|run|bring up|fire up|pull up)\b.*\bgoogle chrome\b", "launch_application"),
+            (r"\b(?:open|launch|start|run|bring up|fire up|pull up)\b.*\bchrome\b", "launch_application"),
+        )
+        for pattern, recovered in app_patterns:
+            if re.search(pattern, text):
+                if not re.search(
+                    r"\b(?:search|browse|go)\b.*\bchrome\b",
+                    text,
+                ):
+                    return recovered
+
+        # --------------------------------------------------
+        # Screen capture / recording.
+        # --------------------------------------------------
+        if re.search(
+            r"\b(?:take|capture|get)\b.*\b(?:a\s+)?(?:screenshot|screen\s*shot)\b",
+            text,
+        ):
+            return "take_screenshot"
+
+        if re.search(
+            r"\b(?:capture|take)\b.*\b(?:this|the|current|my)?\s*screen\b",
+            text,
+        ):
+            return "take_screenshot"
+
+        if re.search(
+            r"\b(?:capture|take)\b.*\b(?:this|the|current|my)?\s*window\b",
+            text,
+        ):
+            return "take_screenshot"
+
+        if re.search(
+            r"\b(?:stop|end|finish)\b.*\b(?:my\s+)?screen\s+record(?:ing)?\b",
+            text,
+        ):
+            return "stop_screen_recording"
+
+        if re.search(
+            r"\b(?:start|begin|record)\b.*\bscreen\s+record(?:ing)?\b",
+            text,
+        ):
+            return "start_screen_recording"
+
+        # --------------------------------------------------
+        # Explicit browser navigation/actions.
+        # --------------------------------------------------
+        if re.search(r"\b(?:close|shut)\b.*\b(?:current|this|the)?\s*tab\b", text):
+            return "close_tab"
+
+        if re.search(r"\b(?:refresh|reload)\b(?:\s+the)?\s+(?:page|browser|tab)\b", text):
+            return "refresh"
+
+        if re.search(
+            r"\b(?:show|open|view|display)\b.*\b(?:browser|browsing)\s+history\b",
+            text,
+        ):
+            return "browser_history"
+
+        if re.search(
+            r"\b(?:show|open|view|display)\b.*\b(?:browser\s+)?downloads\b",
+            text,
+        ):
+            return "browser_downloads"
+
+        if re.search(
+            r"\b(?:bookmark)\b.*\b(?:this|the|current)?\s*page\b",
+            text,
+        ):
+            return "bookmark_page"
+
+        # --------------------------------------------------
+        # YouTube commands must win over generic file/folder
+        # words such as "music", "videos", or "songs".
+        # --------------------------------------------------
+        youtube_search = re.search(
+            r"\b(?:search|find)\s+(?:on\s+)?youtube\s+(?:for\s+)?(.+)$",
+            text,
+        )
+        if youtube_search:
+            return "youtube_search"
+
+        if re.search(
+            r"\b(?:play|watch|listen\s+to)\b.*\b(?:on\s+)?youtube\b",
+            text,
+        ):
+            return "play_youtube"
+
+        if re.search(
+            r"\b(?:youtube)\s+(?:search|find)\b",
+            text,
+        ):
+            return "youtube_search"
+
+        # --------------------------------------------------
+        # File-search commands.  Only recover phrases that are
+        # structurally explicit, so normal questions about files
+        # remain conversational.
+        # --------------------------------------------------
+        if re.search(
+            r"\b(?:search|find)\b.*\bfiles?\b.*\b(?:extension|extensions)\b",
+            text,
+        ) or re.search(
+            r"\b(?:search|find)\b.*\b(?:files?|documents?)\b.*\.(?:py|js|ts|java|cpp|cs|html|css|sql)\b",
+            text,
+        ):
+            return "search_extension"
+
+        if re.search(
+            r"\b(?:search|find)\b.*\bfiles?\b.*\b(?:created|modified|changed|updated|accessed)\b.*\b(?:today|yesterday|this week|this month|this year)\b",
+            text,
+        ):
+            return "search_date"
+
+        if re.search(
+            r"\b(?:search|find)\b.*\b(?:large|big|small|tiny)\s+files?\b",
+            text,
+        ):
+            return "search_size"
+
+        # Preserve a valid specific intent if one already exists.
+        return current if current is not None else intent
+
+    @staticmethod
+    def _normalize_dispatch_entity(intent, entity=None, search_query=None):
+        """
+        Normalize common entity aliases without destroying structured payloads.
+        """
+        if not isinstance(entity, dict):
+            return entity
+
+        normalized = dict(entity)
+
+        if intent == "search_extension":
+            extension = (
+                normalized.get("extension")
+                or normalized.get("file_extension")
+            )
+            if extension:
+                extension = str(extension).strip()
+                if extension and not extension.startswith("."):
+                    extension = "." + extension
+                normalized["extension"] = extension
+
+        if intent in {"youtube_search", "play_youtube", "google_search"}:
+            query = (
+                normalized.get("search_query")
+                or normalized.get("video_query")
+                or normalized.get("query")
+                or search_query
+            )
+            if query:
+                normalized["search_query"] = str(query).strip()
+
+        if intent == "take_screenshot":
+            normalized.setdefault("capture", "screen")
+
+        if intent in {"start_screen_recording", "stop_screen_recording"}:
+            normalized.setdefault("capture", "screen")
+
+        return normalized
+
     # --------------------------------------------------
     # Dispatcher
     # --------------------------------------------------
@@ -2613,6 +2871,21 @@ class CommandDispatcher:
         """
 
         try:
+
+            # ==================================================
+            # DISPATCHER-SIDE NATURAL ENGLISH NORMALIZATION
+            # ==================================================
+            # IntentDetector remains the primary router.  This lightweight
+            # fallback catches explicit English commands that may arrive as
+            # ``ai_chat`` or as a conflicting generic intent after upstream
+            # normalization.  Existing Tanglish commands are untouched.
+            intent = self._normalize_dispatch_intent(intent)
+            intent = self._recover_explicit_natural_english_intent(
+                intent=intent,
+                user_text=user_text,
+                typed_text=typed_text,
+                entity=entity,
+            )
 
             # ==================================================
             # CODE AGENT ROUTING LOCK
@@ -2664,6 +2937,11 @@ class CommandDispatcher:
             )
 
             entity = normalized_entity
+            entity = self._normalize_dispatch_entity(
+                intent=intent,
+                entity=entity,
+                search_query=search_query,
+            )
             self._active_planner_metadata = planner_metadata or {}
 
             # ==================================================
@@ -4893,18 +5171,27 @@ class CommandDispatcher:
                     "Taking screenshot."
                 )
 
-                success = self.system.take_screenshot()
+                screenshot_result = self.system.take_screenshot()
+
+                # SystemController returns the saved path on success in V1.
+                # Preserve backward compatibility with older boolean returns.
+                screenshot_path = (
+                    screenshot_result
+                    if isinstance(screenshot_result, (str, Path))
+                    else None
+                )
+                success = bool(screenshot_result)
 
                 return self.response(
-
-                    bool(success),
-
+                    success,
                     "Status : Screenshot Saved",
-
                     "Status : Screenshot Failed",
-
-                    reply
-
+                    reply,
+                    screenshot_path=(
+                        str(screenshot_path)
+                        if screenshot_path
+                        else None
+                    ),
                 )
 
             # -------------------------

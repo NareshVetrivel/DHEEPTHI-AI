@@ -659,103 +659,39 @@ class IntentDetector:
         return text.strip()
 
     def _normalize_text(self, text: str) -> str:
-        """
-        Normalize recognized speech.
-
-        Includes common Whisper/STT mistakes and Tanglish
-        command normalization.
-        """
-
+        """Normalize STT output while preserving and expanding Tanglish support."""
         text = self._basic_normalize(text)
-
         if not text:
             return ""
 
-        # --------------------------------------------------
-        # Filler removal
-        # --------------------------------------------------
-
-        fillers = {
-            "uh",
-            "um",
-            "hmm",
-            "mmm",
-            "ah",
-            "oh",
-        }
-
-        words = [
-            word
-            for word in text.split()
-            if word not in fillers
-        ]
-
-        text = " ".join(words)
-
-        # --------------------------------------------------
-        # Common Whisper corrections
-        # --------------------------------------------------
+        fillers = {"uh", "um", "hmm", "mmm", "ah", "oh", "erm", "er"}
+        text = " ".join(w for w in text.split() if w not in fillers)
 
         replacements = (
-            ("bdf", "pdf"),
-            ("estaday", "yesterday"),
-            ("yester day", "yesterday"),
-
-            ("you tube", "youtube"),
-            ("you to", "youtube"),
-            ("u tube", "youtube"),
-            ("you too", "youtube"),
-
-            ("g mail", "gmail"),
-
-            ("power point presentation", "powerpoint"),
-            ("power point", "powerpoint"),
-
-            ("note pad", "notepad"),
-            ("node pad", "notepad"),
-
-            ("command promt", "command prompt"),
-            ("command promt", "command prompt"),
-
-            ("vs code", "vscode"),
-            ("visual studio code", "vscode"),
-
-            ("chrome browser", "chrome"),
-            ("google chrome browser", "chrome"),
-
-            ("excel sheet", "excel"),
-
-            ("c plus plus", "c++"),
-            ("c sharp", "c#"),
-
+            ("bdf", "pdf"), ("estaday", "yesterday"), ("yester day", "yesterday"),
+            ("you tube", "youtube"), ("u tube", "youtube"),
+            ("you too", "youtube"), ("g mail", "gmail"),
+            ("power point presentation", "powerpoint"), ("power point", "powerpoint"),
+            ("note pad", "notepad"), ("node pad", "notepad"),
+            ("command promt", "command prompt"), ("command promp", "command prompt"),
+            ("vs code", "vscode"), ("visual studio code", "vscode"),
+            ("chrome browser", "chrome"), ("google chrome browser", "chrome"),
+            ("excel sheet", "excel"), ("c plus plus", "c++"), ("c sharp", "c#"),
             ("artificial intelligent", "artificial intelligence"),
-
-            # Common Word/STT confusion.
-            ("ms word", "word"),
-            ("m s word", "word"),
-            ("microsoft word", "word"),
-
-            # Common browser pronunciation variants.
-            ("fire fox", "firefox"),
-
-            # Common PowerShell pronunciation.
-            ("power shell", "powershell"),
+            ("ms word", "word"), ("m s word", "word"), ("microsoft word", "word"),
+            ("fire fox", "firefox"), ("power shell", "powershell"),
+            ("micro soft edge", "edge"), ("microsoft edge browser", "edge"),
+            ("google chrome", "chrome"),
         )
-
         for old, new in replacements:
             text = text.replace(old, new)
 
         text = self._basic_normalize(text)
+        text = self._strip_english_command_wrappers(text)
+        text = self._basic_normalize(text)
 
-        # --------------------------------------------------
-        # Tanglish command normalization
-        # --------------------------------------------------
-
-        # Longest phrases first so that:
-        #
-        # "open pannu"
-        #
-        # is handled before individual words.
+        # IMPORTANT: retain the existing Tanglish vocabulary and make
+        # matching phrase-based (longest first), not English-only.
         for old, new in sorted(
             self.tanglish_command_map.items(),
             key=lambda item: len(item[0]),
@@ -764,8 +700,253 @@ class IntentDetector:
             text = text.replace(old, new)
 
         text = self._basic_normalize(text)
-
         return text
+
+    # ==========================================================
+    # NATURAL ENGLISH COMMAND NORMALIZATION
+    # ==========================================================
+
+    @staticmethod
+    def _strip_english_command_wrappers(text: str) -> str:
+        """
+        Normalize natural spoken-English request wrappers without changing
+        the meaning of conversational questions.
+
+        Examples
+        --------
+        "could you kindly open chrome" -> "open chrome"
+        "please go ahead and open chrome" -> "open chrome"
+        "would you mind opening chrome" -> "open chrome"
+        "can you help me launch edge" -> "launch edge"
+        "i want you to take a screenshot" -> "take a screenshot"
+        "can you tell me why chrome is useful" -> unchanged
+        """
+        if not text:
+            return ""
+
+        text = IntentDetector._basic_normalize(text)
+        if not text:
+            return ""
+
+        # Verb forms commonly produced by natural speech/STT.
+        gerund_rules = (
+            (r"^opening\b", "open"),
+            (r"^launching\b", "launch"),
+            (r"^starting\b", "start"),
+            (r"^running\b", "run"),
+            (r"^executing\b", "execute"),
+            (r"^closing\b", "close"),
+            (r"^exiting\b", "exit"),
+            (r"^quitting\b", "quit"),
+            (r"^terminating\b", "terminate"),
+            (r"^typing\b", "type"),
+            (r"^writing\b", "write"),
+            (r"^copying\b", "copy"),
+            (r"^pasting\b", "paste"),
+            (r"^cutting\b", "cut"),
+            (r"^clicking\b", "click"),
+            (r"^scrolling\b", "scroll"),
+            (r"^minimizing\b", "minimize"),
+            (r"^minimising\b", "minimize"),
+            (r"^maximizing\b", "maximize"),
+            (r"^maximising\b", "maximize"),
+            (r"^restoring\b", "restore"),
+            (r"^taking\b", "take"),
+            (r"^capturing\b", "capture"),
+            (r"^recording\b", "record"),
+            (r"^stopping\b", "stop"),
+            (r"^ending\b", "end"),
+            (r"^finishing\b", "finish"),
+            (r"^pressing\b", "press"),
+            (r"^selecting\b", "select"),
+            (r"^creating\b", "create"),
+            (r"^making\b", "make"),
+            (r"^deleting\b", "delete"),
+            (r"^removing\b", "remove"),
+            (r"^renaming\b", "rename"),
+            (r"^moving\b", "move"),
+            (r"^compressing\b", "compress"),
+            (r"^extracting\b", "extract"),
+            (r"^unzipping\b", "unzip"),
+            (r"^saving\b", "save"),
+            (r"^printing\b", "print"),
+            (r"^searching\b", "search"),
+            (r"^finding\b", "find"),
+            (r"^locating\b", "locate"),
+            (r"^listing\b", "list"),
+            (r"^showing\b", "show"),
+            (r"^playing\b", "play"),
+            (r"^bookmarking\b", "bookmark"),
+            (r"^refreshing\b", "refresh"),
+            (r"^reloading\b", "reload"),
+            (r"^visiting\b", "visit"),
+            (r"^adding\b", "add"),
+            (r"^inserting\b", "insert"),
+            (r"^replacing\b", "replace"),
+            (r"^clearing\b", "clear"),
+            (r"^applying\b", "apply"),
+            (r"^changing\b", "change"),
+            (r"^increasing\b", "increase"),
+            (r"^decreasing\b", "decrease"),
+            (r"^raising\b", "raise"),
+            (r"^lowering\b", "lower"),
+            (r"^muting\b", "mute"),
+            (r"^locking\b", "lock"),
+            (r"^shutting\b", "shut"),
+        )
+
+        def normalize_verb(value: str) -> str:
+            value = value.strip()
+            for pattern, replacement in gerund_rules:
+                updated = re.sub(
+                    pattern,
+                    replacement,
+                    value,
+                    count=1,
+                    flags=re.IGNORECASE,
+                )
+                if updated != value:
+                    return updated.strip()
+            return value
+
+        # These are ordered longest-first.  This is important:
+        # "would you mind" must be removed before the shorter "would you".
+        prefixes = (
+            # Conditional / indirect requests.
+            r"would\s+you\s+mind\s+if\s+you\s+could\s+(?:please\s+)?",
+            r"would\s+you\s+mind\s+if\s+you\s+would\s+(?:please\s+)?",
+            r"would\s+you\s+mind\s+if\s+you\s+will\s+(?:please\s+)?",
+            r"would\s+you\s+mind\s+(?!if\s+you\b)",
+            r"i\s+was\s+wondering\s+if\s+you\s+could\s+(?:please\s+)?",
+            r"i\s+was\s+wondering\s+if\s+you\s+can\s+(?:please\s+)?",
+            r"i\s+would\s+appreciate\s+it\s+if\s+you\s+could\s+(?:please\s+)?",
+            r"are\s+you\s+able\s+to\s+(?:please\s+)?",
+            r"would\s+you\s+be\s+able\s+to\s+(?:please\s+)?",
+            r"could\s+you\s+possibly\s+",
+            r"could\s+you\s+maybe\s+",
+            r"can\s+you\s+possibly\s+",
+            r"can\s+you\s+maybe\s+",
+
+            # "help me" forms must be handled before the shorter
+            # "can/could/would you" wrappers.
+            r"can\s+you\s+help\s+me\s+(?:to\s+)?(?:please\s+)?",
+            r"could\s+you\s+help\s+me\s+(?:to\s+)?(?:please\s+)?",
+            r"would\s+you\s+help\s+me\s+(?:to\s+)?(?:please\s+)?",
+            r"help\s+me\s+(?:to\s+)?(?:please\s+)?",
+
+            # First-person request forms.
+            r"i\s+would\s+like\s+you\s+to\s+(?:please\s+)?",
+            r"i\s+would\s+like\s+you\s+to\s+",
+            r"i\s+want\s+you\s+to\s+(?:please\s+)?",
+            r"i\s+need\s+you\s+to\s+(?:please\s+)?",
+            r"i'd\s+like\s+you\s+to\s+(?:please\s+)?",
+            r"id\s+like\s+you\s+to\s+(?:please\s+)?",
+            r"i\s+would\s+like\s+to\s+",
+            r"i'd\s+like\s+to\s+",
+            r"id\s+like\s+to\s+",
+
+            # General polite wrappers.
+            r"if\s+you\s+could\s+(?:please\s+)?",
+            r"when\s+you\s+can\s+(?:please\s+)?",
+            r"could\s+you\s+(?:please\s+)?(?:kindly\s+)?",
+            r"can\s+you\s+(?:please\s+)?(?:kindly\s+)?",
+            r"would\s+you\s+(?:please\s+)?(?:kindly\s+)?",
+            r"will\s+you\s+(?:please\s+)?(?:kindly\s+)?",
+
+            # Standalone polite/adverb wrappers.
+            r"please\s+",
+            r"kindly\s+",
+            r"maybe\s+",
+            r"possibly\s+",
+            r"just\s+",
+            r"simply\s+",
+            r"quickly\s+",
+            r"briefly\s+",
+            r"go\s+ahead\s+and\s+(?:please\s+)?",
+        )
+
+        # A command must begin with one of these action forms after the
+        # conversational wrapper is removed.  This prevents:
+        # "could you explain why..." -> "explain why..." from becoming
+        # an executable command.
+        command_start = re.compile(
+            r"^(?:"
+            r"open|launch|start|run|execute|fire\s+up|bring\s+up|pull\s+up|close|exit|quit|terminate|stop|"
+            r"type|write|copy|paste|cut|undo|redo|click|double(?:\s+click)?|"
+            r"right\s+click|left\s+click|scroll|minimize|minimise|maximize|"
+            r"maximise|restore|take|capture|screenshot|screen\s+shot|"
+            r"record|recording|begin|finish|end|halt|press|select|"
+            r"mute|volume|brightness|increase|decrease|raise|lower|"
+            r"shutdown|shut\s+down|restart|reboot|sleep|logout|log\s+out|"
+            r"sign\s+out|lock|create|make|new|delete|remove|rename|move|"
+            r"compress|extract|unzip|save|print|search|find|list|locate|"
+            r"show|look\s+for|look\s+up|google\s+search|youtube\s+search|play|bookmark|refresh|"
+            r"reload|new\s+tab|close\s+tab|next\s+tab|previous\s+tab|"
+            r"go\s+back|go\s+forward|visit|add|insert|replace|clear|"
+            r"apply|set|change|turn|increase|decrease|raise|lower|underline|italic|bold|highlight|justify"
+            r")\b",
+            re.IGNORECASE,
+        )
+
+        # Remove one or more wrapper layers.  We only accept a stripped
+        # candidate when it actually looks like an executable command.
+        candidate = text
+        for _ in range(6):
+            before = candidate
+            candidate = normalize_verb(candidate)
+
+            changed = False
+            for prefix in prefixes:
+                updated = re.sub(
+                    r"^" + prefix,
+                    "",
+                    candidate,
+                    count=1,
+                    flags=re.IGNORECASE,
+                ).strip()
+                if updated != candidate:
+                    candidate = normalize_verb(updated)
+                    changed = True
+                    break
+
+            if not changed:
+                break
+
+        # Handle a few spoken request forms where "help me" is embedded
+        # after "can/could/would you".
+        candidate = re.sub(
+            r"^(?:can|could|would|will)\s+you\s+help\s+me\s+(?:to\s+)?",
+            "",
+            candidate,
+            count=1,
+            flags=re.IGNORECASE,
+        ).strip()
+        candidate = normalize_verb(candidate)
+
+        if not command_start.search(candidate):
+            # Not an executable command; preserve the original sentence
+            # so conversational/question detection can process it safely.
+            return text
+
+        # Natural politeness tails.
+        candidate = re.sub(
+            r"\s+(?:please|kindly|now|for\s+me|for\s+me\s+please|"
+            r"if\s+you\s+can|if\s+possible|thanks|thank\s+you)$",
+            "",
+            candidate,
+            flags=re.IGNORECASE,
+        ).strip()
+
+        # Spoken filler around a command.
+        candidate = re.sub(
+            r"^(?:now|just)\s+",
+            "",
+            candidate,
+            count=1,
+            flags=re.IGNORECASE,
+        ).strip()
+
+        return IntentDetector._basic_normalize(candidate)
 
     # ==========================================================
     # CONVERSATION PROTECTION
@@ -809,6 +990,17 @@ class IntentDetector:
             r"compress|extract)\b",
 
             r"^(search|google|youtube|play)\b",
+
+            # Natural-English explicit desktop/browser/file-search forms.
+            r"^(show|open|view|check)\s+(?:the\s+)?(?:browser\s+)?(?:history|downloads?)\b",
+            r"^bookmark\s+(?:this|the|current)?\s*page\b",
+            r"^(find|search|locate|list|show)\s+.*\bfiles?\b",
+            r"^(find|search|locate|list|show)\s+.*\b(?:large|small|recent|today|yesterday)\b",
+            r"^(?:capture|take|get|grab)\s+(?:this|the|my|current)?\s*(?:screen|window)\b",
+            r"^(?:stop|end|finish|halt)\s+.*\brecord(?:ing)?\b",
+            r"^(?:open|launch|start|run)\s+.*\b(?:homepage|home\s+page)\b",
+            r"\b(?:open|launch|start|run|close|stop|take|capture|search|find|show|"
+            r"bookmark|refresh|reload)\s*$",
 
             r"^(new tab|close tab|next tab|previous tab|"
             r"refresh|reload|go back|go forward)\b",
@@ -1314,155 +1506,63 @@ class IntentDetector:
     # SCREEN CAPTURE / RECORDING INTENTS
     # ==========================================================
 
-    def _detect_capture_intent(
-        self,
-        text: str,
-    ) -> Optional[str]:
-        """
-        Detect screenshot and screen-recording commands with
-        explicit phrase matching.
-
-        This method is intentionally evaluated before generic
-        application detection. Without this priority, commands
-        beginning with ``start`` can be incorrectly classified as
-        ``launch_application``.
-
-        Stop phrases are checked before start phrases so that a
-        command such as ``stop recording`` can never be interpreted
-        as a start request.
-        """
-
+    def _detect_capture_intent(self, text: str) -> Optional[str]:
+        """Detect screenshot/recording commands, including natural English."""
         if not text:
             return None
-
         text = self._basic_normalize(text)
-
         if not text:
             return None
 
-        # ------------------------------------------------------
-        # Screenshot
-        # ------------------------------------------------------
-
-        screenshot_phrases = (
-            "take screenshot",
-            "take a screenshot",
-            "take screen shot",
-            "take a screen shot",
-            "capture screenshot",
-            "capture a screenshot",
-            "capture screen shot",
-            "capture a screen shot",
-            "capture screen",
-            "screenshot this screen",
-            "screenshot this window",
-            "screenshot window",
-            "screen shot this screen",
-            "screen shot this window",
-            "take screenshot of",
-            "take a screenshot of",
-            "capture screenshot of",
-            "capture a screenshot of",
-            "take screenshot from",
-            "capture the screen",
-            "save screenshot",
-            "save a screenshot",
-        )
-
-        if any(
-            phrase in text
-            for phrase in screenshot_phrases
-        ):
-            return "take_screenshot"
-
-        # Short direct form after normalization.
-        if text in {
-            "screenshot",
-            "screen shot",
-        }:
-            return "take_screenshot"
-
-        # ------------------------------------------------------
-        # Stop recording
-        # ------------------------------------------------------
-
-        stop_recording_phrases = (
-            "stop screen recording",
-            "stop the screen recording",
-            "stop screen record",
-            "stop the screen record",
-            "stop recording screen",
-            "stop the recording screen",
-            "stop recording",
-            "stop the recording",
-            "stop this recording",
-            "stop current recording",
-            "end screen recording",
-            "end the screen recording",
-            "end screen record",
-            "end recording",
-            "finish screen recording",
-            "finish the screen recording",
-            "finish recording",
-            "stop screen capture",
-            "stop the screen capture",
-            "stop capturing screen",
-            "stop capturing the screen",
-            "screen recording stop",
-            "screen recording stop pannu",
-            "recording stop pannu",
-            "recording niruthu",
-            "screen recording niruthu",
-            "screen record niruthu",
-        )
-
-        if any(
-            phrase in text
-            for phrase in stop_recording_phrases
+        # Stop must always beat start.
+        if re.search(
+            r"\b(?:stop|end|finish|halt|terminate)\b.*\b"
+            r"(?:screen\s+)?record(?:ing)?\b",
+            text,
+        ) or re.search(
+            r"\b(?:stop|end|finish|halt)\b.*\b(?:recording|capture)\b",
+            text,
         ):
             return "stop_screen_recording"
 
-        # ------------------------------------------------------
-        # Start recording
-        # ------------------------------------------------------
+        if text in {"stop recording", "end recording", "finish recording"}:
+            return "stop_screen_recording"
 
-        start_recording_phrases = (
-            "start screen recording",
-            "start the screen recording",
-            "start screen record",
-            "start the screen record",
-            "start recording screen",
-            "start the recording screen",
-            "start recording",
-            "start the recording",
-            "begin screen recording",
-            "begin the screen recording",
-            "begin screen record",
-            "begin the screen record",
-            "begin recording",
-            "begin the recording",
-            "record screen",
-            "record the screen",
-            "record my screen",
-            "record my computer screen",
-            "record this screen",
-            "record the current screen",
-            "start screen capture",
-            "start the screen capture",
-            "start capturing screen",
-            "start capturing the screen",
-            "screen recording start",
-            "screen recording start pannu",
-            "recording start pannu",
-            "recording edu",
-            "screen recording edu",
-            "screen record edu",
-            "screen record start",
-        )
+        # Screenshot / screen capture. "this screen/window" is a very
+        # common natural-English formulation and is intentionally explicit.
+        if (
+            re.search(
+                r"\b(?:take|get|grab|capture|save)\b.*\b"
+                r"(?:a\s+)?(?:screen\s*shot|screenshot)\b",
+                text,
+            )
+            or re.search(
+                r"\b(?:capture|grab|take|get)\b.*\b"
+                r"(?:this|the|my|current)?\s*(?:screen|window)\b",
+                text,
+            )
+            or re.search(
+                r"\b(?:screen\s*shot|screenshot)\b.*\b"
+                r"(?:this|the|current)?\s*(?:screen|window)\b",
+                text,
+            )
+            or text in {"screenshot", "screen shot", "capture screen", "capture window"}
+        ):
+            return "take_screenshot"
 
-        if any(
-            phrase in text
-            for phrase in start_recording_phrases
+        # Start recording.
+        if (
+            re.search(
+                r"\b(?:start|begin|initiate|launch)\b.*\b"
+                r"(?:the\s+)?(?:screen\s+)?record(?:ing)?\b",
+                text,
+            )
+            or re.search(
+                r"\b(?:record|capture)\b.*\b"
+                r"(?:my|this|the|current)?\s*screen\b",
+                text,
+            )
+            or text in {"record", "recording"}
         ):
             return "start_screen_recording"
 
@@ -1493,7 +1593,8 @@ class IntentDetector:
             "volume up" in text
             or "increase volume" in text
             or "raise volume" in text
-            or "turn up volume" in text
+            or re.search(r"\bturn\s+up\s+(?:the\s+)?volume\b", text)
+            or re.search(r"\bturn\s+the\s+volume\s+up\b", text)
         ):
             return "volume_up"
 
@@ -1501,7 +1602,8 @@ class IntentDetector:
             "volume down" in text
             or "decrease volume" in text
             or "lower volume" in text
-            or "turn down volume" in text
+            or re.search(r"\bturn\s+down\s+(?:the\s+)?volume\b", text)
+            or re.search(r"\bturn\s+the\s+volume\s+down\b", text)
         ):
             return "volume_down"
 
@@ -1714,133 +1816,92 @@ class IntentDetector:
     # BROWSER INTENTS
     # ==========================================================
 
-    def _detect_browser_intent(
-        self,
-        text: str,
-    ) -> Optional[str]:
+    def _detect_browser_intent(self, text: str) -> Optional[str]:
+        """Detect browser actions with natural-English phrasing."""
+        if not text:
+            return None
+        text = self._basic_normalize(text)
 
-        if "new tab" in text:
+        if re.search(r"\b(?:open|create|start)\b.*\bnew\s+tab\b|\bnew\s+tab\b", text):
             return "new_tab"
-
-        if "close tab" in text:
+        if re.search(r"\b(?:close|shut)\b.*\b(?:the\s+)?(?:current\s+)?tab\b", text):
             return "close_tab"
-
-        if "next tab" in text:
+        if re.search(r"\bnext\s+tab\b", text):
             return "next_tab"
-
-        if "previous tab" in text:
+        if re.search(r"\b(?:previous|prior|last)\s+tab\b", text):
             return "previous_tab"
-
-        if (
-            text == "refresh"
-            or "refresh page" in text
-            or "reload" in text
-            or "reload page" in text
-        ):
+        if re.search(r"\b(?:refresh|reload)\b(?:\s+(?:the|this|current)\s+)?(?:page|tab|browser)?\b", text):
             return "refresh"
 
         if (
-            text == "history"
-            or "open history" in text
-            or "browser history" in text
-            or "show browser history" in text
+            re.search(r"\b(?:open|show|view|check)\b.*\b(?:browser\s+)?history\b", text)
+            or text in {"history", "browser history"}
         ):
             return "browser_history"
 
         if (
-            text == "downloads"
-            or "open downloads" in text
-            or "browser downloads" in text
+            re.search(r"\b(?:open|show|view|check)\b.*\b(?:browser\s+)?downloads?\b", text)
+            or text in {"downloads", "browser downloads"}
         ):
             return "browser_downloads"
 
         if (
-            "bookmark page" in text
-            or "add bookmark" in text
-            or "bookmark this page" in text
+            re.search(r"\b(?:bookmark|book mark)\b.*\b(?:this|the|current)?\s*page\b", text)
+            or re.search(r"\badd\b.*\b(?:this|the|current)?\s*page\b.*\bbookmark\b", text)
         ):
             return "bookmark_page"
 
-        if "bookmark" in text:
+        if re.search(r"\bbookmark(?:s)?\b", text):
             return "browser_bookmarks"
 
-        if "address bar" in text:
+        if re.search(r"\b(?:address|url)\s+bar\b", text):
             return "address_bar"
-
-        if "go back" in text:
+        if re.search(r"\bgo\s+(?:back|backward)\b|\bback\s+to\s+(?:the\s+)?(?:previous|last)\s+page\b", text):
             return "browser_back"
-
-        if "go forward" in text:
+        if re.search(r"\bgo\s+forward\b", text):
             return "browser_forward"
-
-        if (
-            "private window" in text
-            or "incognito" in text
-            or "inprivate" in text
-        ):
+        if re.search(r"\b(?:private|incognito|inprivate)\s+(?:window|mode)\b", text):
             return "private_window"
 
-        if (
-            "profile" in text
-            and any(
-                word in text
-                for word in (
-                    "open",
-                    "launch",
-                    "start",
-                    "switch",
-                )
-            )
-        ):
+        if "profile" in text and re.search(r"\b(?:open|launch|start|switch|change)\b", text):
             return "open_chrome_profile"
 
-        if (
-            "youtube" in text
-            and "search" in text
-        ):
+        # YouTube is deliberately checked before generic web/file search.
+        if re.search(r"\b(?:search|find|look\s+up)\b.*\byoutube\b", text):
+            return "youtube_search"
+        if re.search(r"\byoutube\b.*\b(?:search|find|look\s+up)\b", text):
             return "youtube_search"
 
-        if (
-            text.startswith("play ")
-            or "play song" in text
-            or "play music" in text
-            or "play video" in text
-        ):
+        if re.search(r"\b(?:play|watch|listen\s+to)\b.*\byoutube\b", text):
+            return "play_youtube"
+        if re.search(r"\byoutube\b.*\b(?:play|watch)\b", text):
             return "play_youtube"
 
-        if (
-            "open google" in text
-            or text == "google"
-        ):
+        # Exact Google/YouTube site requests only. Do not steal
+        # "open google chrome" or "open youtube music".
+        if re.fullmatch(r"(?:open|launch|visit)\s+(?:the\s+)?google(?:\s+homepage|\s+home|\s+website|\s+site)?", text):
+            return "open_google"
+        if text in {"google", "google homepage", "google home", "google website", "google site"}:
             return "open_google"
 
-        if (
-            "open youtube" in text
-            or text == "youtube"
-        ):
+        if re.fullmatch(r"(?:open|launch|visit)\s+(?:the\s+)?youtube(?:\s+homepage|\s+home|\s+website|\s+site)?", text):
+            return "open_youtube"
+        if text in {"youtube", "youtube homepage", "youtube home", "youtube website", "youtube site"}:
             return "open_youtube"
 
-        if (
-            "google search" in text
-            or "search google" in text
-        ):
+        if re.search(r"\b(?:google\s+search|search\s+google|google\s+for)\b", text):
             return "google_search"
 
         if (
-            "open website" in text
-            or "visit website" in text
-            or "visit " in text
+            re.search(r"\b(?:open|visit|go\s+to)\b.*\b(?:website|web\s*site|homepage|home\s+page|site)\b", text)
             or "www." in text
         ):
             return "open_website"
 
-        # ------------------------------------------------------
-        # Generic web search
-        # ------------------------------------------------------
-
+        # Generic web search, but never file-search requests.
         if (
-            text.startswith("search ")
-            and "file" not in text
+            re.match(r"^(?:search|find|look\s+up)\b", text)
+            and not re.search(r"\bfiles?\b|\bfile\s+extension\b", text)
         ):
             return "google_search"
 
@@ -1850,91 +1911,53 @@ class IntentDetector:
     # APPLICATION INTENTS
     # ==========================================================
 
-    def _detect_application_intent(
-        self,
-        text: str,
-    ) -> Optional[str]:
+    def _detect_application_intent(self, text: str) -> Optional[str]:
+        """Detect explicit application lifecycle requests."""
+        if not text:
+            return None
+        text = self._basic_normalize(text)
 
-        # ------------------------------------------------------
-        # Word lifecycle
-        # ------------------------------------------------------
-
-        if text in {
-            "word",
-            "open word",
-            "launch word",
-            "start word",
-        }:
+        # Word has its own V1 lifecycle.
+        if text in {"word", "open word", "launch word", "start word"}:
             return "open_word"
-
-        if any(
-            phrase in text
-            for phrase in (
-                "close word",
-                "close ms word",
-                "close microsoft word",
-                "exit word",
-                "quit word",
-                "terminate word",
-            )
-        ):
+        if re.search(r"\b(?:close|exit|quit|terminate)\b.*\b(?:ms\s+)?word\b", text):
             return "close_word"
 
-        # ------------------------------------------------------
-        # Explicit application close
-        # ------------------------------------------------------
+        open_verbs = r"(?:open|launch|start|run|execute|fire\s+up|bring\s+up|pull\s+up)"
+        close_verbs = r"(?:close|exit|quit|terminate|shut\s+down|stop)"
 
-        for app in self.application_open_keywords:
+        # Longest/specific names first so "chrome" beats generic "browser".
+        apps = sorted(self.application_open_keywords, key=len, reverse=True)
 
-            if app not in text:
-                continue
-
-            if any(
-                command in text
-                for command in (
-                    "close",
-                    "exit",
-                    "quit",
-                    "terminate",
-                    "stop",
-                )
-            ):
+        for app in apps:
+            if re.search(rf"\b{close_verbs}\b.*\b{re.escape(app)}\b", text):
                 return "close_application"
 
-        # ------------------------------------------------------
-        # Explicit application open
-        # ------------------------------------------------------
-
-        for app in self.application_open_keywords:
-
-            if (
-                text == app
-                or f"open {app}" in text
-                or f"launch {app}" in text
-                or f"run {app}" in text
-                or f"start {app}" in text
-            ):
+        for app in apps:
+            if re.fullmatch(rf"{open_verbs}\s+(?:the\s+)?{re.escape(app)}", text):
+                return "launch_application"
+            if re.search(rf"\b{open_verbs}\b.*\b{re.escape(app)}\b", text):
                 return "launch_application"
 
-        # ------------------------------------------------------
-        # Generic open/launch/run
-        # ------------------------------------------------------
+        # Common aliases that STT/natural language may express differently.
+        if re.search(r"\b(?:open|launch|start|run|bring\s+up|fire\s+up)\b.*\bgoogle\s+chrome\b", text):
+            return "launch_application"
+        if re.search(r"\b(?:open|launch|start|run)\b.*\b(?:vs\s*code|visual\s+studio\s+code)\b", text):
+            return "launch_application"
 
-        if (
-            text.startswith("open ")
-            or text.startswith("launch ")
-            or text.startswith("run ")
-            or text.startswith("start ")
-        ):
-            if (
-                "find " not in text
-                and "search " not in text
-            ):
-                if "file" in text:
-                    return "open_file"
+        # Natural/Tanglish speech can place the action at the end:
+        # "chrome ah open", "enna chrome open". Preserve that form.
+        if re.search(r"\b(?:open|launch|start|run)\s*$", text):
+            if any(re.search(rf"\b{re.escape(app)}\b", text) for app in apps):
+                return "launch_application"
+        if re.search(r"\b(?:close|exit|quit|terminate|stop)\s*$", text):
+            if any(re.search(rf"\b{re.escape(app)}\b", text) for app in apps):
+                return "close_application"
 
-                # If website was not detected earlier, generic
-                # application launch remains the fallback.
+        # Dedicated Windows utilities are handled by system detector;
+        # keep generic app fallback for unknown application names.
+        if re.match(rf"^{open_verbs}\s+", text):
+            if not re.search(r"\b(?:file|files|folder|folders)\b", text):
                 return "launch_application"
 
         return None
@@ -1943,125 +1966,76 @@ class IntentDetector:
     # SEARCH INTENTS
     # ==========================================================
 
-    def _detect_search_intent(
-        self,
-        text: str,
-    ) -> Optional[str]:
+    def _detect_search_intent(self, text: str) -> Optional[str]:
+        """Detect explicit file-search semantics before AI/code fallbacks."""
+        if not text:
+            return None
+        text = self._basic_normalize(text)
 
-        # ------------------------------------------------------
-        # Extension search
-        # ------------------------------------------------------
+        action = r"(?:find|search|locate|list|show|look\s+for|look\s+up)"
+        file_ref = r"(?:files?|documents?|items?)"
 
-        extensions = (
-            "pdf",
-            "doc",
-            "docx",
-            "txt",
-            "ppt",
-            "pptx",
-            "xls",
-            "xlsx",
-            "csv",
-            "jpg",
-            "jpeg",
-            "png",
-            "mp3",
-            "mp4",
-            "zip",
+        # Extension searches: support ".py", "py extension", "extension py",
+        # "Python files", and common semantic file types.
+        extension_pattern = (
+            r"(?:\.?(?:pdf|docx?|txt|pptx?|xlsx?|csv|jpe?g|png|gif|bmp|"
+            r"mp3|wav|mp4|avi|mkv|zip|py|js|ts|java|cpp|cs|html|css|sql))"
         )
-
-        semantic_file_types = (
-            "word",
-            "excel",
-            "powerpoint",
-            "ppt",
-            "text",
-            "image",
-            "images",
-            "photo",
-            "photos",
-            "video",
-            "videos",
-            "music",
-            "audio",
+        semantic_types = (
+            r"(?:python|javascript|typescript|java|c\+\+|c\s*sharp|html|css|sql|"
+            r"word|excel|powerpoint|text|image|images|photo|photos|video|videos|"
+            r"audio|music|spreadsheet)"
         )
-
-        if any(
-            extension in text
-            for extension in extensions
-        ) or any(
-            value in text
-            for value in semantic_file_types
+        if re.search(
+            rf"\b{action}\b.*\b{file_ref}\b.*(?:extension|type|format)\b",
+            text,
+        ) or re.search(
+            rf"\b{action}\b.*(?:{extension_pattern})\s+(?:{file_ref}|extension)\b",
+            text,
+        ) or re.search(
+            rf"\b{action}\b.*\b(?:{semantic_types})\b.*\b{file_ref}\b",
+            text,
+        ) or re.search(
+            rf"\b{action}\b.*\b{file_ref}\b.*\b(?:{semantic_types})\b",
+            text,
+        ) or re.search(
+            rf"\b{action}\b.*\b{file_ref}\b.*\bextension\b.*(?:{extension_pattern})",
+            text,
         ):
-            if any(
-                keyword in text
-                for keyword in (
-                    "find",
-                    "search",
-                    "show",
-                    "list",
-                    "locate",
-                )
-            ):
-                return "search_extension"
+            return "search_extension"
 
-        # ------------------------------------------------------
-        # Search by size
-        # ------------------------------------------------------
+        # Very explicit extension-only forms.
+        if re.fullmatch(r"(?:search|find|list)\s+(?:for\s+)?(?:the\s+)?(?:\.?\w+)\s+extension", text):
+            return "search_extension"
+        if re.fullmatch(r"(?:search|find|list)\s+(?:for\s+)?files?\s+by\s+extension", text):
+            return "search_extension"
 
-        if any(
-            keyword in text
-            for keyword in (
-                "larger than",
-                "bigger than",
-                "greater than",
-                "above",
-                "over",
-                "under",
-                "less than",
-                "smaller than",
-                "size",
-            )
+        # Size searches, including semantic "large/small files".
+        if (
+            re.search(rf"\b{action}\b.*\b(?:large|larger|big|bigger|small|smaller|tiny|huge)\b.*\b{file_ref}\b", text)
+            or re.search(rf"\b{action}\b.*\b{file_ref}\b.*\b(?:large|larger|big|bigger|small|smaller|tiny|huge)\b", text)
+            or re.search(rf"\b{action}\b.*\b{file_ref}\b.*\b(?:size|larger\s+than|bigger\s+than|greater\s+than|more\s+than|above|over|under|less\s+than|lesser\s+than|smaller\s+than)\b", text)
+            or re.fullmatch(rf"(?:{action})\s+large\s+files?", text)
+            or re.fullmatch(rf"(?:{action})\s+small\s+files?", text)
+            or re.fullmatch(rf"(?:{action})\s+files?\s+by\s+size", text)
         ):
-            if any(
-                keyword in text
-                for keyword in (
-                    "file",
-                    "files",
-                    "find",
-                    "search",
-                    "show",
-                )
-            ):
-                return "search_size"
+            return "search_size"
 
-        # ------------------------------------------------------
-        # Search by date
-        # ------------------------------------------------------
-
-        if any(
-            keyword in text
-            for keyword in (
-                "today",
-                "yesterday",
-                "last week",
-                "last month",
-                "recent",
-                "modified",
-                "created",
-            )
+        # Date searches, including "created today", "modified yesterday",
+        # "files from last week", "recent files", etc.
+        date_terms = (
+            r"(?:today|yesterday|tomorrow|recent(?:ly)?|last\s+week|"
+            r"this\s+week|last\s+month|this\s+month|last\s+year|this\s+year|"
+            r"created|modified|changed|updated|accessed)"
+        )
+        if (
+            re.search(rf"\b{action}\b.*{date_terms}.*\b{file_ref}\b", text)
+            or re.search(rf"\b{action}\b.*\b{file_ref}\b.*{date_terms}", text)
+            or re.search(rf"\b{action}\b.*\b{file_ref}\b.*\bdate\b", text)
+            or re.fullmatch(rf"(?:{action})\s+files?\s+by\s+date", text)
+            or re.fullmatch(rf"(?:{action})\s+files?\s+(?:created|modified|changed|updated|accessed)\s+(?:today|yesterday|recently?)", text)
         ):
-            if any(
-                keyword in text
-                for keyword in (
-                    "file",
-                    "files",
-                    "find",
-                    "search",
-                    "show",
-                )
-            ):
-                return "search_date"
+            return "search_date"
 
         return None
 
@@ -2865,237 +2839,105 @@ class IntentDetector:
     # LOCAL INTENT DETECTION
     # ==========================================================
 
-    def _detect_local_intent(
-        self,
-        text: str,
-    ) -> Optional[str]:
+    def _detect_local_intent(self, text: str) -> Optional[str]:
+        """Resolve deterministic local intents in a high-precision priority order."""
+        if not text:
+            return None
 
-        # ------------------------------------------------------
-        # IMPORTANT:
-        #
-        # Conversation protection happens BEFORE generic
-        # keyword detection.
-        # ------------------------------------------------------
+        text = self._basic_normalize(text)
 
         if not self._is_explicit_automation_command(text):
-
             if self._is_conversational_message(text):
                 return "ai_chat"
 
-        # ------------------------------------------------------
-        # SCREEN CAPTURE / RECORDING FIRST
-        #
-        # These are direct desktop actions. They MUST be checked
-        # before generic application detection because phrases such
-        # as:
-        #
-        #   "start the screen recording"
-        #   "start recording"
-        #
-        # otherwise fall through to the generic "start ->
-        # launch_application" rule.
-        #
-        # Screenshot and recording are also intentionally kept
-        # local so Gemini cannot reinterpret them as another intent.
-        # ------------------------------------------------------
-
+        # 1. Direct desktop capture.
         intent = self._detect_capture_intent(text)
-
         if intent:
             return intent
 
-        # ------------------------------------------------------
-        # Code Agent FIRST
-        #
-        # Programming requests must be routed before generic
-        # "write", "create", "run", and file/application intents.
-        # ------------------------------------------------------
-
-        intent = self._detect_code_agent_intent(text)
-
-        if intent:
-            return intent
-
-        # ------------------------------------------------------
-        # Word FIRST
-        #
-        # Word-specific actions need priority over generic
-        # "type", "save", "copy", etc.
-        # ------------------------------------------------------
-
+        # 2. Word-specific actions.
         intent = self._detect_word_intent(text)
-
         if intent:
             return intent
 
-        # ------------------------------------------------------
-        # Office legacy
-        # ------------------------------------------------------
-
-        intent = self._detect_office_intent(text)
-
-        if intent:
-            return intent
-
-        # ------------------------------------------------------
-        # Folder operations BEFORE generic file operations
-        # ------------------------------------------------------
-
-        intent = self._detect_folder_intent(text)
-
-        if intent:
-            return intent
-
-        # ------------------------------------------------------
-        # File operations
-        # ------------------------------------------------------
-
-        intent = self._detect_file_intent(text)
-
-        if intent:
-            return intent
-
-        # ------------------------------------------------------
-        # Archive
-        # ------------------------------------------------------
-
-        # Already handled inside file detector.
-        # Kept here as an additional safeguard.
-        if (
-            "extract zip" in text
-            or "extract archive" in text
-            or "unzip" in text
-            or "un zip" in text
-        ):
-            return "extract_zip"
-
-        if (
-            "compress file" in text
-            or "create zip" in text
-            or "zip this file" in text
-            or "archive file" in text
-        ):
-            return "compress_file"
-
-        # ------------------------------------------------------
-        # System
-        # ------------------------------------------------------
-
-        intent = self._detect_system_intent(text)
-
-        if intent:
-            return intent
-
-        # ------------------------------------------------------
-        # Browser
-        # ------------------------------------------------------
-
+        # 3. Browser actions before folders/code because terms such as
+        # "music", "downloads", and "youtube" can otherwise collide.
         intent = self._detect_browser_intent(text)
-
         if intent:
             return intent
 
-        # ------------------------------------------------------
-        # Search
-        # ------------------------------------------------------
-
+        # 4. Explicit file-search semantics before code-agent detection.
         intent = self._detect_search_intent(text)
-
         if intent:
             return intent
 
-        # ------------------------------------------------------
-        # Keyboard / mouse
-        # ------------------------------------------------------
+        # 5. Code generation/implementation.
+        intent = self._detect_code_agent_intent(text)
+        if intent:
+            return intent
 
+        # 6. Office.
+        intent = self._detect_office_intent(text)
+        if intent:
+            return intent
+
+        # 7. Folder operations.
+        intent = self._detect_folder_intent(text)
+        if intent:
+            return intent
+
+        # 8. File operations.
+        intent = self._detect_file_intent(text)
+        if intent:
+            return intent
+
+        # 9. System.
+        intent = self._detect_system_intent(text)
+        if intent:
+            return intent
+
+        # 10. Keyboard/mouse.
         intent = self._detect_keyboard_mouse_intent(text)
-
         if intent:
             return intent
 
-        # ------------------------------------------------------
-        # Application
-        # ------------------------------------------------------
-
+        # 11. Application lifecycle.
         intent = self._detect_application_intent(text)
-
         if intent:
             return intent
 
-        # ------------------------------------------------------
-        # Generic save / print
-        # ------------------------------------------------------
-
-        if "save file" in text:
+        # 12. Generic save/print/file operations.
+        if re.search(r"\b(?:save|store)\s+(?:the\s+)?file\b", text):
             return "save_file"
-
-        if "print file" in text:
+        if re.search(r"\bprint\s+(?:the\s+)?file\b", text):
             return "print_file"
-
-        # ------------------------------------------------------
-        # Generic open file
-        # ------------------------------------------------------
-
-        if (
-            text.startswith("open ")
-            and "file" in text
-        ):
+        if re.match(r"^open\b", text) and re.search(r"\bfile\b", text):
             return "open_file"
 
-        # ------------------------------------------------------
-        # Explicit search
-        # ------------------------------------------------------
-
-        if (
-            text.startswith("google search")
-            or text.startswith("search google")
-        ):
+        # 13. Explicit search fallback.
+        if re.match(r"^(?:google\s+search|search\s+google)\b", text):
             return "google_search"
 
-        # ------------------------------------------------------
-        # Generic AI questions
-        # ------------------------------------------------------
-
+        # 14. Conversation.
         question_patterns = (
-            "what is",
-            "who is",
-            "where is",
-            "when is",
-            "why is",
-            "how to",
-            "how does",
-            "tell me",
-            "can you explain",
-            "please explain",
-            "explain",
-            "define",
-            "difference between",
-            "compare",
-            "python pathi",
-            "java pathi",
-            "ai pathi",
-            "machine learning pathi",
-            "deep learning pathi",
-            "enna",
-            "epdi",
-            "yen",
+            r"^what\s+(?:is|are|does|do)\b",
+            r"^who\s+(?:is|are)\b",
+            r"^where\s+(?:is|are)\b",
+            r"^when\s+(?:is|are|does)\b",
+            r"^why\s+(?:is|are|does|do)\b",
+            r"^how\s+(?:to|does|do|can|is|are)\b",
+            r"^tell\s+me\b",
+            r"^(?:can|could|would)\s+you\s+(?:explain|tell|describe)\b",
+            r"^(?:please\s+)?(?:explain|define|describe)\b",
+            r"^difference\s+between\b",
+            r"^compare\b",
+            r"\b(?:python|java|ai|machine\s+learning|deep\s+learning)\s+(?:pathi|pati)\b",
+            r"^(?:enna|epdi|yen|ethuku|etharku)\b",
         )
-
-        if any(
-            pattern in text
-            for pattern in question_patterns
-        ):
+        if any(re.search(pattern, text) for pattern in question_patterns):
             return "ai_chat"
 
-        # ------------------------------------------------------
-        # AI keyword fallback
-        # ------------------------------------------------------
-
-        words = set(text.split())
-
-        if words.intersection(
-            self.ai_keywords
-        ):
+        if set(text.split()).intersection(self.ai_keywords):
             return "ai_chat"
 
         return None
@@ -3448,6 +3290,37 @@ Normalized speech:
             return None
 
     # ==========================================================
+    # LOCAL-ONLY DETECTOR
+    # ==========================================================
+
+    def detect_local_intent_only(
+        self,
+        text: str,
+    ) -> Optional[str]:
+        """Resolve an intent using deterministic local logic only.
+
+        No RapidFuzz or Gemini fallback is used. This is intended for
+        offline diagnostics and routing benchmarks; production
+        ``detect_intent()`` keeps the complete local -> fuzzy -> Gemini flow.
+        """
+        if text is None:
+            return None
+
+        original_text = str(text).strip()
+        if not original_text or len(original_text) <= 1:
+            return None
+
+        normalized_text = self._normalize_text(original_text)
+        if not normalized_text:
+            return None
+
+        capture_intent = self._detect_capture_intent(normalized_text)
+        if capture_intent:
+            return capture_intent
+
+        return self._detect_local_intent(normalized_text)
+
+    # ==========================================================
     # MAIN DETECTOR
     # ==========================================================
 
@@ -3537,7 +3410,7 @@ Normalized speech:
                 return "ai_chat"
 
         # ==================================================
-        # STEP 2
+        # STEP 3
         # Local deterministic detection
         # ==================================================
 
@@ -3549,7 +3422,7 @@ Normalized speech:
             return local_intent
 
         # ==================================================
-        # STEP 3
+        # STEP 4
         # RapidFuzz fallback
         # ==================================================
 
@@ -3581,7 +3454,7 @@ Normalized speech:
                 return fuzzy_intent
 
         # ==================================================
-        # STEP 4
+        # STEP 5
         # Gemini semantic fallback
         # ==================================================
 
