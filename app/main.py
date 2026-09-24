@@ -52,17 +52,6 @@ def dheepthi_qt_message_handler(
     # ---------------------------------------------------------
     # Known Qt warning
     # ---------------------------------------------------------
-    #
-    # This warning:
-    #
-    #   QFont::setPointSize: Point size <= 0 (-1)
-    #
-    # has been isolated to the window-control hover path.
-    #
-    # It is not an application crash or functional error.
-    #
-    # Do not print it to the terminal.
-    #
 
     if (
         "QFont::setPointSize" in message
@@ -148,7 +137,7 @@ def main():
     )
 
     app.setApplicationName(
-        "ASTRA-AI"
+        "DHEEPTHI-AI"
     )
 
     app.setApplicationVersion(
@@ -156,15 +145,25 @@ def main():
     )
 
     app.setOrganizationName(
-        "ASTRA"
+        "DHEEPTHI"
     )
 
     # ---------------------------------------------------------
     # Application Icon
     # ---------------------------------------------------------
+    #
+    # IMPORTANT:
+    #
+    # The Windows application/taskbar icon uses the generated
+    # multi-resolution DHEEPTHI ICO.
+    #
+    # The custom title-bar logo remains completely separate
+    # and continues using dheepthi_logo-2.png inside
+    # main_window.py.
+    #
 
     icon_path = os.path.abspath(
-        "ui/assets/dheepthi_logo-2.png"
+        "ui/assets/dheepthi.ico"
     )
 
     if os.path.exists(
@@ -175,6 +174,7 @@ def main():
             icon_path
         )
 
+        # Application-level icon.
         app.setWindowIcon(
             app_icon
         )
@@ -184,7 +184,7 @@ def main():
         app_icon = QIcon()
 
         print(
-            "Warning : Application icon not found."
+            "Warning : DHEEPTHI application icon not found."
         )
 
     # ---------------------------------------------------------
@@ -195,7 +195,21 @@ def main():
 
     window = MainWindow()
 
+    # ---------------------------------------------------------
+    # IMPORTANT:
+    #
+    # Re-apply the application ICO after MainWindow creation.
+    #
+    # MainWindow may assign its own window icon during
+    # construction. This ensures the final window/taskbar
+    # icon comes from dheepthi.ico.
+    # ---------------------------------------------------------
+
     window.setWindowIcon(
+        app_icon
+    )
+
+    QApplication.instance().setWindowIcon(
         app_icon
     )
 
