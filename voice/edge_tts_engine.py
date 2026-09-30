@@ -4,36 +4,21 @@ voice/edge_tts_engine.py
 ASTRA-AI
 Premium Microsoft Edge Neural TTS Engine
 
-Features
---------
-✓ Microsoft Edge Neural Voice
-✓ Faster Response
-✓ Blocking + Non-blocking API
-✓ Thread Safe
-✓ Stop Current Speech
-✓ Request Generation Protection
-✓ Queue Safe
-✓ Auto Cleanup
-✓ Explicit Success / Failure Reporting
-✓ Rate Support
-✓ Volume Support
+Streaming/cancellation compatible Edge TTS provider.
 
-IMPORTANT
----------
-Each speech request receives a generation ID.
+Provider responsibilities
+-------------------------
+* Generate Edge Neural TTS audio.
+* Play one request at a time.
+* Invalidate stale requests immediately on stop/new request.
+* Expose blocking and non-blocking APIs.
+* Keep temporary audio files isolated per request.
+* Allow TextToSpeech / StreamingTTSManager to cancel playback safely.
 
-When stop() or a new speak() request occurs:
-
-    Old generation
-        ↓
-    Invalidated
-        ↓
-    Playback stopped
-        ↓
-    Old worker cannot continue successfully
-
-This prevents an older worker from incorrectly
-continuing after a newer request has started.
+Note:
+Edge TTS generation itself produces an audio file before pygame playback.
+Sentence-level streaming is therefore handled by StreamingTTSManager,
+which sends small completed text units to this engine one at a time.
 """
 
 from __future__ import annotations
@@ -47,936 +32,393 @@ import edge_tts
 import pygame
 
 
-# ============================================================
-# EDGE TTS ENGINE
-# ============================================================
-
 class EdgeTTSEngine:
 
-    # ========================================================
-    # INITIALIZATION
-    # ========================================================
-
     def __init__(self):
-
-        # ----------------------------------------------------
-        # VOICE SETTINGS
-        # ----------------------------------------------------
-
         self.voice = "en-IN-NeerjaNeural"
-
         self.rate = 0
-
         self.volume = 100
 
-        # ----------------------------------------------------
-        # THREAD SAFETY
-        # ----------------------------------------------------
-
         self.lock = threading.RLock()
-
-        # ----------------------------------------------------
-        # CURRENT NON-BLOCKING THREAD
-        # ----------------------------------------------------
-
         self.current_thread = None
 
-        # ----------------------------------------------------
-        # STATE
-        # ----------------------------------------------------
-
         self.is_speaking = False
-
         self._closed = False
 
-        # ----------------------------------------------------
-        # REQUEST GENERATION
-        #
-        # Every request receives a unique generation number.
-        #
-        # stop() invalidates the active generation.
-        #
-        # This prevents old workers from becoming active again
-        # after a new request clears a shared event.
-        # ----------------------------------------------------
-
+        # Monotonically increasing ownership generation.
         self._generation = 0
-
-        # ----------------------------------------------------
-        # CURRENT PLAYBACK FILE
-        # ----------------------------------------------------
-
         self._current_filename = None
 
-        # ----------------------------------------------------
-        # INITIALIZE PYGAME MIXER
-        # ----------------------------------------------------
-
         try:
-
             if not pygame.mixer.get_init():
-
                 pygame.mixer.init()
-
         except Exception as error:
-
-            print(
-                f"Edge TTS Mixer Init Error : {error}"
-            )
+            print(f"Edge TTS Mixer Init Error : {error}")
 
     # ========================================================
-    # REQUEST GENERATION
+    # GENERATION / OWNERSHIP
     # ========================================================
 
-    def _next_generation(self):
-        """
-        Create and return a new active generation ID.
-        """
-
+    def _next_generation(self) -> int:
         with self.lock:
-
             self._generation += 1
-
             return self._generation
 
-    def _is_generation_active(
-        self,
-        generation: int,
-    ):
-        """
-        Return True only if this worker still owns
-        the currently active Edge TTS request.
-        """
-
+    def _is_generation_active(self, generation: int) -> bool:
         if self._closed:
-
             return False
 
         with self.lock:
-
-            return (
-                generation
-                == self._generation
-            )
+            return generation == self._generation
 
     # ========================================================
-    # FORMAT RATE
+    # FORMAT SETTINGS
     # ========================================================
 
-    def _get_edge_rate(self):
-        """
-        Convert integer rate into Edge TTS rate format.
-
-        Examples:
-
-            0    -> +0%
-            20   -> +20%
-            -20  -> -20%
-        """
-
+    def _get_edge_rate(self) -> str:
         try:
-
-            rate = int(
-                self.rate
-            )
-
-        except (
-            TypeError,
-            ValueError,
-        ):
-
+            rate = int(self.rate)
+        except (TypeError, ValueError):
             rate = 0
 
-        # Keep the value within a reasonable range.
+        rate = max(-100, min(100, rate))
+        return f"+{rate}%" if rate >= 0 else f"{rate}%"
 
-        rate = max(
-            -100,
-            min(
-                100,
-                rate,
-            ),
-        )
-
-        if rate >= 0:
-
-            return f"+{rate}%"
-
-        return f"{rate}%"
-
-    # ========================================================
-    # FORMAT VOLUME
-    # ========================================================
-
-    def _get_edge_volume(self):
-        """
-        Convert integer volume into Edge TTS volume format.
-
-        Examples:
-
-            100 -> +0%
-            80  -> -20%
-            120 -> +20%
-        """
-
+    def _get_edge_volume(self) -> str:
         try:
-
-            volume = int(
-                self.volume
-            )
-
-        except (
-            TypeError,
-            ValueError,
-        ):
-
+            volume = int(self.volume)
+        except (TypeError, ValueError):
             volume = 100
 
-        volume = max(
-            0,
-            min(
-                200,
-                volume,
-            ),
-        )
-
-        edge_volume = (
-            volume
-            - 100
-        )
-
-        if edge_volume >= 0:
-
-            return (
-                f"+{edge_volume}%"
-            )
-
-        return (
-            f"{edge_volume}%"
-        )
+        volume = max(0, min(200, volume))
+        edge_volume = volume - 100
+        return f"+{edge_volume}%" if edge_volume >= 0 else f"{edge_volume}%"
 
     # ========================================================
-    # GENERATE SPEECH
+    # GENERATION
     # ========================================================
 
-    async def _generate(
-        self,
-        text,
-        filename,
-    ):
-        """
-        Generate Edge TTS audio.
-        """
-
+    async def _generate(self, text: str, filename: str):
         communicate = edge_tts.Communicate(
-
             text=text,
-
             voice=self.voice,
-
             rate=self._get_edge_rate(),
-
             volume=self._get_edge_volume(),
-
         )
-
-        await communicate.save(
-            filename
-        )
+        await communicate.save(filename)
 
     # ========================================================
-    # INTERNAL BLOCKING SPEECH
+    # BLOCKING SPEECH
     # ========================================================
 
-    def speak_blocking(
-        self,
-        text,
-    ):
+    def speak_blocking(self, text):
         """
-        Generate and play Edge TTS synchronously.
+        Generate and play one Edge TTS segment.
 
-        Returns
-        -------
-        bool
-
-            True
-                Edge TTS completed successfully.
-
-            False
-                Edge TTS failed or was cancelled.
-
-        IMPORTANT
-        ---------
-        This method does NOT perform fallback.
-
-        TextToSpeech decides whether Piper or pyttsx3
-        should be used after Edge failure.
+        Returns True only when the complete segment was generated
+        and played by the request that still owns the generation.
         """
-
-        if self._closed:
-
+        if self._closed or text is None:
             return False
 
-        if text is None:
-
-            return False
-
-        text = str(
-            text
-        ).strip()
-
+        text = str(text).strip()
         if not text:
-
             return False
 
-        # ----------------------------------------------------
-        # CREATE REQUEST GENERATION
-        # ----------------------------------------------------
-
-        generation = (
-            self._next_generation()
-        )
-
+        generation = self._next_generation()
         filename = None
-
         loop = None
-
         playback_started = False
 
         try:
-
-            # ------------------------------------------------
-            # REQUEST STILL ACTIVE?
-            # ------------------------------------------------
-
-            if not self._is_generation_active(
-                generation
-            ):
-
+            if not self._is_generation_active(generation):
                 return False
 
-            # ------------------------------------------------
-            # MARK SPEAKING
-            # ------------------------------------------------
-
             with self.lock:
-
-                if not self._is_generation_active(
-                    generation
-                ):
-
+                if not self._is_generation_active(generation):
                     return False
-
                 self.is_speaking = True
 
-            # ------------------------------------------------
-            # CREATE TEMPORARY MP3 FILE
-            # ------------------------------------------------
-
             temp = tempfile.NamedTemporaryFile(
-
                 delete=False,
-
                 suffix=".mp3",
-
             )
-
             filename = temp.name
-
             temp.close()
 
             with self.lock:
+                if self._is_generation_active(generation):
+                    self._current_filename = filename
 
-                if self._is_generation_active(
-                    generation
-                ):
-
-                    self._current_filename = (
-                        filename
-                    )
-
-            # ------------------------------------------------
-            # CREATE EVENT LOOP
-            # ------------------------------------------------
-
+            # -----------------------------------------------
+            # Generate audio
+            # -----------------------------------------------
             loop = asyncio.new_event_loop()
 
-            # ------------------------------------------------
-            # GENERATE EDGE SPEECH
-            # ------------------------------------------------
-
             try:
-
+                asyncio.set_event_loop(loop)
                 loop.run_until_complete(
-
-                    self._generate(
-
-                        text,
-
-                        filename,
-
-                    )
-
+                    self._generate(text, filename)
                 )
-
             except Exception as error:
-
-                print(
-
-                    f"Edge TTS Generate Error : "
-                    f"{error}"
-
-                )
-
+                print(f"Edge TTS Generate Error : {error}")
                 return False
-
             finally:
-
                 try:
-
                     loop.close()
-
                 except Exception:
-
+                    pass
+                loop = None
+                try:
+                    asyncio.set_event_loop(None)
+                except Exception:
                     pass
 
-                loop = None
-
-            # ------------------------------------------------
-            # REQUEST CANCELLED WHILE GENERATING?
-            # ------------------------------------------------
-
-            if not self._is_generation_active(
-                generation
-            ):
-
+            if not self._is_generation_active(generation):
                 return False
 
-            # ------------------------------------------------
-            # VALIDATE GENERATED FILE
-            # ------------------------------------------------
-
-            if not os.path.exists(
-                filename
-            ):
-
+            if not os.path.exists(filename):
                 print(
-
-                    "Edge TTS Error : "
-                    "Generated audio file not found."
-
+                    "Edge TTS Error : Generated audio file not found."
                 )
-
                 return False
-
-            if os.path.getsize(
-                filename
-            ) == 0:
-
-                print(
-
-                    "Edge TTS Error : "
-                    "Generated audio file is empty."
-
-                )
-
-                return False
-
-            # ------------------------------------------------
-            # REQUEST STILL ACTIVE BEFORE PLAYBACK?
-            # ------------------------------------------------
-
-            if not self._is_generation_active(
-                generation
-            ):
-
-                return False
-
-            # ------------------------------------------------
-            # PLAYBACK
-            # ------------------------------------------------
 
             try:
+                if os.path.getsize(filename) == 0:
+                    print(
+                        "Edge TTS Error : Generated audio file is empty."
+                    )
+                    return False
+            except OSError:
+                return False
 
-                pygame.mixer.music.load(
-                    filename
-                )
+            # -----------------------------------------------
+            # Playback
+            # -----------------------------------------------
+            try:
+                if not self._is_generation_active(generation):
+                    return False
 
-                # --------------------------------------------
-                # Re-check ownership immediately before play.
-                # --------------------------------------------
+                pygame.mixer.music.load(filename)
 
-                if not self._is_generation_active(
-                    generation
-                ):
-
+                if not self._is_generation_active(generation):
                     try:
-
                         pygame.mixer.music.stop()
-
                     except Exception:
-
                         pass
-
                     return False
 
                 pygame.mixer.music.play()
-
                 playback_started = True
 
             except Exception as error:
-
-                print(
-
-                    f"Edge TTS Playback Error : "
-                    f"{error}"
-
-                )
-
+                print(f"Edge TTS Playback Error : {error}")
                 return False
 
-            # ------------------------------------------------
-            # WAIT FOR PLAYBACK
-            # ------------------------------------------------
-
+            # -----------------------------------------------
+            # Wait until this segment finishes or is cancelled.
+            # -----------------------------------------------
             while True:
-
-                # --------------------------------------------
-                # OLD REQUEST?
-                # --------------------------------------------
-
-                if not self._is_generation_active(
-                    generation
-                ):
-
+                if not self._is_generation_active(generation):
                     return False
-
-                # --------------------------------------------
-                # PLAYBACK FINISHED?
-                # --------------------------------------------
 
                 try:
-
                     if not pygame.mixer.music.get_busy():
-
                         break
-
                 except Exception:
-
                     return False
 
-                pygame.time.wait(
-                    10
-                )
+                # Short polling interval keeps cancellation responsive.
+                pygame.time.wait(8)
 
-            # ------------------------------------------------
-            # FINAL OWNERSHIP CHECK
-            # ------------------------------------------------
-
-            if not self._is_generation_active(
-                generation
-            ):
-
-                return False
-
-            return True
+            return self._is_generation_active(generation)
 
         except Exception as error:
-
-            print(
-
-                f"Edge TTS Error : "
-                f"{error}"
-
-            )
-
+            print(f"Edge TTS Error : {error}")
             return False
 
         finally:
+            is_active = self._is_generation_active(generation)
 
-            # ------------------------------------------------
-            # CLEANUP EVENT LOOP
-            # ------------------------------------------------
-
-            if loop is not None:
-
-                try:
-
-                    loop.close()
-
-                except Exception:
-
-                    pass
-
-            # ------------------------------------------------
-            # ONLY ACTIVE GENERATION MAY STOP/UNLOAD AUDIO
-            #
-            # This is important because an old worker must
-            # never stop audio belonging to a newer request.
-            # ------------------------------------------------
-
-            is_active = (
-                self._is_generation_active(
-                    generation
-                )
-            )
-
+            # Only the current owner may touch shared playback state.
             if is_active:
-
                 try:
-
                     if playback_started:
-
                         pygame.mixer.music.stop()
-
                 except Exception:
-
                     pass
 
                 try:
-
                     pygame.mixer.music.unload()
-
                 except Exception:
-
                     pass
-
-            # ------------------------------------------------
-            # DELETE TEMP FILE
-            # ------------------------------------------------
 
             if filename:
-
                 try:
-
-                    if os.path.exists(
-                        filename
-                    ):
-
-                        os.remove(
-                            filename
-                        )
-
+                    if os.path.exists(filename):
+                        os.remove(filename)
                 except Exception:
-
                     pass
 
-            # ------------------------------------------------
-            # CLEAR STATE ONLY IF THIS IS STILL THE ACTIVE
-            # REQUEST.
-            # ------------------------------------------------
-
             with self.lock:
-
-                if (
-                    generation
-                    == self._generation
-                ):
-
-                    if (
-                        self._current_filename
-                        == filename
-                    ):
-
+                if generation == self._generation:
+                    if self._current_filename == filename:
                         self._current_filename = None
-
                     self.is_speaking = False
 
     # ========================================================
-    # NON-BLOCKING SPEAK
+    # NON-BLOCKING SPEECH
     # ========================================================
 
-    def speak(
-        self,
-        text,
-    ):
+    def speak(self, text):
         """
-        Non-blocking speech API.
+        Start one asynchronous Edge TTS segment.
 
-        Returns
-        -------
-        threading.Thread | None
+        TextToSpeech normally owns request-level cancellation, so
+        this method also invalidates any older Edge request.
         """
-
-        if self._closed:
-
+        if self._closed or text is None:
             return None
 
-        if text is None:
-
-            return None
-
-        text = str(
-            text
-        ).strip()
-
+        text = str(text).strip()
         if not text:
-
             return None
-
-        # ----------------------------------------------------
-        # STOP PREVIOUS REQUEST
-        # ----------------------------------------------------
 
         self.stop()
 
-        # ----------------------------------------------------
-        # START NEW THREAD
-        #
-        # speak_blocking() creates its own generation.
-        # ----------------------------------------------------
-
         worker = threading.Thread(
-
             target=self.speak_blocking,
-
-            args=(
-                text,
-            ),
-
+            args=(text,),
             daemon=True,
-
             name="ASTRA-Edge-TTS",
-
         )
 
         with self.lock:
-
             self.current_thread = worker
 
         worker.start()
-
         return worker
 
     # ========================================================
-    # STOP
+    # STOP / CANCEL
     # ========================================================
 
-    def stop(
-        self,
-    ):
+    def stop(self):
         """
-        Stop the current Edge TTS request.
+        Invalidate the current request before stopping playback.
 
-        The active generation is invalidated before
-        playback is stopped.
-
-        Therefore an old worker cannot continue and
-        report a successful completion later.
+        This ordering prevents an old worker from becoming valid again.
         """
-
         with self.lock:
-
-            # ------------------------------------------------
-            # INVALIDATE ACTIVE REQUEST
-            # ------------------------------------------------
-
             self._generation += 1
-
             self.is_speaking = False
-
             self._current_filename = None
 
-        # ----------------------------------------------------
-        # STOP PYGAME PLAYBACK
-        # ----------------------------------------------------
-
         try:
-
             if pygame.mixer.get_init():
-
                 pygame.mixer.music.stop()
-
         except Exception:
-
             pass
 
-        # ----------------------------------------------------
-        # UNLOAD CURRENT MUSIC
-        # ----------------------------------------------------
-
         try:
-
             if pygame.mixer.get_init():
-
                 pygame.mixer.music.unload()
-
         except Exception:
-
             pass
 
+    cancel = stop
+
     # ========================================================
-    # VOICE
+    # SETTINGS
     # ========================================================
 
-    def set_voice(
-        self,
-        voice,
-    ):
-        """
-        Set Microsoft Edge Neural voice.
-
-        Example:
-
-            en-IN-NeerjaNeural
-            en-IN-PrabhatNeural
-        """
-
+    def set_voice(self, voice):
         if voice:
+            self.voice = str(voice).strip()
 
-            self.voice = str(
-                voice
-            ).strip()
-
-    # ========================================================
-    # RATE
-    # ========================================================
-
-    def set_rate(
-        self,
-        rate,
-    ):
-        """
-        Set Edge speech rate.
-
-        Recommended range:
-
-            -100 to 100
-        """
-
+    def set_rate(self, rate):
         try:
-
-            self.rate = int(
-                rate
-            )
-
-        except (
-            TypeError,
-            ValueError,
-        ):
-
+            self.rate = int(rate)
+        except (TypeError, ValueError):
             self.rate = 0
 
-    # ========================================================
-    # VOLUME
-    # ========================================================
-
-    def set_volume(
-        self,
-        volume,
-    ):
-        """
-        Set Edge speech volume.
-
-        100 = normal volume.
-
-        Range:
-
-            0 to 200
-        """
-
+    def set_volume(self, volume):
         try:
-
-            self.volume = int(
-                volume
-            )
-
-        except (
-            TypeError,
-            ValueError,
-        ):
-
+            self.volume = int(volume)
+        except (TypeError, ValueError):
             self.volume = 100
 
     # ========================================================
     # STATUS
     # ========================================================
 
-    def speaking(
-        self,
-    ):
-        """
-        Return True when Edge TTS is currently active.
-        """
-
+    def speaking(self):
         with self.lock:
-
             if self.is_speaking:
-
                 return True
 
         try:
-
             if (
-
                 pygame.mixer.get_init()
-
-                and
-
-                pygame.mixer.music.get_busy()
-
+                and pygame.mixer.music.get_busy()
             ):
-
                 return True
-
         except Exception:
-
             pass
 
         return False
+
+    def wait_until_done(self, timeout=None):
+        """
+        Wait for current Edge playback to finish.
+
+        Returns True when no active playback remains, False on timeout.
+        """
+        start = __import__("time").monotonic()
+
+        while self.speaking():
+            if self._closed:
+                return True
+
+            if timeout is not None:
+                try:
+                    if (__import__("time").monotonic() - start) >= float(timeout):
+                        return False
+                except (TypeError, ValueError):
+                    pass
+
+            __import__("time").sleep(0.01)
+
+        return True
 
     # ========================================================
     # CLEANUP
     # ========================================================
 
-    def close(
-        self,
-    ):
-        """
-        Shutdown Edge TTS engine.
-
-        pygame mixer is intentionally NOT quit here
-        because other ASTRA TTS providers may share it.
-        """
-
+    def close(self):
         if self._closed:
-
             return
 
-        self._closed = True
-
+        # Invalidate and stop before marking the object closed so the
+        # active worker observes the generation change.
         self.stop()
+        self._closed = True
 
         worker = self.current_thread
 
         if (
-
             worker is not None
-
             and worker.is_alive()
-
-            and worker
-            is not threading.current_thread()
-
+            and worker is not threading.current_thread()
         ):
-
             try:
-
-                worker.join(
-                    timeout=1.0
-                )
-
+                worker.join(timeout=1.0)
             except Exception:
-
                 pass
 
         with self.lock:
-
             self.current_thread = None
-
             self._current_filename = None
-
             self.is_speaking = False
 
-        print(
-            "Edge TTS Engine shutdown completed."
-        )
+        print("Edge TTS Engine shutdown completed.")

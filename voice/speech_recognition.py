@@ -68,7 +68,15 @@ class SpeechRecognizer:
     # ==================================================
 
     COMMAND_TIMEOUT = 5
-    COMMAND_PHRASE_TIME_LIMIT = 20
+    COMMAND_PHRASE_TIME_LIMIT = int(
+        os.getenv("DHEEPTHI_COMMAND_PHRASE_TIME_LIMIT", "12")
+    )
+    COMMAND_PAUSE_THRESHOLD = float(
+        os.getenv("DHEEPTHI_COMMAND_PAUSE_THRESHOLD", "0.55")
+    )
+    COMMAND_NON_SPEAKING_DURATION = float(
+        os.getenv("DHEEPTHI_COMMAND_NON_SPEAKING_DURATION", "0.30")
+    )
 
     # ==================================================
     # MICROPHONE SETTINGS
@@ -1846,6 +1854,31 @@ class SpeechRecognizer:
     ):
 
         self.level_callback = callback
+
+    # ==================================================
+    # COMMAND-MODE STATUS / STOP
+    # ==================================================
+
+    def is_listening(self):
+        """Return whether the legacy command STT path is active."""
+        return bool(self._manual_listening)
+
+    def cancel_listening(self):
+        """Cooperatively cancel command-mode listening and its audio meter."""
+        self._stop_requested = True
+        self._manual_listening = False
+
+        try:
+            self.stop_audio_meter()
+        except Exception:
+            pass
+
+        self._emit_audio_level(0.0)
+
+    def stop(self):
+        """Compatibility stop method for UI shutdown/cancellation."""
+        self.cancel_listening()
+        self.stop_wake_word()
 
     # ==================================================
     # CLEANUP

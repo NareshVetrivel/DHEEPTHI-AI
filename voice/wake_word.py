@@ -225,7 +225,7 @@ class WakeWordDetector:
     FEATURE_DIMENSION = 96
 
     # Detection
-    DEFAULT_THRESHOLD = 0.000250
+    DEFAULT_THRESHOLD = 0.000350 #0.000400
 
     REQUIRED_CONSECUTIVE_DETECTIONS = 2
 
@@ -317,6 +317,7 @@ class WakeWordDetector:
 
         self._running = False
         self._closed = False
+        self._suspended = False
 
         self._armed = True
 
@@ -1864,6 +1865,8 @@ class WakeWordDetector:
 
             armed = self._armed
 
+            suspended = self._suspended
+
             waiting_for_release = (
                 self._waiting_for_release
             )
@@ -2375,6 +2378,7 @@ class WakeWordDetector:
         with self._state_lock:
 
             self._running = True
+            self._suspended = False
 
             self._armed = True
 
@@ -2532,6 +2536,113 @@ class WakeWordDetector:
         return True
 
     # ==================================================================
+    # PAUSE / RESUME FOR CONVERSATION
+    # ==================================================================
+
+    def pause_for_conversation(self) -> bool:
+        """
+        Temporarily release the microphone while preserving the loaded
+        wake-word model and calibrated noise floor.
+
+        This is intended for Gemini Live / conversation mode.  It avoids
+        destroying the detector state and avoids forcing a full model load
+        and ambient-noise calibration when conversation mode finishes.
+        """
+
+        self._ensure_locks()
+
+        with self._state_lock:
+            if self._closed:
+                return False
+
+            if self._suspended:
+                return True
+
+            self._suspended = True
+            self._running = False
+            self._armed = False
+            self._waiting_for_release = False
+
+        self._reset_confirmation()
+
+        stream = self._stream
+        self._stream = None
+
+        if stream is not None:
+            try:
+                stream.stop()
+            except Exception:
+                pass
+            try:
+                stream.close()
+            except Exception:
+                pass
+
+        print("🎤 DHEEPTHI wake listener paused for conversation.")
+        return True
+
+    def resume_after_conversation(self) -> bool:
+        """
+        Resume wake-word detection without reloading the model or
+        recalibrating the ambient noise floor.
+        """
+
+        self._ensure_locks()
+
+        with self._state_lock:
+            if self._closed:
+                return False
+
+            if not self._suspended:
+                return self.is_running()
+
+            self._suspended = False
+            self._running = True
+            self._armed = True
+            self._waiting_for_release = False
+            self._last_detection_time = 0.0
+            self._last_positive_time = 0.0
+            self._last_active_time = time.monotonic()
+
+        if not self.is_model_loaded():
+            with self._state_lock:
+                self._running = False
+            return self.load_model() and self.start()
+
+        self._reset_confirmation()
+        self._reset_model_state()
+
+        with self._audio_lock:
+            self._wake_score = 0.0
+            self._peak_wake_score = 0.0
+            self._speech_ratio = 0.0
+            self._speech_detected = False
+
+        try:
+            stream = sd.InputStream(
+                samplerate=self.SAMPLE_RATE,
+                channels=self.CHANNELS,
+                dtype="int16",
+                blocksize=self.BLOCK_SIZE,
+                callback=self._audio_callback,
+                device=None,
+                latency="low",
+            )
+            stream.start()
+            self._stream = stream
+
+        except Exception as error:
+            self._stream = None
+            with self._state_lock:
+                self._running = False
+                self._armed = False
+            print(f"❌ Failed to resume DHEEPTHI wake listener: {error}")
+            return False
+
+        print("🎤 DHEEPTHI wake listener resumed after conversation.")
+        return True
+
+    # ==================================================================
     # RE-ARM
     # ==================================================================
 
@@ -2588,6 +2699,7 @@ class WakeWordDetector:
                 return True
 
             self._running = False
+            self._suspended = False
 
             self._armed = False
 
@@ -2668,6 +2780,7 @@ class WakeWordDetector:
         with self._state_lock:
 
             self._closed = True
+            self._suspended = False
 
             self._armed = False
 
@@ -2889,6 +3002,10 @@ class WakeWordDetector:
                 armed
             ),
 
+            "suspended": (
+                suspended
+            ),
+
             "waiting_for_release": (
                 waiting_for_release
             ),
@@ -3029,3 +3146,6 @@ class WakeWordDetector:
                 self.MAX_CONFIRMATION_GAP_SECONDS
             ),
         }
+
+# Public API expected by ui.main_window.py
+__all__ = ["WakeWordDetector"]

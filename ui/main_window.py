@@ -2,9 +2,21 @@ import os
 import re
 import html
 import random
+import queue
+import threading
 from pathlib import Path
 
 from dotenv import load_dotenv
+
+try:
+    import sounddevice as sd
+except Exception:
+    sd = None
+
+try:
+    from voice.microphone_monitor import MicrophoneMuteMonitor
+except Exception:
+    MicrophoneMuteMonitor = None
 
 
 # =====================================================
@@ -106,10 +118,8 @@ from ui.widgets.system_osd import SystemOSD
 
 from voice.speech_recognition import SpeechRecognizer
 from voice.text_to_speech import TextToSpeech
+from voice.streaming_tts_manager import StreamingTTSManager
 
-# Production DHEEPTHI wake-word detector:
-# openWakeWord + TFLite, owned by wake_word.py.
-from voice.wake_word import WakeWordDetector
 
 from planner.intent_detector import IntentDetector
 from planner.entity_extractor import EntityExtractor
@@ -163,151 +173,19 @@ CLOSE_GREETINGS = [
 # Voice Worker
 # =====================================================
 
-class WakeWordWorker(QThread):
-
-    @staticmethod
-    def _safe_qfont(family: str, pixel_size: int, *, bold: bool = False) -> QFont:
-        """Create a Qt font with an explicit, always-positive pixel size."""
-        font = QFont(family)
-        font.setPixelSize(max(1, int(pixel_size)))
-        font.setBold(bool(bold))
-        return font
 
 
-    """Background worker dedicated to the production DHEEPTHI detector.
-
-    Wake detection is completely separate from command STT:
-        WakeWordDetector -> DHEEPTHI detected -> stop detector -> MainWindow
-        -> existing Listening/TTS/manual STT command pipeline.
-    """
-
-    wake_detected = Signal(str)
-    finished = Signal()
-    audio_level = Signal(float)
-
-    def __init__(self, detector):
-        super().__init__()
-        self.detector = detector
-        self._stop = False
-        self._detected_emitted = False
-
-        if self.detector is not None:
-            self.detector.on_detected = self._on_detected
-            self.detector.level_callback = self._on_level
-
-    def _on_detected(self, wake_word):
-        if self._stop or self._detected_emitted:
-            return
-
-        self._detected_emitted = True
-        print(f"⚡ Production wake word detected: {wake_word}")
-        self.wake_detected.emit(str(wake_word))
-
-    def _on_level(self, level):
-        try:
-            self.audio_level.emit(float(level))
-        except Exception:
-            pass
-
-    def run(self):
-        """
-        Run the production DHEEPTHI wake-word detector.
-
-        WakeWordDetector owns the actual microphone stream and blocks
-        inside detector.start() until stop() is requested.
-
-        This worker must NEVER use SpeechRecognizer or wake_word_mode.
-        """
-
-        try:
-
-            if (
-                self._stop
-                or self.isInterruptionRequested()
-            ):
-                return
-
-            if self.detector is None:
-
-                print(
-                    "❌ WakeWordWorker cannot start: "
-                    "WakeWordDetector is unavailable."
-                )
-
-                return
-
-            print(
-                "🎤 Production DHEEPTHI listener active."
-            )
-
-            started = self.detector.start()
-
-            if not started:
-
-                print(
-                    "⚠️ Production DHEEPTHI listener "
-                    "could not start."
-                )
-
-                return
-
-            # detector.start() returns after the detector has been
-            # stopped. Keep the worker alive while the detector owns
-            # the microphone.
-            while (
-                not self._stop
-                and not self.isInterruptionRequested()
-            ):
-
-                if not self.detector.is_running():
-
-                    break
-
-                self.msleep(100)
-
-        except Exception as error:
-
-            print(
-                f"WakeWordWorker Error : {error}"
-            )
-
-        finally:
-
-            # Make sure the production detector releases the microphone
-            # if the worker exits for any reason.
-            try:
-
-                if self.detector is not None:
-
-                    self.detector.stop()
-
-            except Exception as error:
-
-                print(
-                    f"Wake detector final stop error: {error}"
-                )
-
-            self.finished.emit()
-
-    def stop(self):
-        """Stop the production detector without blocking the GUI thread."""
-        self._stop = True
-        self.requestInterruption()
-
-        try:
-            if self.detector is not None:
-                self.detector.stop()
-        except Exception as error:
-            print(f"Wake detector stop error: {error}")
-
+# =====================================================
+# Gemini Live Audio Worker
+# =====================================================
 
 class VoiceWorker(QThread):
     """Background worker for existing manual command STT.
 
     IMPORTANT:
-        This worker no longer performs wake-word recognition.
-        Production DHEEPTHI detection belongs exclusively to WakeWordWorker.
-        The existing SpeechRecognizer command-capture path is preserved.
+        This legacy worker is retained for compatibility with existing
+        command/selection flows. Normal V1 voice interaction is handled
+        directly by Gemini Live; no wake-word listener is used.
     """
 
     command_ready = Signal(str)
@@ -318,7 +196,9 @@ class VoiceWorker(QThread):
         super().__init__()
         self.recognizer = recognizer
         self.tts = tts
-        self.wake_word_mode = bool(wake_word_mode)
+        # Kept only for backward compatibility with old callers.
+        # No wake-word runtime is started or consulted.
+        self.wake_word_mode = False
         self._stop = False
         self._command_emitted = False
         self.timed_out = False
@@ -443,10 +323,6 @@ class VoiceWorker(QThread):
             pass
 
 
-# =====================================================
-# Gemini Conversation Worker
-# =====================================================
-
 class ChatWorker(QThread):
     """
     Background worker for Gemini conversation.
@@ -536,10 +412,6 @@ class ChatWorker(QThread):
             )
 
 
-# =====================================================
-# DHEEPTHI Code Agent Worker
-# =====================================================
-
 class CodeAgentWorker(QThread):
     """
     Run the complete Code Agent dispatcher workflow outside the
@@ -619,10 +491,6 @@ class CodeAgentWorker(QThread):
             self.error_occurred.emit(str(error))
 
 
-# =====================================================
-# Vision Worker
-# =====================================================
-
 class VisionWorker(QThread):
     """Run cloud Gemini Vision analysis outside the Qt GUI thread."""
 
@@ -681,9 +549,6 @@ only; do not perform or suggest automation actions.
                 f"I could not analyze the current screen: {error}"
             )
 
-# =====================================================
-# Custom Application Title Bar
-# =====================================================
 
 class ApplicationTitleBar(QWidget):
     """Custom DHEEPTHI-AI title bar used instead of the native Windows bar.
@@ -867,6 +732,194 @@ class ApplicationTitleBar(QWidget):
         super().mouseDoubleClickEvent(event)
 
 
+class GeminiLiveAudioWorker(QThread):
+    """Bridge the physical microphone/speaker to Gemini Live."""
+
+    connected = Signal()
+    failed = Signal(str)
+    finished_audio = Signal()
+
+    INPUT_RATE = 16000
+    OUTPUT_RATE = 24000
+    CHANNELS = 1
+    DTYPE = "int16"
+    BLOCKSIZE = 640  # 40 ms input packets for low latency.
+
+    def __init__(self, live_session, parent=None):
+        super().__init__(parent)
+        self.live_session = live_session
+        self._stop_requested = False
+        self._input_enabled = True
+        self._output_queue = queue.Queue(maxsize=128)
+        self._output_buffer = bytearray()
+        self._output_lock = threading.RLock()
+        self._input_stream = None
+        self._output_stream = None
+
+    def run(self):
+        if sd is None:
+            self.failed.emit("sounddevice is not available.")
+            return
+
+        try:
+            if self.live_session is None:
+                raise RuntimeError("Gemini Live session is not available.")
+
+            print("[LIVE AUDIO] Connecting Gemini Live session...")
+
+            if not self.live_session.start(timeout=15.0):
+                error = getattr(self.live_session, "start_error", None)
+                raise RuntimeError(
+                    str(error or "Gemini Live session failed to start.")
+                )
+
+            print("[LIVE AUDIO] Gemini Live session connected.")
+            self.connected.emit()
+
+            self._input_stream = sd.RawInputStream(
+                samplerate=self.INPUT_RATE,
+                blocksize=self.BLOCKSIZE,
+                channels=self.CHANNELS,
+                dtype=self.DTYPE,
+                callback=self._input_callback,
+            )
+
+            self._output_stream = sd.RawOutputStream(
+                samplerate=self.OUTPUT_RATE,
+                blocksize=0,
+                channels=self.CHANNELS,
+                dtype=self.DTYPE,
+                callback=self._output_callback,
+            )
+
+            with self._output_stream:
+                with self._input_stream:
+                    print("[LIVE AUDIO] Microphone + speaker streams active.")
+                    while not self._stop_requested and not self.isInterruptionRequested():
+                        self.msleep(20)
+
+        except Exception as error:
+            if not self._stop_requested:
+                print(f"[LIVE AUDIO] Runtime error: {error}")
+                self.failed.emit(str(error))
+
+        finally:
+            self._close_streams()
+            print("[LIVE AUDIO] Audio worker stopped.")
+            self.finished_audio.emit()
+
+    def _input_callback(self, indata, frames, time_info, status):
+        if self._stop_requested or not self._input_enabled:
+            return
+
+        if status:
+            print(f"[LIVE AUDIO] Input status: {status}")
+
+        try:
+            data = bytes(indata)
+            if data and self.live_session is not None:
+                self.live_session.send_audio(data)
+        except Exception as error:
+            print(f"[LIVE AUDIO] Input callback error: {error}")
+
+    def _output_callback(self, outdata, frames, time_info, status):
+        if status:
+            print(f"[LIVE AUDIO] Output status: {status}")
+
+        needed = len(outdata)
+
+        try:
+            with self._output_lock:
+                while len(self._output_buffer) < needed:
+                    try:
+                        chunk = self._output_queue.get_nowait()
+                    except queue.Empty:
+                        break
+                    if chunk:
+                        self._output_buffer.extend(chunk)
+
+                available = min(len(self._output_buffer), needed)
+
+                if available:
+                    outdata[:available] = self._output_buffer[:available]
+                    del self._output_buffer[:available]
+
+                if available < needed:
+                    outdata[available:needed] = b"\x00" * (needed - available)
+
+        except Exception as error:
+            print(f"[LIVE AUDIO] Output callback error: {error}")
+            try:
+                outdata[:] = b"\x00" * needed
+            except Exception:
+                pass
+
+    def set_input_enabled(self, enabled: bool):
+        """Enable/disable microphone upload without tearing down Live."""
+        self._input_enabled = bool(enabled)
+        if not self._input_enabled:
+            self.clear_input_meter = True
+
+    def input_enabled(self) -> bool:
+        return bool(self._input_enabled)
+
+    def enqueue_output(self, audio_data: bytes):
+        if self._stop_requested or not audio_data:
+            return
+
+        data = bytes(audio_data)
+        try:
+            self._output_queue.put_nowait(data)
+        except queue.Full:
+            try:
+                self._output_queue.get_nowait()
+            except queue.Empty:
+                pass
+            try:
+                self._output_queue.put_nowait(data)
+            except queue.Full:
+                pass
+
+    def clear_output(self):
+        """Immediately discard buffered model audio for barge-in."""
+        with self._output_lock:
+            self._output_buffer.clear()
+
+        while True:
+            try:
+                self._output_queue.get_nowait()
+            except queue.Empty:
+                break
+
+    def stop(self):
+        self._stop_requested = True
+        self.requestInterruption()
+        self.clear_output()
+
+        try:
+            if self.live_session is not None:
+                self.live_session.stop(timeout=3.0)
+        except Exception as error:
+            print(f"[LIVE AUDIO] Session stop error: {error}")
+
+        self._close_streams()
+
+    def _close_streams(self):
+        for stream_name in ("_input_stream", "_output_stream"):
+            stream = getattr(self, stream_name, None)
+            if stream is None:
+                continue
+            try:
+                stream.stop()
+            except Exception:
+                pass
+            try:
+                stream.close()
+            except Exception:
+                pass
+            setattr(self, stream_name, None)
+
+
 # =====================================================
 # Main Window
 # =====================================================
@@ -875,6 +928,13 @@ class MainWindow(QMainWindow):
     """
     ASTRA-AI Main Window
     """
+
+    gemini_live_input_signal = Signal(str)
+    gemini_live_output_signal = Signal(str)
+    gemini_live_interrupted_signal = Signal()
+    gemini_live_turn_complete_signal = Signal(str, str)
+    gemini_live_error_signal = Signal(str)
+    gemini_live_closed_signal = Signal()
 
     def __init__(self):
 
@@ -907,13 +967,8 @@ class MainWindow(QMainWindow):
         self._startup_poll_timer = None
 
         # ----------------------------------
-        # Wake-word -> command lifecycle guard
+        # Realtime voice lifecycle guard
         # ----------------------------------
-        # A DHEEPTHI detection is converted into the SAME command
-        # lifecycle used by the manual microphone. This guard prevents
-        # duplicate transitions while the wake worker is stopping and
-        # its finished signal is travelling back to the GUI thread.
-        self._wake_command_transition_active = False
 
         # Safety timeout only. Normal unlock happens from the real
         # TTS completion signal or the speaking-state fallback.
@@ -1045,35 +1100,25 @@ class MainWindow(QMainWindow):
         self.chat_processing = False
 
         # ----------------------------------
-        # Voice Worker State
+        # Gemini Live Voice State
         # ----------------------------------
 
-        self.current_voice_mode = None
-
-        # "wake"   -> DHEEPTHI standby listener
-        # "manual" -> microphone button listener
-
+        self.current_voice_mode = "gemini_live"
         self.manual_listening_requested = False
+        self._gemini_live_pending_start = False
+        self.gemini_live_mic_enabled = True
 
         # ----------------------------------
-        # DHEEPTHI Wake Word Mode
+        # Physical Laptop Microphone Mute
         # ----------------------------------
+        # These attributes must exist before the monitor is created below.
+        # The monitor itself is created during MainWindow construction and
+        # started later after the startup greeting.
+        self.physical_microphone_muted = False
+        self.microphone_mute_monitor = None
+        self._physical_microphone_monitor_started = False
 
-        self.wake_word_enabled = True
-
-        self.wake_word_running = False
-
-        # Production DHEEPTHI detector is separate from the existing
-        # SpeechRecognizer command STT backend.
-        self.wake_word_detector = None
-        self.wake_word_model_path = (
-            PROJECT_ROOT
-            / "models"
-            / "wakeword"
-            / "dheepthi_float32.tflite"
-        )
-
-        # Prevent multiple mic clicks
+        # Prevent duplicate command/voice transitions.
         self.processing_voice = False
 
         # ----------------------------------
@@ -1190,6 +1235,29 @@ class MainWindow(QMainWindow):
         # top-level Windows-style overlay and must never push UI widgets.
         self.system_osd = SystemOSD(self)
         self.system_osd.hide_osd()
+
+        self.gemini_live_input_signal.connect(
+            self._handle_gemini_live_input_transcript
+        )
+        self.gemini_live_output_signal.connect(
+            self._handle_gemini_live_output_transcript
+        )
+        self.gemini_live_interrupted_signal.connect(
+            self._handle_gemini_live_interrupted
+        )
+        self.gemini_live_turn_complete_signal.connect(
+            self._handle_gemini_live_turn_complete
+        )
+        self.gemini_live_error_signal.connect(
+            self._handle_gemini_live_error
+        )
+        self.gemini_live_closed_signal.connect(
+            self._handle_gemini_live_closed
+        )
+
+        # Prepare the physical laptop microphone monitor. It starts only
+        # after the startup greeting has completed.
+        self._initialize_physical_microphone_monitor()
 
     def setup_ui(self):
         """
@@ -1812,32 +1880,7 @@ class MainWindow(QMainWindow):
 
         print("Vosk Speech Recognizer Created.")
         print("Command STT : Existing SpeechRecognizer pipeline")
-        print("Faster-Whisper wake detection : DISABLED")
-
-        # ------------------------------------------
-        # Production DHEEPTHI Wake Word
-        # ------------------------------------------
-
-        try:
-            self.wake_word_detector = WakeWordDetector(
-                model_path=self.wake_word_model_path,
-                threshold=0.000250,
-            )
-
-            print(
-                "Production WakeWordDetector created."
-            )
-
-            print(
-                f"Wake Model : {self.wake_word_model_path}"
-            )
-
-        except Exception as error:
-            self.wake_word_detector = None
-
-            print(
-                f"Production WakeWordDetector creation failed: {error}"
-            )
+        print("Realtime microphone : Gemini Live")
 
         # ------------------------------------------
         # Voice
@@ -1845,6 +1888,23 @@ class MainWindow(QMainWindow):
 
         self.tts = TextToSpeech()
 
+        # Streaming conversational TTS.  This sits on top of the existing
+        # TextToSpeech provider chain and only affects the conversational
+        # Gemini voice path.  Command/automation speech remains unchanged.
+        self.streaming_tts_manager = StreamingTTSManager(
+            self.tts
+        )
+
+        # ------------------------------------------
+        # Gemini Live Conversation Runtime
+        # ------------------------------------------
+        self.gemini_live_session = None
+        self.gemini_live_audio_worker = None
+        self.gemini_live_active = False
+        self.gemini_live_command_handoff = False
+        self.gemini_live_last_command = ""
+        self.gemini_live_user_transcript = ""
+        self.gemini_live_output_transcript = ""
         # ------------------------------------------
         # NLP
         # ------------------------------------------
@@ -2000,7 +2060,7 @@ class MainWindow(QMainWindow):
 
     def _unlock_after_speech(
         self,
-        restart_wake=True,
+        restart_live=True,
         terminal_avatar_state="idle"
     ):
         """
@@ -2047,15 +2107,13 @@ class MainWindow(QMainWindow):
             except Exception:
                 pass
 
-            if (
-                restart_wake
-                and self.wake_word_enabled
-                and not self.manual_listening_requested
-                and not self._pending_file_selection
-            ):
+            # In direct Gemini Live mode, every completed local command
+            # returns control to the persistent realtime voice experience.
+            # The old realtime voice restart path is intentionally gone.
+            if not self._closing:
                 QTimer.singleShot(
                     350,
-                    self.start_wake_word_worker
+                    self._restart_gemini_live_after_command
                 )
 
         # Give the TTS worker a moment to start before polling.
@@ -2263,9 +2321,7 @@ class MainWindow(QMainWindow):
         # Start manual listener.
         # --------------------------------------------------
 
-        self.start_voice_worker(
-            wake_word_mode=False
-        )
+        self.ensure_gemini_live_input()
 
     def _handle_pending_file_selection(
         self,
@@ -2326,7 +2382,7 @@ class MainWindow(QMainWindow):
                 pass
 
             self._unlock_after_speech(
-                restart_wake=True
+                restart_live=True
             )
 
             return True
@@ -2833,9 +2889,7 @@ class MainWindow(QMainWindow):
 
         QTimer.singleShot(
             80,
-            lambda: self.start_voice_worker(
-                wake_word_mode=False
-            )
+            lambda: self.ensure_gemini_live_input()
         )
 
     def _wait_for_confirmation_prompt(self):
@@ -2984,7 +3038,7 @@ class MainWindow(QMainWindow):
             pass
 
         self._unlock_after_speech(
-            restart_wake=True
+            restart_live=True
         )
 
     def _handle_confirmation_response(self, text):
@@ -3332,7 +3386,7 @@ class MainWindow(QMainWindow):
         # CommandDispatcher already sends the clarification through TTS.
         # MainWindow therefore only waits for that speech to finish.
         self._unlock_after_speech(
-            restart_wake=True,
+            restart_live=True,
             terminal_avatar_state="thinking_laptop",
         )
 
@@ -3380,7 +3434,7 @@ class MainWindow(QMainWindow):
                 pass
 
             self._unlock_after_speech(
-                restart_wake=True,
+                restart_live=True,
                 terminal_avatar_state="thinking_laptop",
             )
             return True
@@ -3529,7 +3583,7 @@ class MainWindow(QMainWindow):
                     pass
 
                 self._unlock_after_speech(
-                    restart_wake=True
+                    restart_live=True
                 )
 
                 return
@@ -3752,7 +3806,7 @@ class MainWindow(QMainWindow):
             # Dispatcher normally speaks successful replies itself.
             # Wait asynchronously instead of blocking the GUI.
             self._unlock_after_speech(
-                restart_wake=True,
+                restart_live=True,
                 terminal_avatar_state="success"
             )
 
@@ -3821,7 +3875,7 @@ class MainWindow(QMainWindow):
         self._set_avatar_state("error")
 
         self._unlock_after_speech(
-            restart_wake=True,
+            restart_live=True,
             terminal_avatar_state="error"
         )
 
@@ -4143,7 +4197,7 @@ class MainWindow(QMainWindow):
                         self._clean_vision_response_for_tts(message)
                     )
                     self._unlock_after_speech(
-                        restart_wake=True,
+                        restart_live=True,
                         terminal_avatar_state="error"
                     )
                 except Exception:
@@ -4690,7 +4744,7 @@ class MainWindow(QMainWindow):
                 )
 
                 self._unlock_after_speech(
-                    restart_wake=True,
+                    restart_live=True,
                     terminal_avatar_state="success"
                 )
 
@@ -4784,7 +4838,7 @@ class MainWindow(QMainWindow):
                 )
 
                 self._unlock_after_speech(
-                    restart_wake=True,
+                    restart_live=True,
                     terminal_avatar_state="error"
                 )
 
@@ -5073,7 +5127,7 @@ class MainWindow(QMainWindow):
             pass
 
         self._unlock_after_speech(
-            restart_wake=True,
+            restart_live=True,
             terminal_avatar_state="error",
         )
 
@@ -5343,7 +5397,7 @@ class MainWindow(QMainWindow):
                 pass
 
             self._unlock_after_speech(
-                restart_wake=True,
+                restart_live=True,
                 terminal_avatar_state="error",
             )
 
@@ -5372,7 +5426,7 @@ class MainWindow(QMainWindow):
                 pass
 
             self._unlock_after_speech(
-                restart_wake=True,
+                restart_live=True,
                 terminal_avatar_state="error",
             )
 
@@ -5436,7 +5490,7 @@ class MainWindow(QMainWindow):
             pass
 
         self._unlock_after_speech(
-            restart_wake=True,
+            restart_live=True,
             terminal_avatar_state="success",
         )
 
@@ -5461,7 +5515,7 @@ class MainWindow(QMainWindow):
             except Exception:
                 pass
             self._unlock_after_speech(
-                restart_wake=True,
+                restart_live=True,
                 terminal_avatar_state="error",
             )
             return True
@@ -5491,7 +5545,7 @@ class MainWindow(QMainWindow):
                 pass
 
             self._unlock_after_speech(
-                restart_wake=True,
+                restart_live=True,
                 terminal_avatar_state="success",
             )
 
@@ -5550,7 +5604,7 @@ class MainWindow(QMainWindow):
                 pass
 
             self._unlock_after_speech(
-                restart_wake=True,
+                restart_live=True,
                 terminal_avatar_state="error",
             )
 
@@ -5607,7 +5661,7 @@ class MainWindow(QMainWindow):
             pass
 
         self._unlock_after_speech(
-            restart_wake=True,
+            restart_live=True,
             terminal_avatar_state="success",
         )
 
@@ -5632,7 +5686,7 @@ class MainWindow(QMainWindow):
             except Exception:
                 pass
             self._unlock_after_speech(
-                restart_wake=True,
+                restart_live=True,
                 terminal_avatar_state="error",
             )
             return True
@@ -5666,7 +5720,7 @@ class MainWindow(QMainWindow):
                 pass
 
             self._unlock_after_speech(
-                restart_wake=True,
+                restart_live=True,
                 terminal_avatar_state="idle",
             )
 
@@ -5738,7 +5792,7 @@ class MainWindow(QMainWindow):
                 pass
 
             self._unlock_after_speech(
-                restart_wake=True,
+                restart_live=True,
                 terminal_avatar_state="error",
             )
 
@@ -5767,7 +5821,7 @@ class MainWindow(QMainWindow):
                 pass
 
             self._unlock_after_speech(
-                restart_wake=True,
+                restart_live=True,
                 terminal_avatar_state="error",
             )
 
@@ -5829,7 +5883,7 @@ class MainWindow(QMainWindow):
             pass
 
         self._unlock_after_speech(
-            restart_wake=True,
+            restart_live=True,
             terminal_avatar_state="success",
         )
 
@@ -6283,7 +6337,7 @@ class MainWindow(QMainWindow):
                     )
 
                     self._unlock_after_speech(
-                        restart_wake=True,
+                        restart_live=True,
                         terminal_avatar_state="success"
                     )
 
@@ -6298,7 +6352,7 @@ class MainWindow(QMainWindow):
                     )
 
                     # _unlock_after_speech() owns microphone
-                    # unlock + wake-word restart.
+                    # unlock + Gemini Live restart.
 
                     return
 
@@ -6370,7 +6424,7 @@ class MainWindow(QMainWindow):
                 )
 
                 self._unlock_after_speech(
-                    restart_wake=True,
+                    restart_live=True,
                     terminal_avatar_state="error"
                 )
 
@@ -6431,7 +6485,7 @@ class MainWindow(QMainWindow):
                 )
 
                 self._unlock_after_speech(
-                    restart_wake=True,
+                    restart_live=True,
                     terminal_avatar_state="error"
                 )
 
@@ -6510,7 +6564,7 @@ class MainWindow(QMainWindow):
             )
 
             self._unlock_after_speech(
-                restart_wake=True,
+                restart_live=True,
                 terminal_avatar_state="success"
             )
 
@@ -6565,52 +6619,91 @@ class MainWindow(QMainWindow):
             if not conversation_message:
 
                 self._unlock_after_speech(
-                    restart_wake=True
+                    restart_live=True
                 )
 
                 return
 
             self.lock_microphone()
 
+            # One session belongs to exactly one conversational voice turn.
+            # Starting a new session invalidates any stale queued chunks from
+            # a previous turn and keeps the TTS pipeline isolated.
+            streaming_session = self.streaming_tts_manager.start_session()
+
             try:
-                ai_reply = self.gemini.generate_response(
+                if streaming_session is None:
+                    raise RuntimeError(
+                        "Streaming TTS manager could not start a session"
+                    )
+
+                # Gemini now yields text as it arrives.  The StreamingTTSManager
+                # consumes those chunks immediately and its dedicated consumer
+                # thread starts TTS as soon as a meaningful sentence/clause is
+                # available.  This means Gemini generation and TTS playback run
+                # in parallel instead of waiting for the complete answer.
+                response_chunks = []
+
+                for chunk in self.gemini.generate_response_stream(
                     conversation_message
-                )
+                ):
+                    if chunk is None:
+                        continue
 
-                if not ai_reply or not str(ai_reply).strip():
-                    raise RuntimeError("Gemini returned an empty response")
+                    chunk = str(chunk)
+                    if not chunk.strip():
+                        continue
 
-                ai_reply = str(ai_reply).strip()
+                    response_chunks.append(chunk)
 
-                self.mic_widget.update_ai_message(
-                    ai_reply
-                )
+                    # Preserve the existing UI behaviour while allowing the
+                    # speech pipeline to begin before Gemini finishes.
+                    current_reply = "".join(response_chunks).strip()
+                    if current_reply:
+                        self.mic_widget.update_ai_message(
+                            current_reply
+                        )
 
-                try:
-                    self._set_thinking_state("Inactive")
-                    self.left_panel.set_speaking("Speaking")
-                except Exception:
-                    pass
+                    try:
+                        self._set_thinking_state("Inactive")
+                        self.left_panel.set_speaking("Speaking")
+                    except Exception:
+                        pass
 
-                # AI / Gemini response flow:
-                #
-                # thinking_ai
-                #       ↓
-                # speaking
-                #       ↓
-                # TTS completes
-                #       ↓
-                # success
-                #       ↓
-                # AvatarWidget automatically returns to idle
-                self._set_avatar_state("speaking")
+                    self._set_avatar_state("speaking")
 
-                speech_reply = self._clean_vision_response_for_tts(ai_reply)
+                    # Clean only the text being handed to TTS.  The original
+                    # streamed text is retained for the conversation UI.
+                    speech_chunk = self._clean_vision_response_for_tts(
+                        chunk
+                    )
 
-                self.tts.speak(speech_reply)
+                    if speech_chunk:
+                        self.streaming_tts_manager.add_chunk(
+                            speech_chunk,
+                            streaming_session,
+                        )
+
+                ai_reply = "".join(response_chunks).strip()
+
+                if not ai_reply:
+                    self.streaming_tts_manager.stop()
+                    raise RuntimeError(
+                        "Gemini returned an empty streaming response"
+                    )
+
+                # Flush the final partial sentence.  This only enqueues the
+                # remaining text; it does not wait for playback, so the final
+                # TTS request continues through the existing provider chain.
+                if not self.streaming_tts_manager.finish(
+                    streaming_session
+                ):
+                    raise RuntimeError(
+                        "Streaming TTS session became inactive"
+                    )
 
                 self._unlock_after_speech(
-                    restart_wake=True,
+                    restart_live=True,
                     terminal_avatar_state="success"
                 )
 
@@ -6619,6 +6712,14 @@ class MainWindow(QMainWindow):
                 )
 
             except Exception as error:
+
+                # Prevent any already-buffered response from leaking into a
+                # later conversational turn.  Existing TextToSpeech.stop()
+                # also invalidates the active provider request.
+                try:
+                    self.streaming_tts_manager.stop()
+                except Exception:
+                    pass
 
                 print(f"Gemini Command Error : {error}")
 
@@ -6649,7 +6750,7 @@ class MainWindow(QMainWindow):
                     pass
 
                 self._unlock_after_speech(
-                    restart_wake=True,
+                    restart_live=True,
                     terminal_avatar_state="error"
                 )
 
@@ -7615,7 +7716,7 @@ class MainWindow(QMainWindow):
             pass
 
         self._unlock_after_speech(
-            restart_wake=True
+            restart_live=True
         )
 
     # --------------------------------------------------
@@ -8309,7 +8410,7 @@ class MainWindow(QMainWindow):
                 ↓
             MIC UNLOCK
                 ↓
-            DHEEPTHI wake listener
+            Gemini Live direct listening
         """
 
         if getattr(self, "_closing", False):
@@ -9050,50 +9151,11 @@ class MainWindow(QMainWindow):
             self._verify_startup_microphone_unlocked
         )
 
-        # Start DHEEPTHI only after the mic is explicitly enabled.
-        if (
-            getattr(
-                self,
-                "wake_word_enabled",
-                False,
-            )
-            and not getattr(
-                self,
-                "manual_listening_requested",
-                False,
-            )
-            and not getattr(
-                self,
-                "processing_voice",
-                False,
-            )
-            and not getattr(
-                self,
-                "wake_word_running",
-                False,
-            )
-            and not getattr(
-                self,
-                "_closing",
-                False,
-            )
-        ):
-
-            QTimer.singleShot(
-                250,
-                self._start_wake_word_after_startup
-            )
-
+        # Start Gemini Live directly after the startup greeting.
+        if not getattr(self, "_closing", False):
+            QTimer.singleShot(250, self._start_gemini_live_after_startup)
             print(
-                "[STARTUP] DHEEPTHI wake listener scheduled "
-                "AFTER MIC UNLOCK."
-            )
-
-        else:
-
-            print(
-                "[STARTUP] DHEEPTHI not started: "
-                "another voice mode or shutdown is active."
+                "[STARTUP] Gemini Live scheduled AFTER MIC UNLOCK."
             )
 
         print(
@@ -9172,91 +9234,36 @@ class MainWindow(QMainWindow):
                     f"[STARTUP] MIC VERIFY REPAIR ERROR | {error}"
                 )
 
-    def _start_wake_word_after_startup(self):
-        """
-        Start DHEEPTHI only after the startup greeting has completely
-        finished AND the microphone UI has been explicitly released.
-        """
-
-        if getattr(
-            self,
-            "_closing",
-            False,
-        ):
+    def _start_gemini_live_after_startup(self):
+        """Start the realtime Gemini Live session after the greeting."""
+        if self._closing or getattr(self, "_startup_greeting_active", False):
             return
-
-        if getattr(
-            self,
-            "_startup_greeting_active",
-            False,
-        ):
-
-            print(
-                "[STARTUP] Wake start BLOCKED: "
-                "greeting still active."
-            )
-
-            return
-
-        if not getattr(
-            self,
-            "_startup_sequence_complete",
-            False,
-        ):
-
-            print(
-                "[STARTUP] Wake start BLOCKED: "
-                "startup sequence not complete."
-            )
-
-            return
-
-        if not getattr(
-            self,
-            "wake_word_enabled",
-            False,
-        ):
-            return
-
-        if getattr(
-            self,
-            "manual_listening_requested",
-            False,
-        ):
-            return
-
-        if getattr(
-            self,
-            "processing_voice",
-            False,
-        ):
+        if not getattr(self, "_startup_sequence_complete", False):
+            QTimer.singleShot(250, self._start_gemini_live_after_startup)
             return
 
         try:
-
-            if not self.microphone_button.isEnabled():
-
-                print(
-                    "[STARTUP] Wake start BLOCKED: "
-                    "microphone button is still disabled."
-                )
-
-                QTimer.singleShot(
-                    100,
-                    self._start_wake_word_after_startup
-                )
-
-                return
-
+            self.unlock_microphone()
         except Exception:
             pass
 
-        print(
-            "[STARTUP] Startup gate OPEN | "
-            "MIC is unlocked | starting DHEEPTHI."
-        )
+        self._start_physical_microphone_monitor()
 
-        self.start_wake_word_worker()
+        # The physical laptop microphone key is authoritative. If Windows
+        # reports the capture endpoint muted, remain in IDLE and wait for the
+        # hardware key to be unmuted instead of opening Gemini Live input.
+        if self.physical_microphone_muted:
+            print("[STARTUP] Physical microphone is muted; keeping DHEEPTHI IDLE.")
+            self._set_gemini_live_input_from_physical_mic(False)
+            return
+
+        self.gemini_live_mic_enabled = True
+        self._gemini_live_pending_start = True
+        self.manual_listening_requested = False
+        self.processing_voice = False
+
+        print("[STARTUP] Startup gate OPEN | starting Gemini Live directly.")
+        QTimer.singleShot(0, self._start_gemini_live_conversation)
 
     # --------------------------------------------------
     # Initialization Failed
@@ -9493,1287 +9500,629 @@ class MainWindow(QMainWindow):
             )
 
     # --------------------------------------------------
+    # Physical Laptop Microphone Monitor
+    # --------------------------------------------------
+
+    def _initialize_physical_microphone_monitor(self):
+        """Create the Windows physical microphone mute monitor."""
+        if self.microphone_mute_monitor is not None:
+            return
+
+        if MicrophoneMuteMonitor is None:
+            print(
+                "[MIC MONITOR] voice.microphone_monitor is not available; "
+                "physical microphone-key monitoring is disabled."
+            )
+            return
+
+        try:
+            monitor = MicrophoneMuteMonitor(
+                interval_ms=250,
+                parent=self,
+            )
+            monitor.mute_changed.connect(
+                self._handle_physical_microphone_mute_changed
+            )
+            if hasattr(monitor, "error"):
+                monitor.error.connect(
+                    self._handle_physical_microphone_monitor_error
+                )
+
+            self.microphone_mute_monitor = monitor
+            print("[MIC MONITOR] Physical laptop microphone monitor created.")
+        except Exception as error:
+            self.microphone_mute_monitor = None
+            print(f"[MIC MONITOR] Initialization error: {error}")
+
+    def _start_physical_microphone_monitor(self):
+        """Start monitoring the physical/default Windows microphone mute state."""
+        if self._closing:
+            return
+
+        self._initialize_physical_microphone_monitor()
+        monitor = self.microphone_mute_monitor
+        if monitor is None:
+            return
+
+        try:
+            if not monitor.isRunning():
+                monitor.start()
+            self._physical_microphone_monitor_started = True
+            print("[MIC MONITOR] Physical laptop microphone monitor started.")
+
+            # Explicitly synchronize the initial endpoint state after the
+            # worker has had time to initialize. This prevents a microphone
+            # already muted before startup from leaving the UI in LISTENING.
+            QTimer.singleShot(400, self._sync_physical_microphone_state)
+        except Exception as error:
+            print(f"[MIC MONITOR] Start error: {error}")
+
+    @Slot(bool)
+    def _handle_physical_microphone_mute_changed(self, muted):
+        """Synchronize Gemini Live and the UI with the physical mic mute key."""
+        if self._closing:
+            return
+
+        muted = bool(muted)
+
+        # Do not discard the first state emitted by the monitor. MainWindow
+        # starts with False as a safe default, but Windows may already report
+        # the physical microphone as muted when DHEEPTHI starts.
+        state_changed = muted != bool(self.physical_microphone_muted)
+        self.physical_microphone_muted = muted
+
+        if muted:
+            print("[MIC MONITOR] Physical microphone MUTED -> DHEEPTHI IDLE.")
+            self._set_gemini_live_input_from_physical_mic(False)
+        else:
+            if state_changed:
+                print("[MIC MONITOR] Physical microphone UNMUTED -> Gemini Live LISTENING.")
+            self._set_gemini_live_input_from_physical_mic(True)
+
+    def _sync_physical_microphone_state(self):
+        """Apply the monitor's current endpoint mute state on the GUI thread."""
+        if self._closing:
+            return
+
+        monitor = self.microphone_mute_monitor
+        if monitor is None:
+            return
+
+        try:
+            current = getattr(monitor, "current_muted", None)
+            if current is not None:
+                self._handle_physical_microphone_mute_changed(bool(current))
+        except Exception as error:
+            print(f"[MIC MONITOR] Initial state sync error: {error}")
+
+    @Slot(str)
+    def _handle_physical_microphone_monitor_error(self, message):
+        if self._closing:
+            return
+        print(f"[MIC MONITOR] {message}")
+
+    def _set_gemini_live_input_from_physical_mic(self, enabled):
+        """Apply physical mic state without destroying the Live session."""
+        enabled = bool(enabled) and not self.physical_microphone_muted
+        self.gemini_live_mic_enabled = enabled
+
+        worker = self.gemini_live_audio_worker
+        if worker is not None:
+            try:
+                worker.set_input_enabled(enabled)
+            except Exception as error:
+                print(f"[MIC MONITOR] Live input gate error: {error}")
+
+        if not enabled:
+            # Physical microphone MUTE is the authoritative idle state.
+            # Keep Gemini Live alive, but stop uploading microphone audio.
+            try:
+                if worker is not None:
+                    worker.clear_input_meter = True
+                    worker.clear_output()
+            except Exception:
+                pass
+
+            try:
+                self.status_label.setText("Status : Microphone Muted")
+                self.left_panel.set_listening("Mic Muted")
+                self.left_panel.set_speaking("Silent")
+                self._set_thinking_state("Inactive")
+                self._set_avatar_state("idle")
+                self.mic_widget.update_audio_level(0.0)
+            except Exception:
+                pass
+
+            # IMPORTANT: do not call MicWidget.set_listening(False) here.
+            # In the existing MicWidget implementation that state is not the
+            # physical-key lock state. Use the MainWindow's existing lock API
+            # so the visible microphone button becomes LOCKED without editing
+            # ui/widgets/mic_widget.py.
+            try:
+                self.lock_microphone()
+            except Exception as error:
+                print(f"[MIC MONITOR] Mic UI lock error: {error}")
+            return
+
+        # Physical mic has just been UNMUTED. If Live is already connected,
+        # open only the microphone input gate; the Live session itself stays
+        # alive. The existing MainWindow unlock API controls the button state.
+        if self.gemini_live_active and worker is not None:
+            try:
+                worker.set_input_enabled(True)
+            except Exception as error:
+                print(f"[MIC MONITOR] Live resume error: {error}")
+
+            try:
+                self.status_label.setText("Status : Gemini Live Listening")
+                self.left_panel.set_listening("Listening")
+                self.left_panel.set_speaking("Silent")
+                self._set_thinking_state("Inactive")
+                self._set_avatar_state("listening")
+            except Exception:
+                pass
+
+            # IMPORTANT: this is the physical-key -> UI transition.
+            # Do not change MicWidget's implementation. MainWindow's existing
+            # unlock_microphone() keeps the button visually/interactively
+            # UNLOCKED.
+            try:
+                self.unlock_microphone()
+            except Exception as error:
+                print(f"[MIC MONITOR] Mic UI unlock error: {error}")
+            return
+
+        if self._startup_sequence_complete and not self._startup_greeting_active:
+            self._gemini_live_pending_start = True
+            QTimer.singleShot(0, self._start_gemini_live_conversation)
+
+    def _stop_physical_microphone_monitor(self):
+        """Stop and release the physical microphone monitor."""
+        monitor = self.microphone_mute_monitor
+        self.microphone_mute_monitor = None
+        self._physical_microphone_monitor_started = False
+
+        if monitor is None:
+            return
+
+        try:
+            monitor.stop()
+        except Exception as error:
+            print(f"[MIC MONITOR] Stop error: {error}")
+
+        try:
+            if monitor.isRunning() and monitor is not QThread.currentThread():
+                monitor.wait(1500)
+        except Exception:
+            pass
+
+        try:
+            monitor.deleteLater()
+        except Exception:
+            pass
+
+    # --------------------------------------------------
     # Start Listening
     # --------------------------------------------------
 
     def start_listening(self):
+        """Toggle the Gemini Live microphone on/off.
+
+        The microphone button is no longer push-to-talk and no longer
+        starts a one-shot STT worker. Gemini Live remains the realtime
+        conversation engine for the whole session.
         """
-        Start manual voice recognition.
-
-        Manual microphone lifecycle:
-
-            Mic Click
-                ↓
-            Stop DHEEPTHI wake listener
-                ↓
-            Show "Listening" immediately
-                ↓
-            ASTRA says "Listening"
-                ↓
-            Wait until TTS finishes
-                ↓
-            Start the actual microphone listener
-                ↓
-            Capture one command
-                ↓
-            Disable microphone while ASTRA processes / speaks
-                ↓
-            Restart DHEEPTHI after the task is complete
-
-        The GUI thread is never blocked waiting for the wake-word
-        worker. This is important because blocking QThread.wait()
-        from the Qt GUI thread can make the window appear as
-        "Not Responding".
-        """
-
-        if self._closing:
+        if self._closing or getattr(self, "_startup_greeting_active", False):
             return
 
-        # ---------------------------------
-        # Startup greeting owns the microphone
-        # ---------------------------------
-
-        if getattr(
-            self,
-            "_startup_greeting_active",
-            False
-        ):
-
-            print(
-                "[MIC] Click ignored: startup greeting is active."
-            )
-
+        if self.physical_microphone_muted:
+            print("[MIC] UI toggle ignored because physical laptop microphone is muted.")
+            self._set_gemini_live_input_from_physical_mic(False)
             return
 
-        # ---------------------------------
-        # Already processing
-        # ---------------------------------
-
-        if self.processing_voice:
+        if not self.gemini_live_active:
+            print("[MIC] Gemini Live is not active; starting Live session.")
+            self._gemini_live_pending_start = True
+            self.gemini_live_mic_enabled = True
+            self.processing_voice = False
+            QTimer.singleShot(0, self._start_gemini_live_conversation)
             return
 
-        # ---------------------------------
-        # Manual listening already requested
-        # ---------------------------------
+        self._toggle_gemini_live_microphone()
 
-        if self.manual_listening_requested:
+    def _toggle_gemini_live_microphone(self):
+        """Toggle microphone upload while keeping Gemini Live connected."""
+        worker = self.gemini_live_audio_worker
+        if worker is None:
+            self._gemini_live_pending_start = True
+            self.gemini_live_mic_enabled = True
+            QTimer.singleShot(0, self._start_gemini_live_conversation)
             return
 
-        # ---------------------------------
-        # Request Manual Mode
-        # ---------------------------------
-
-        self.manual_listening_requested = True
-        self._wake_command_transition_active = False
-
-        # Lock immediately so the user cannot start another
-        # microphone action while the mode is switching.
-        self.lock_microphone()
-
-        # ---------------------------------
-        # Update UI immediately
-        # ---------------------------------
-        # The user asked for the first manual click to show
-        # "Listening", not "Preparing".
-        #
-        # The actual audio capture is still delayed until
-        # ASTRA finishes saying "Listening", preventing Whisper
-        # from capturing ASTRA's own voice.
-        # ---------------------------------
-
-        self.status_label.setText(
-            "Status : Listening..."
-        )
-
-        # ---------------------------------
-        # Avatar: switch immediately when
-        # the microphone is clicked.
-        # ---------------------------------
-
-        self._set_avatar_state(
-            "listening"
-        )
+        self.gemini_live_mic_enabled = not self.gemini_live_mic_enabled
+        try:
+            worker.set_input_enabled(self.gemini_live_mic_enabled)
+        except Exception as error:
+            print(f"[MIC] Live microphone toggle error: {error}")
 
         try:
-            self.mic_widget.show_listening()
-
-            self.mic_widget.set_listening(
-                False
-            )
-
-            self.left_panel.set_listening(
-                "Listening"
-            )
-
-            self._set_thinking_state(
-                "Inactive"
-            )
-
-            self.left_panel.set_speaking(
-                "Silent"
-            )
-
+            if self.gemini_live_mic_enabled:
+                self.status_label.setText("Status : Gemini Live Listening")
+                self._set_avatar_state("listening")
+                self.left_panel.set_listening("Listening")
+                self.left_panel.set_speaking("Silent")
+                self._set_thinking_state("Inactive")
+                self.mic_widget.show_listening()
+                self.mic_widget.set_listening(True)
+                print("[MIC] Gemini Live microphone ON.")
+            else:
+                self.status_label.setText("Status : Microphone Off")
+                self.left_panel.set_listening("Mic Off")
+                self.left_panel.set_speaking("Silent")
+                self._set_avatar_state("idle")
+                self.mic_widget.set_listening(False)
+                self.mic_widget.update_audio_level(0.0)
+                print("[MIC] Gemini Live microphone OFF.")
         except Exception:
             pass
 
-        QApplication.processEvents()
-
-        # ---------------------------------
-        # Stop DHEEPTHI Wake Worker
-        # ---------------------------------
-        # IMPORTANT:
-        # Do NOT call voice_worker.wait() here.
-        # The GUI must remain responsive.
-        #
-        # listening_finished() will continue the manual flow
-        # after the wake worker has actually finished.
-        # ---------------------------------
-
-        if self.voice_worker is not None:
-
-            try:
-
-                if self.voice_worker.isRunning():
-
-                    if self.current_voice_mode == "wake":
-
-                        print(
-                            "Stopping DHEEPTHI listener for manual microphone..."
-                        )
-
-                        try:
-                            self.voice_worker.stop()
-
-                        except Exception as error:
-                            print(
-                                f"Wake Worker Stop Error : {error}"
-                            )
-
-                        return
-
-                    # Manual worker is already running.
-                    self.manual_listening_requested = False
-                    self.unlock_microphone()
-                    return
-
-            except Exception as error:
-
-                print(
-                    f"Voice Worker State Error : {error}"
-                )
-
-        # ---------------------------------
-        # No wake worker is running.
-        # Start the manual prompt now.
-        # ---------------------------------
-
-        self._begin_manual_listening_prompt()
-
-    # --------------------------------------------------
-    # Begin Manual Listening Prompt
-    # --------------------------------------------------
-
-    def _begin_manual_listening_prompt(self):
-        """
-        Start the manual-listening TTS prompt.
-
-        This is called only after the wake-word worker has
-        stopped, so ASTRA cannot speak while the wake listener
-        still owns the microphone.
-        """
-
+    def ensure_gemini_live_input(self):
+        """Ensure Gemini Live input is available without overriding the physical mic key."""
         if self._closing:
             return
 
-        if not self.manual_listening_requested:
+        self.manual_listening_requested = False
+
+        # The physical laptop microphone key is authoritative. Never reopen
+        # the Gemini Live input gate while Windows reports the capture endpoint
+        # as muted. The Live session itself remains alive.
+        if self.physical_microphone_muted:
+            self.gemini_live_mic_enabled = False
+            self._set_gemini_live_input_from_physical_mic(False)
             return
 
-        # ---------------------------------
-        # Safety: wake worker must be gone
-        # ---------------------------------
+        self.gemini_live_mic_enabled = True
 
-        if self.voice_worker is not None:
-
+        if self.gemini_live_active and self.gemini_live_audio_worker is not None:
             try:
-
-                if self.voice_worker.isRunning():
-
-                    return
-
+                self.gemini_live_audio_worker.set_input_enabled(True)
             except Exception:
                 pass
+            self.status_label.setText("Status : Gemini Live Listening")
+            try:
+                self.mic_widget.show_listening()
+                self.mic_widget.set_listening(True)
+                self.left_panel.set_listening("Listening")
+            except Exception:
+                pass
+            return
 
-        # ---------------------------------
-        # Keep the UI in Listening state
-        # ---------------------------------
+        self._gemini_live_pending_start = True
+        QTimer.singleShot(0, self._start_gemini_live_conversation)
 
-        self.status_label.setText(
-            "Status : Listening..."
-        )
+    # --------------------------------------------------
+    # Gemini Live Conversation
+    # --------------------------------------------------
 
-        try:
+    def _start_gemini_live_conversation(self):
+        if self._closing or not self._gemini_live_pending_start:
+            return
 
-            self.mic_widget.show_listening()
+        self._gemini_live_pending_start = False
+        self.gemini_live_mic_enabled = not self.physical_microphone_muted
+        self.gemini_live_command_handoff = False
+        self.gemini_live_last_command = ""
+        self.gemini_live_user_transcript = ""
+        self.gemini_live_output_transcript = ""
 
-            self.mic_widget.set_listening(
-                False
-            )
-
-            self.left_panel.set_listening(
-                "Listening"
-            )
-
-            self._set_thinking_state(
-                "Inactive"
-            )
-
-            self.left_panel.set_speaking(
-                "Speaking"
-            )
-
-        except Exception:
-            pass
-
-        # ---------------------------------
-        # ASTRA Voice Prompt
-        # ---------------------------------
-        # Only the word "Listening" is used.
-        # No "Sollunga" prompt is generated here.
-        # ---------------------------------
+        self._stop_gemini_live_conversation(clear_audio=True, restart_live=False)
 
         try:
+            session = self.gemini.create_live_session(
+                on_connected=self._on_gemini_live_connected,
+                on_audio=self._on_gemini_live_audio,
+                on_input_transcript=self._on_gemini_live_input_transcript,
+                on_output_transcript=self._on_gemini_live_output_transcript,
+                on_interrupted=self._on_gemini_live_interrupted,
+                on_turn_complete=self._on_gemini_live_turn_complete,
+                on_error=self._on_gemini_live_error,
+                on_closed=self._on_gemini_live_closed,
+                auto_start=False,
+            )
 
-            if self.tts is not None:
+            if session is None:
+                raise RuntimeError("Gemini Live session could not be created.")
 
-                self.tts.speak(
-                    "Listening"
-                )
+            self.gemini_live_session = session
+            self.gemini_live_active = True
+
+            worker = GeminiLiveAudioWorker(session, self)
+            worker.connected.connect(self._on_gemini_live_audio_worker_connected)
+            worker.failed.connect(self._on_gemini_live_audio_worker_failed)
+            worker.finished_audio.connect(self._on_gemini_live_audio_worker_finished)
+            self.gemini_live_audio_worker = worker
+            worker.start()
+
+            self.status_label.setText("Status : Gemini Live Listening")
+            print("[LIVE] Gemini Live conversation started.")
 
         except Exception as error:
+            print(f"[LIVE] Start error: {error}")
+            self._handle_gemini_live_error(str(error))
 
-            print(
-                f"Listening Prompt TTS Error : {error}"
-            )
-
-            # If TTS fails, start microphone directly.
-            self._start_manual_listener_after_prompt()
-
+    def _on_gemini_live_audio_worker_connected(self):
+        if self._closing or not self.gemini_live_active:
             return
-
-        # ---------------------------------
-        # Wait asynchronously for TTS
-        # ---------------------------------
-
-        QTimer.singleShot(
-            100,
-            self._wait_for_manual_listening_prompt
-        )
-
-    # --------------------------------------------------
-    # Wait For Manual Listening Prompt
-    # --------------------------------------------------
-
-    def _wait_for_manual_listening_prompt(self):
-        """
-        Wait asynchronously until ASTRA finishes saying
-        "Listening".
-
-        The microphone remains disabled at the backend while
-        TTS is speaking. This prevents Whisper from hearing
-        ASTRA's own voice.
-        """
-
-        if self._closing:
-            return
-
-        if not self.manual_listening_requested:
-            return
-
         try:
-
-            speaking = (
-                self.tts is not None
-                and self.tts.speaking()
-            )
-
-        except Exception:
-
-            speaking = False
-
-        if speaking:
-
-            QTimer.singleShot(
-                60,
-                self._wait_for_manual_listening_prompt
-            )
-
-            return
-
-        # ---------------------------------
-        # TTS finished
-        # ---------------------------------
-
-        self._start_manual_listener_after_prompt()
-
-    # --------------------------------------------------
-    # Start Manual Listener After Prompt
-    # --------------------------------------------------
-
-    def _start_manual_listener_after_prompt(self):
-        """
-        Start the actual microphone listener only after
-        ASTRA's "Listening" prompt has completely finished.
-        """
-
-        if self._closing:
-            return
-
-        if not self.manual_listening_requested:
-            return
-
-        # ---------------------------------
-        # Safety: existing worker
-        # ---------------------------------
-
-        if self.voice_worker is not None:
-
-            try:
-
-                if self.voice_worker.isRunning():
-                    return
-
-            except Exception:
-                pass
-
-        # ---------------------------------
-        # Update UI
-        # ---------------------------------
-
-        self.status_label.setText(
-            "Status : Listening..."
-        )
-
-        # ---------------------------------
-        # Avatar: keep LISTENING visible
-        # during actual microphone capture.
-        # ---------------------------------
-
-        self._set_avatar_state(
-            "listening"
-        )
-
-        try:
-
-            self.mic_widget.show_listening()
-
-            # Start a clean visual meter for every recording session.
-            self.mic_widget.set_listening(
-                True
-            )
-
-            self.mic_widget.update_audio_level(
-                0.0
-            )
-
-            self.left_panel.set_listening(
-                "Listening"
-            )
-
-            self._set_thinking_state(
-                "Inactive"
-            )
-
-            self.left_panel.set_speaking(
-                "Silent"
-            )
-
+            input_enabled = not self.physical_microphone_muted
+            if self.gemini_live_audio_worker is not None:
+                self.gemini_live_audio_worker.set_input_enabled(input_enabled)
+            self.gemini_live_mic_enabled = input_enabled
+            self.microphone_button.setEnabled(True)
+            self.mic_widget.setEnabled(True)
+            if input_enabled:
+                self.status_label.setText("Status : Listening")
+                self._set_avatar_state("listening")
+                self.left_panel.set_listening("Listening")
+                self.left_panel.set_speaking("Silent")
+                self._set_thinking_state("Inactive")
+            else:
+                self.status_label.setText("Status : Microphone Muted")
+                self._set_avatar_state("idle")
+                self.left_panel.set_listening("Mic Muted")
+                self.left_panel.set_speaking("Silent")
+                self._set_thinking_state("Inactive")
+                self.mic_widget.set_listening(False)
         except Exception:
             pass
 
-        QApplication.processEvents()
+    def _on_gemini_live_audio_worker_failed(self, message):
+        if not self._closing:
+            self.gemini_live_error_signal.emit(str(message or "Gemini Live audio failed."))
 
-        # ---------------------------------
-        # Start Manual Worker
-        # ---------------------------------
+    def _on_gemini_live_audio_worker_finished(self):
+        if not self._closing:
+            print("[LIVE] Audio bridge finished.")
 
-        QTimer.singleShot(
-            50,
-            lambda: self.start_voice_worker(
-                wake_word_mode=False
-            )
+    def _on_gemini_live_connected(self):
+        if not self._closing:
+            print("[LIVE] Gemini Live API connected.")
+
+    def _on_gemini_live_audio(self, audio_data):
+        worker = self.gemini_live_audio_worker
+        if worker is not None and self.gemini_live_active:
+            worker.enqueue_output(audio_data)
+
+    def _on_gemini_live_input_transcript(self, text):
+        self.gemini_live_input_signal.emit(str(text or ""))
+
+    def _on_gemini_live_output_transcript(self, text):
+        self.gemini_live_output_signal.emit(str(text or ""))
+
+    def _on_gemini_live_interrupted(self):
+        self.gemini_live_interrupted_signal.emit()
+
+    def _on_gemini_live_turn_complete(self, user_text, assistant_text):
+        self.gemini_live_turn_complete_signal.emit(
+            str(user_text or ""),
+            str(assistant_text or ""),
         )
 
-    def listening_finished(self):
-        """
-        Handle completion of both:
-
-        1. Production DHEEPTHI wake-word listening
-        2. Manual microphone listening
-
-        IMPORTANT:
-        This method never blocks the Qt GUI thread with
-        QThread.wait(). The worker's finished signal already
-        tells us that its run() method has returned.
-        """
-
-        finished_mode = self.current_voice_mode
-
-        current_worker = self.voice_worker
-
-        self.voice_worker = None
-
-        self.current_voice_mode = None
-
-        # ---------------------------------
-        # Stop Audio UI
-        # ---------------------------------
-
-        try:
-
-            self.mic_widget.update_audio_level(
-                0.0
-            )
-
-            # Use the widget's public state API instead of touching
-            # the private _listening attribute directly.
-            self.mic_widget.set_listening(False)
-
-        except Exception:
-            pass
-
-        # ---------------------------------
-        # Non-blocking Worker Cleanup
-        # ---------------------------------
-
-        if current_worker:
-
-            try:
-
-                current_worker.deleteLater()
-
-            except Exception as error:
-
-                print(
-                    f"Voice Worker Cleanup Error : {error}"
-                )
-
-        # ==================================================
-        # MANUAL MICROPHONE MODE
-        # ==================================================
-
-        if finished_mode == "manual":
-
-            print(
-                "Manual microphone listening finished."
-            )
-
-            self.manual_listening_requested = False
-
-            self.wake_word_running = False
-
-            # --------------------------------------------------
-            # SILENCE / COMMAND TIMEOUT
-            # --------------------------------------------------
-            #
-            # Silence after a manual microphone click is a normal
-            # cancelled listening session.
-            #
-            # Required V1 lifecycle:
-            #
-            #     LISTENING
-            #         ↓
-            #     timeout
-            #         ↓
-            #     ERROR avatar
-            #         ↓
-            #     IDLE avatar
-            #         ↓
-            #     microphone unlocked
-            #         ↓
-            #     DHEEPTHI wake listener restarted
-            #
-            # Never enter the processing/thinking state for a timeout.
-            # Never treat timeout as application shutdown.
-            # --------------------------------------------------
-
-            if (
-                current_worker is not None
-                and getattr(
-                    current_worker,
-                    "timed_out",
-                    False,
-                )
-                and not getattr(
-                    current_worker,
-                    "command_captured",
-                    False,
-                )
-            ):
-
-                print(
-                    "\n========== VOICE TIMEOUT =========="
-                )
-
-                print(
-                    "No command detected."
-                )
-
-                print(
-                    "Manual microphone session cancelled safely."
-                )
-
-                print(
-                    "Showing ERROR state before returning to IDLE."
-                )
-
-                print(
-                    "===================================\n"
-                )
-
-                # ------------------------------------------
-                # Reset voice ownership immediately
-                # ------------------------------------------
-
-                self.manual_listening_requested = False
-                self.wake_word_running = False
-                self._wake_command_transition_active = False
-
-                # A timeout means no command was handed to
-                # process_command(), so processing must remain false.
-                self.processing_voice = False
-
-                # ------------------------------------------
-                # Stop audio meter / microphone visual state
-                # ------------------------------------------
-
-                try:
-
-                    self.mic_widget.update_audio_level(
-                        0.0
-                    )
-
-                    self.mic_widget.set_listening(
-                        False
-                    )
-
-                except Exception as error:
-
-                    print(
-                        f"Voice timeout mic UI reset error : {error}"
-                    )
-
-                # ------------------------------------------
-                # ERROR state
-                # ------------------------------------------
-
-                try:
-
-                    self.status_label.setText(
-                        "Status : No command detected"
-                    )
-
-                    self.left_panel.set_listening(
-                        "No command"
-                    )
-
-                    self._set_thinking_state(
-                        "Inactive"
-                    )
-
-                    self.left_panel.set_speaking(
-                        "Silent"
-                    )
-
-                    self._set_avatar_state(
-                        "error"
-                    )
-
-                except Exception as error:
-
-                    print(
-                        f"Voice timeout ERROR state error : {error}"
-                    )
-
-                # ------------------------------------------
-                # Unlock immediately
-                # ------------------------------------------
-
-                self.unlock_microphone()
-
-                # ------------------------------------------
-                # ERROR -> IDLE
-                # ------------------------------------------
-                #
-                # Keep the error avatar visible briefly so the user
-                # can clearly see that the listening attempt ended.
-                # Then restore the normal idle avatar.
-                # ------------------------------------------
-
-                def _finish_voice_timeout():
-
-                    if self._closing:
-
-                        return
-
-                    try:
-
-                        self._set_avatar_state(
-                            "idle"
-                        )
-
-                        self.status_label.setText(
-                            "Status : Waiting for DHEEPTHI"
-                            if self.wake_word_enabled
-                            else "Status : Idle"
-                        )
-
-                        self.left_panel.set_listening(
-                            "Waiting for DHEEPTHI"
-                            if self.wake_word_enabled
-                            else "Idle"
-                        )
-
-                        self._set_thinking_state(
-                            "Inactive"
-                        )
-
-                        self.left_panel.set_speaking(
-                            "Silent"
-                        )
-
-                    except Exception as error:
-
-                        print(
-                            f"Voice timeout IDLE state error : {error}"
-                        )
-
-                    # --------------------------------------
-                    # Restart wake-word detection only after
-                    # the ERROR -> IDLE transition completes.
-                    # --------------------------------------
-
-                    if (
-                        self.wake_word_enabled
-                        and not self.manual_listening_requested
-                        and not self.processing_voice
-                        and not self._closing
-                    ):
-
-                        print(
-                            "Voice timeout recovery complete."
-                        )
-
-                        print(
-                            "Restarting DHEEPTHI wake listener..."
-                        )
-
-                        QTimer.singleShot(
-                            150,
-                            self.start_wake_word_worker
-                        )
-
-                QTimer.singleShot(
-                    1200,
-                    _finish_voice_timeout
-                )
-
-                return
-
-            # --------------------------------------------------
-            # Pending YES/NO confirmation
-            # --------------------------------------------------
-            # process_command() can receive the confirmation request
-            # while the manual worker is still unwinding. Start the
-            # confirmation listener only after this worker has fully
-            # finished, otherwise two voice workers could overlap.
-
-            # =================================================
-            # Pending File Selection - FIRST PRIORITY
-            # =================================================
-
-            if self._pending_file_selection:
-
-                print(
-                    "Manual listening finished. "
-                    "Pending file selection is active."
-                )
-
-                self.status_label.setText(
-                    "Status : Waiting for File Selection"
-                )
-
-                try:
-
-                    self.left_panel.set_listening(
-                        "Select File Number"
-                    )
-
-                    self._set_thinking_state(
-                        "Waiting for Selection"
-                    )
-
-                    self.left_panel.set_speaking(
-                        "Silent"
-                    )
-
-                    self.mic_widget.show_listening()
-
-                    self.mic_widget.set_listening(
-                        False
-                    )
-
-                except Exception as error:
-
-                    print(
-                        f"File Selection State Error : {error}"
-                    )
-
-                QTimer.singleShot(
-                    150,
-                    self._wait_for_speech_then_start_selection
-                )
-
-                return
-
-
-            # =================================================
-            # Pending Confirmation - SECOND PRIORITY
-            # =================================================
-
-            if self._pending_confirmation:
-
-                print(
-                    "Manual listening finished. "
-                    "Pending confirmation is active."
-                )
-
-                self.status_label.setText(
-                    "Status : Waiting for Confirmation"
-                )
-
-                try:
-
-                    self.left_panel.set_listening(
-                        "Say Yes or No"
-                    )
-
-                    self._set_thinking_state(
-                        "Waiting for Confirmation"
-                    )
-
-                    self.left_panel.set_speaking(
-                        "Silent"
-                    )
-
-                except Exception as error:
-
-                    print(
-                        f"Confirmation State Error : {error}"
-                    )
-
-                QTimer.singleShot(
-                    120,
-                    self._wait_for_confirmation_prompt
-                )
-
-                return
-
-            # --------------------------------------------------
-            # Normal manual command
-            # --------------------------------------------------
-            # DO NOT unlock or restart wake-word mode here.
-            # process_command() owns the command lifecycle and
-            # _unlock_after_speech() will unlock + restart wake
-            # only after processing/TTS has completed.
-            # --------------------------------------------------
-
-            self.status_label.setText(
-                "Status : Processing..."
-            )
-
-            # IMPORTANT:
-            # Do not force thinking_ai here. command_ready/process_command()
-            # already detects the intent and selects thinking_laptop or
-            # thinking_ai. Keeping that state prevents this finished callback
-            # from overwriting the correct avatar.
-
-            try:
-
-                self.left_panel.set_listening(
-                    "Idle"
-                )
-
-                self._set_thinking_state(
-                    "Thinking",
-                    avatar_state="thinking_laptop",
-                )
-
-                self.left_panel.set_speaking(
-                    "Silent"
-                )
-
-            except Exception:
-                pass
-
-            return
-
-        # ==================================================
-        # DHEEPTHI WAKE WORD MODE
-        # ==================================================
-
-        if finished_mode == "wake":
-
-            self.wake_word_running = False
-
-            # The wake listener has released the microphone. The transition
-            # guard can now be cleared because command capture is about to
-            # take ownership through the existing manual path.
-            self._wake_command_transition_active = False
-
-            # ---------------------------------
-            # Manual microphone has priority
-            # ---------------------------------
-
-            if self.manual_listening_requested:
-
-                print(
-                    "Wake listener stopped for manual microphone."
-                )
-
-                QTimer.singleShot(
-                    0,
-                    self._begin_manual_listening_prompt
-                )
-
-                return
-
-            # ---------------------------------
-            # Wake-word command is being processed.
-            # ---------------------------------
-
-            if self.processing_voice:
-
-                return
-
-            # ---------------------------------
-            # Normal Wake Word Loop
-            # ---------------------------------
-
-            if self.wake_word_enabled:
-
-                try:
-
-                    self.left_panel.set_listening(
-                        "Waiting for DHEEPTHI"
-                    )
-
-                    self._set_thinking_state(
-                        "Inactive"
-                    )
-
-                    self.left_panel.set_speaking(
-                        "Silent"
-                    )
-
-                except Exception:
-                    pass
-
-                QTimer.singleShot(
-                    700,
-                    lambda: (
-                        self.start_wake_word_worker()
-                        if self.wake_word_enabled
-                        and not self.manual_listening_requested
-                        and not self.processing_voice
-                        else None
-                    )
-                )
-
-            return
-
-        # ---------------------------------
-        # Unknown / Safety
-        # ---------------------------------
-
-        if not self.processing_voice:
-
-            self.manual_listening_requested = False
-
-            QTimer.singleShot(
-                120,
-                self.unlock_microphone
-            )
-
-    def start_voice_worker(
-        self,
-        wake_word_mode=False
-    ):
-        """
-        Start a voice worker in either:
-
-        wake_word_mode=True
-            -> DHEEPTHI standby
-
-        wake_word_mode=False
-            -> Manual microphone
-        """
-
-        # ---------------------------------
-        # Startup Greeting Safety Gate
-        # ---------------------------------
-        # No wake/manual voice worker may start while the opening greeting
-        # owns the microphone.  This blocks stale QTimer callbacks and any
-        # initialization race from stealing the microphone.
-
-        if getattr(
-            self,
-            "_startup_greeting_active",
-            False,
-        ):
-
-            print(
-                "[VOICE] Startup greeting active. "
-                "Voice worker start blocked."
-            )
-
-            return
-
-        if not getattr(
-            self,
-            "_startup_sequence_complete",
-            False,
-        ):
-
-            print(
-                "[VOICE] Startup sequence incomplete. "
-                "Voice worker start blocked."
-            )
-
-            return
-
-        # ---------------------------------
-        # Existing worker check
-        # ---------------------------------
-
-        if self.voice_worker is not None:
-
-            try:
-                if self.voice_worker.isRunning():
-                    return
-            except RuntimeError:
-                # The previous QThread object may already have been deleted.
-                self.voice_worker = None
-
-        # ---------------------------------
-        # Set Worker Mode
-        # ---------------------------------
-
-        if wake_word_mode:
-            # Wake mode is owned by start_wake_word_worker().
-            # Do not route production wake detection through SpeechRecognizer.
-            print(
-                "[VOICE] Wake mode request redirected to production detector."
-            )
-
-            self.start_wake_word_worker()
-            return
-
-        self.current_voice_mode = "manual"
-
-        # ---------------------------------
-        # Create Worker
-        # ---------------------------------
-
-        self.voice_worker = VoiceWorker(
-            self.recognizer,
-            self.tts,
-            wake_word_mode=False,
-        )
-
-        # ---------------------------------
-        # Signals
-        # ---------------------------------
-
-        self.voice_worker.command_ready.connect(
-            self.process_command
-        )
-
-        self.voice_worker.audio_level.connect(
-            self.update_audio_wave
-        )
-
-        self.voice_worker.finished.connect(
-            self.listening_finished
-        )
-
-        # ---------------------------------
-        # Start
-        # ---------------------------------
-
-        self.voice_worker.start()
-
-        if wake_word_mode:
-
-            self.wake_word_running = True
-
-            print(
-                "DHEEPTHI wake listener started."
-            )
-
-        else:
-
-            print(
-                "Manual microphone listener started."
-            )
-
-    # --------------------------------------------------
-    # Start DHEEPTHI Wake Word Worker
-    # --------------------------------------------------
-
-    def start_wake_word_worker(self):
-
-        # ----------------------------------
-        # Startup Greeting Safety Gate
-        # ----------------------------------
-        # Any stale timer/signal must be ignored until the opening TTS has
-        # completely finished and _finish_startup_greeting() has explicitly
-        # released the microphone.
-
-        if getattr(
-            self,
-            "_startup_greeting_active",
-            False,
-        ):
-
-            print(
-                "[WAKE] Startup greeting active. "
-                "DHEEPTHI start request ignored."
-            )
-
-            return
-
-        if not getattr(
-            self,
-            "_startup_sequence_complete",
-            False,
-        ):
-
-            print(
-                "[WAKE] Startup sequence incomplete. "
-                "DHEEPTHI start request ignored."
-            )
-
-            return
-
-        if not self.wake_word_enabled:
-
-            return
-
-        # ---------------------------------
-        # Manual microphone has priority
-        # ---------------------------------
-
-        if self.manual_listening_requested:
-
-            return
-
-        if self.processing_voice:
-
-            return
-
-        # ---------------------------------
-        # Existing Worker
-        # ---------------------------------
-
-        if self.voice_worker is not None:
-
-            if self.voice_worker.isRunning():
-
-                return
-
-        # ---------------------------------
-        # Start Wake Mode
-        # ---------------------------------
-
-        self.wake_word_running = True
-
-        self.current_voice_mode = "wake"
-
-        self.status_label.setText(
-            "Status : Waiting for DHEEPTHI"
-        )
-
-        try:
-
-            self.left_panel.set_listening(
-                "Waiting for DHEEPTHI"
-            )
-
-            self._set_thinking_state(
-                "Inactive"
-            )
-
-            self.left_panel.set_speaking(
-                "Silent"
-            )
-
-        except Exception:
-
-            pass
-
-        # Production detector owns the wake-word microphone.
-        self.voice_worker = WakeWordWorker(
-            self.wake_word_detector
-        )
-
-        self.voice_worker.wake_detected.connect(
-            self._on_wake_word_detected
-        )
-
-        self.voice_worker.audio_level.connect(
-            self.update_audio_wave
-        )
-
-        self.voice_worker.finished.connect(
-            self.listening_finished
-        )
-
-        self.voice_worker.start()
-
-        self.wake_word_running = True
-
-        print(
-            "DHEEPTHI production wake listener started."
-        )
-
-    # --------------------------------------------------
-    # Production DHEEPTHI Detection Callback
-    # --------------------------------------------------
+    def _on_gemini_live_error(self, error):
+        self.gemini_live_error_signal.emit(str(error or "Gemini Live error."))
+
+    def _on_gemini_live_closed(self):
+        self.gemini_live_closed_signal.emit()
 
     @Slot(str)
-    def _on_wake_word_detected(
-        self,
-        wake_word,
-    ):
-        """Convert DHEEPTHI detection into the existing manual command flow.
+    def _handle_gemini_live_input_transcript(self, text):
+        text = str(text or "").strip()
+        if not text or self._closing or not self.gemini_live_active:
+            return
 
-        Production wake-word recognition stays completely inside
-        ``WakeWordDetector``. Once it confirms DHEEPTHI, MainWindow only
-        performs the hand-off: stop the wake listener, show the existing
-        LISTENING avatar/state, say ``Listening``, and then start the exact
-        same command STT worker used by the manual microphone button.
+        self.gemini_live_user_transcript = text
 
-        This method intentionally does NOT add a second STT path and does
-        NOT send the wake-word text into the command dispatcher.
-        """
+        try:
+            self.mic_widget.update_user_message(text)
+        except Exception:
+            pass
 
+        try:
+            local_intent = self.intent_detector.detect_local_intent_only(text)
+        except Exception as error:
+            print(f"[LIVE] Local intent routing error: {error}")
+            local_intent = None
+
+        # Native Gemini Live owns normal conversation. No second STT/LLM/TTS
+        # pipeline is started for these messages.
+        if local_intent in (None, "ai_chat"):
+            try:
+                self.status_label.setText("Status : DHEEPTHI Listening")
+                self._set_avatar_state("listening")
+                self.left_panel.set_listening("Listening")
+            except Exception:
+                pass
+            return
+
+        # Deterministic local command: interrupt Live immediately and reuse
+        # the existing command processor unchanged.
+        if text == self.gemini_live_last_command:
+            return
+
+        self.gemini_live_last_command = text
+        self.gemini_live_command_handoff = True
+
+        print("\n========== LIVE -> COMMAND ROUTE ==========")
+        print(f"Recognized command : {text}")
+        print(f"Local intent       : {local_intent}")
+        print("===========================================\n")
+
+        self.processing_voice = True
+        self._stop_gemini_live_conversation(clear_audio=True, restart_live=False)
+        QTimer.singleShot(0, lambda command=text: self.process_command(command))
+
+    @Slot(str)
+    def _handle_gemini_live_output_transcript(self, text):
+        if self._closing or not text:
+            return
+
+        self.gemini_live_output_transcript += text
+
+        if self.physical_microphone_muted:
+            # Keep the hardware-mute state authoritative for the UI.
+            # Gemini Live may still finish an already-generated response,
+            # but DHEEPTHI must remain visually IDLE.
+            return
+
+        try:
+            self.mic_widget.update_ai_message(
+                self.gemini_live_output_transcript.strip()
+            )
+            self.status_label.setText("Status : DHEEPTHI Speaking")
+            self._set_avatar_state("speaking")
+            self.left_panel.set_speaking("Speaking")
+            self._set_thinking_state("Inactive")
+        except Exception:
+            pass
+
+    @Slot()
+    def _handle_gemini_live_interrupted(self):
+        worker = self.gemini_live_audio_worker
+        if worker is not None:
+            worker.clear_output()
+
+        if self._closing or not self.gemini_live_active:
+            return
+
+        if self.physical_microphone_muted:
+            self._set_gemini_live_input_from_physical_mic(False)
+            return
+
+        print("[LIVE] Model response interrupted by user speech.")
+        try:
+            self.status_label.setText("Status : Listening")
+            self._set_avatar_state("listening")
+            self.left_panel.set_listening("Listening")
+            self.left_panel.set_speaking("Silent")
+            self.microphone_button.setEnabled(True)
+            self.mic_widget.setEnabled(True)
+        except Exception:
+            pass
+
+    @Slot(str, str)
+    def _handle_gemini_live_turn_complete(self, user_text, assistant_text):
         if self._closing:
             return
 
-        if not self.wake_word_enabled:
+        if user_text:
+            self.gemini_live_user_transcript = user_text
+
+        if assistant_text:
+            self.gemini_live_output_transcript = assistant_text
+            try:
+                self.mic_widget.update_ai_message(assistant_text)
+            except Exception:
+                pass
+
+        if self.gemini_live_active and not self.physical_microphone_muted:
+            try:
+                self.status_label.setText("Status : Listening")
+                self._set_avatar_state("listening")
+                self.left_panel.set_listening("Listening")
+                self.left_panel.set_speaking("Silent")
+                self._set_thinking_state("Inactive")
+                self.microphone_button.setEnabled(True)
+                self.mic_widget.setEnabled(True)
+            except Exception:
+                pass
+
+        self.gemini_live_output_transcript = ""
+
+    @Slot(str)
+    def _handle_gemini_live_error(self, message):
+        if self._closing:
             return
 
-        if self.processing_voice:
+        print(f"[LIVE] Gemini Live error: {message}")
+        handoff = self.gemini_live_command_handoff
+        self.gemini_live_active = False
+        self._stop_gemini_live_conversation(clear_audio=True, restart_live=False)
+
+        if handoff:
             return
-
-        if self.manual_listening_requested:
-            return
-
-        # The detector already guarantees one callback per detection.
-        # The additional GUI-side guard protects against a race between
-        # the detector callback, the worker shutdown signal, and queued
-        # Qt events.
-        if self._wake_command_transition_active:
-            return
-
-        normalized = (
-            str(wake_word or "")
-            .strip()
-            .lower()
-        )
-
-        if normalized and "dheepthi" not in normalized:
-            return
-
-        self._wake_command_transition_active = True
-
-        print(
-            "\n⚡ DHEEPTHI confirmed by production detector."
-        )
-        print(
-            "[WAKE -> COMMAND] Handing control to the existing manual STT lifecycle."
-        )
-
-        # --------------------------------------------------
-        # Reuse the EXACT manual microphone lifecycle
-        # --------------------------------------------------
-        # This flag is consumed by listening_finished(). When the wake
-        # worker releases the microphone, listening_finished() calls
-        # _begin_manual_listening_prompt(), which says "Listening" and then
-        # starts the normal VoiceWorker command capture.
-        self.manual_listening_requested = True
-        self.lock_microphone()
-
-        # Immediate UI transition: identical to a manual mic click.
-        self.status_label.setText(
-            "Status : Listening..."
-        )
-
-        self._set_avatar_state(
-            "listening"
-        )
 
         try:
-            self.mic_widget.show_listening()
-            self.mic_widget.set_listening(False)
-
-            self.left_panel.set_listening(
-                "Listening"
+            self.mic_widget.update_ai_message(
+                "Sorry, Gemini Live is unavailable right now."
             )
+            self._set_avatar_state("error")
+            self.status_label.setText("Status : Gemini Live Error")
+        except Exception:
+            pass
 
-            self._set_thinking_state(
-                "Inactive"
-            )
+        self.processing_voice = False
+        self.manual_listening_requested = False
+        self.gemini_live_mic_enabled = True
+        self.unlock_microphone()
 
-            self.left_panel.set_speaking(
-                "Silent"
-            )
+        if not self._closing:
+            self._gemini_live_pending_start = True
+            QTimer.singleShot(900, self._start_gemini_live_conversation)
 
-            QApplication.processEvents()
+    @Slot()
+    def _handle_gemini_live_closed(self):
+        if not self._closing and not self.gemini_live_command_handoff:
+            print("[LIVE] Gemini Live session closed.")
 
-        except Exception as error:
-            print(
-                f"Wake listening UI state error: {error}"
-            )
+    def _stop_gemini_live_conversation(self, clear_audio=True, restart_live=False):
+        """Stop the current Live session; restart_live is kept for compatibility and ignored."""
+        worker = self.gemini_live_audio_worker
+        session = self.gemini_live_session
+        self.gemini_live_active = False
 
-        # --------------------------------------------------
-        # Release wake-word microphone before TTS/STT
-        # --------------------------------------------------
-        # Never run command STT while the production wake detector still
-        # owns the sounddevice stream. This also prevents the following
-        # "Listening" TTS from being captured by the wake detector.
-        wake_worker = self.voice_worker
-
-        if wake_worker is not None:
+        if worker is not None:
             try:
-                if wake_worker.isRunning():
-                    print(
-                        "Stopping production DHEEPTHI listener "
-                        "before command capture..."
-                    )
-                    wake_worker.stop()
-                    return
+                if clear_audio:
+                    worker.clear_output()
+                worker.stop()
+                if worker.isRunning() and worker is not QThread.currentThread():
+                    worker.wait(2500)
             except Exception as error:
-                print(
-                    f"Wake worker state error: {error}"
-                )
+                print(f"[LIVE] Audio worker stop error: {error}")
 
-        # Worker already finished: continue through the same manual prompt.
-        QTimer.singleShot(
-            0,
-            self._begin_manual_listening_prompt
-        )
+        self.gemini_live_audio_worker = None
 
+        if session is not None:
+            try:
+                session.stop(timeout=3.0)
+            except Exception as error:
+                print(f"[LIVE] Session stop error: {error}")
+
+        try:
+            if self.gemini is not None:
+                self.gemini.close_live_session()
+        except Exception as error:
+            print(f"[LIVE] Gemini client Live cleanup error: {error}")
+
+        self.gemini_live_session = None
+
+    def _restart_gemini_live_after_command(self):
+        """Return to realtime conversation after a local command/TTS flow."""
+        if self._closing or getattr(self, "_startup_greeting_active", False):
+            return
+        if self.gemini_live_active:
+            return
+
+        self.processing_voice = False
+        self.manual_listening_requested = False
+        self.gemini_live_mic_enabled = not self.physical_microphone_muted
+        self._gemini_live_pending_start = not self.physical_microphone_muted
+        self.unlock_microphone()
+        if self.physical_microphone_muted:
+            self._set_gemini_live_input_from_physical_mic(False)
+            return
+        print("[COMMAND -> LIVE] Returning to Gemini Live conversation.")
+        QTimer.singleShot(0, self._start_gemini_live_conversation)
 
     # --------------------------------------------------
     # Audio Wave Update
@@ -11636,7 +10985,7 @@ class MainWindow(QMainWindow):
 
         This method intentionally does not call
         process_command() because process_command() owns
-        microphone/TTS/wake-word lifecycle.
+        microphone/TTS/Live lifecycle.
         """
 
         try:
@@ -12397,7 +11746,7 @@ class MainWindow(QMainWindow):
             self._set_avatar_state("success")
 
             self._unlock_after_speech(
-                restart_wake=True,
+                restart_live=True,
                 terminal_avatar_state="success",
             )
 
@@ -12456,7 +11805,7 @@ class MainWindow(QMainWindow):
         self._set_avatar_state("error")
 
         self._unlock_after_speech(
-            restart_wake=True,
+            restart_live=True,
             terminal_avatar_state="error",
         )
 
@@ -12557,7 +11906,7 @@ class MainWindow(QMainWindow):
                     )
 
                 self._unlock_after_speech(
-                    restart_wake=True
+                    restart_live=True
                 )
 
                 return
@@ -14542,13 +13891,10 @@ class MainWindow(QMainWindow):
         print(f"DHEEPTHI : {goodbye_message}")
 
         # ----------------------------------------------
-        # Prevent new voice / wake-word work.
+        # Prevent new voice work.
         # ----------------------------------------------
 
         self.manual_listening_requested = False
-        self._wake_command_transition_active = False
-        self.wake_word_enabled = False
-        self.wake_word_running = False
         self.processing_voice = False
 
         # ----------------------------------------------
@@ -14743,8 +14089,6 @@ class MainWindow(QMainWindow):
         # ==================================================
 
         self.manual_listening_requested = False
-        self.wake_word_enabled = False
-        self.wake_word_running = False
 
         # ==================================================
         # PROCESS PENDING QT EVENTS
@@ -14847,8 +14191,7 @@ class MainWindow(QMainWindow):
                         #
                         # DO NOT destroy the QThread here.
                         #
-                        # Wake-word recording may still be inside
-                        # sounddevice / Faster-Whisper.
+                        # Legacy voice recording may still be stopping.
                         # --------------------------------------------------
 
                         print(
@@ -15070,35 +14413,29 @@ class MainWindow(QMainWindow):
                 )
 
         # ==================================================
-        # PRODUCTION DHEEPTHI WAKE DETECTOR
+        # PHYSICAL MICROPHONE MONITOR
         # ==================================================
 
-        wake_detector = getattr(
-            self,
-            "wake_word_detector",
-            None
-        )
+        try:
+            self._stop_physical_microphone_monitor()
+        except Exception as error:
+            print(f"Physical microphone monitor cleanup error : {error}")
 
-        if wake_detector is not None:
+        # ==================================================
+        # GEMINI LIVE CONVERSATION
+        # ==================================================
 
-            try:
-                print(
-                    "Closing production DHEEPTHI wake detector..."
-                )
-
-                wake_detector.close()
-
-                self.wake_word_detector = None
-
-                print(
-                    "Production DHEEPTHI wake detector closed."
-                )
-
-            except Exception as error:
-
-                print(
-                    f"Wake detector cleanup error: {error}"
-                )
+        try:
+            self._gemini_live_pending_start = False
+            self.gemini_live_command_handoff = True
+            self._stop_gemini_live_conversation(
+                clear_audio=True,
+                restart_live=False,
+            )
+        except Exception as error:
+            print(
+                f"Gemini Live Cleanup Error : {error}"
+            )
 
         # ==================================================
         # GEMINI
@@ -15160,6 +14497,15 @@ class MainWindow(QMainWindow):
         # ==================================================
 
         try:
+
+            streaming_tts_manager = getattr(
+                self,
+                "streaming_tts_manager",
+                None
+            )
+
+            if streaming_tts_manager is not None:
+                streaming_tts_manager.close()
 
             tts = getattr(
                 self,

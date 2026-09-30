@@ -12,6 +12,7 @@ import subprocess
 import sys
 
 from ai.gemini_client import GeminiClient
+from voice.streaming_tts_manager import StreamingTTSManager
 from code_agent.agent import CodeAgent
 from automation.screen_recorder import ScreenRecorder
 from automation.file_system_agent import FileSystemAgent
@@ -68,6 +69,19 @@ class CommandDispatcher:
         self.whisper = whisper
 
         self.gemini = gemini_client
+
+        # --------------------------------------------------
+        # Streaming Conversation TTS
+        # --------------------------------------------------
+        # Keep dispatcher-level AI conversation handling compatible with
+        # the existing TextToSpeech engine while allowing Gemini response
+        # chunks to reach speech before the full response is generated.
+        # MainWindow's voice route may use its own streaming session;
+        # this manager is the safe fallback for any dispatcher caller that
+        # reaches the ai_chat branch directly.
+        self.streaming_tts_manager = StreamingTTSManager(
+            self.tts
+        )
 
         # --------------------------------------------------
         # DHEEPTHI Code Agent V1
@@ -2848,6 +2862,25 @@ class CommandDispatcher:
     # Dispatcher
     # --------------------------------------------------
 
+    def close(self):
+        """Release dispatcher-owned streaming speech resources."""
+
+        manager = getattr(
+            self,
+            "streaming_tts_manager",
+            None,
+        )
+
+        if manager is not None:
+
+            try:
+                manager.close()
+            except Exception as error:
+                print(
+                    f"Streaming TTS Manager Close Error : {error}"
+                )
+
+
     def dispatch(
         self,
         intent,
@@ -3215,20 +3248,50 @@ class CommandDispatcher:
 
                     )
 
+                streaming_session = None
+                response_chunks = []
+
                 try:
 
-                    reply = (
-                        self.gemini.generate_response(
-                            conversation_message
-                        )
+                    streaming_session = (
+                        self.streaming_tts_manager.start_session()
                     )
+
+                    if streaming_session is None:
+                        raise RuntimeError(
+                            "Streaming TTS manager could not start a session"
+                        )
+
+                    for chunk in self.gemini.generate_response_stream(
+                        conversation_message
+                    ):
+
+                        if chunk is None:
+                            continue
+
+                        chunk = str(chunk)
+
+                        if not chunk.strip():
+                            continue
+
+                        response_chunks.append(chunk)
+
+                        self.streaming_tts_manager.add_chunk(
+                            chunk,
+                            streaming_session,
+                        )
 
                 except Exception as error:
 
                     print(
-                        "AI Conversation Error :",
+                        "AI Conversation Streaming Error :",
                         error
                     )
+
+                    try:
+                        self.streaming_tts_manager.stop()
+                    except Exception:
+                        pass
 
                     reply = (
                         "Sorry da, ippo response generate "
@@ -3255,11 +3318,14 @@ class CommandDispatcher:
 
                     )
 
-                reply = str(
-                    reply or ""
-                ).strip()
+                reply = "".join(response_chunks).strip()
 
                 if not reply:
+
+                    try:
+                        self.streaming_tts_manager.stop()
+                    except Exception:
+                        pass
 
                     reply = (
                         "Sorry da, ippo proper response "
@@ -3286,9 +3352,26 @@ class CommandDispatcher:
 
                     )
 
-                self.tts.speak(
-                    reply
-                )
+                if not self.streaming_tts_manager.finish(
+                    streaming_session
+                ):
+
+                    try:
+                        self.streaming_tts_manager.stop()
+                    except Exception:
+                        pass
+
+                    return self.response(
+
+                        False,
+
+                        "",
+
+                        "Status : AI Streaming TTS Failed",
+
+                        reply
+
+                    )
 
                 return self.response(
 

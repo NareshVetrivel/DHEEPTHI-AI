@@ -1056,6 +1056,21 @@ class IntentDetector:
 
             r"\b(meaning|difference|compare|explain|describe|"
             r"define|teach|guide|summary|summarize)\b",
+
+            # Natural conversational requests. These are especially
+            # important for Gemini Live transcripts because a desktop
+            # keyword may appear inside a question, for example:
+            #   "tell me about Chrome"
+            #   "what about Downloads"
+            #   "can you explain Chrome"
+            r"^(?:please\s+)?tell\s+me\b",
+            r"^(?:please\s+)?talk\s+(?:about|to)\b",
+            r"^(?:please\s+)?what\s+about\b",
+            r"^(?:please\s+)?give\s+me\b",
+            r"^(?:please\s+)?can\s+you\s+(?:tell|explain|describe|"
+            r"help|teach)\b",
+            r"^(?:please\s+)?could\s+you\s+(?:tell|explain|describe|"
+            r"help|teach)\b",
         )
 
         if any(
@@ -3293,6 +3308,55 @@ Normalized speech:
     # LOCAL-ONLY DETECTOR
     # ==========================================================
 
+    def _is_explicit_action_request(
+        self,
+        text: str,
+    ) -> bool:
+        """Return True when a conversational-looking sentence still
+        contains a direct request to perform a desktop action.
+
+        Gemini Live transcripts commonly contain polite forms such as
+        ``can you open Chrome``. The normal conversation detector treats
+        those as questions, so Live command handoff needs this small
+        disambiguation layer before deciding that a transcript belongs to
+        the conversation engine.
+        """
+
+        if not text:
+            return False
+
+        text = self._basic_normalize(text)
+
+        action = (
+            r"open|start|run|launch|close|exit|quit|terminate|"
+            r"create|make|new|delete|remove|rename|move|copy|paste|cut|"
+            r"type|write|click|double\s+click|right\s+click|scroll|"
+            r"search|find|locate|show|view|check|play|bookmark|refresh|reload|"
+            r"screenshot|record|capture|mute|lock|shutdown|restart|reboot|"
+            r"sleep|logout|signout|save|print|select|undo|redo|"
+            r"minimize|maximize|restore|press|set|increase|decrease|"
+            r"turn\s+(?:up|down|on|off)"
+        )
+
+        # Direct command is already covered by the existing detector.
+        if self._is_explicit_automation_command(text):
+            return True
+
+        # Polite/modal command forms:
+        #   can you open chrome
+        #   could you create a folder
+        #   would you close notepad
+        #   please open downloads
+        #   i want you to open chrome
+        patterns = (
+            rf"^(?:please\s+)?(?:can|could|would|will)\s+you\s+(?:please\s+)?(?:{action})\b",
+            rf"^(?:please\s+)(?:{action})\b",
+            rf"^i\s+(?:want|need)\s+you\s+to\s+(?:{action})\b",
+            rf"^(?:you\s+)?(?:please\s+)?(?:{action})\b",
+        )
+
+        return any(re.search(pattern, text) for pattern in patterns)
+
     def detect_local_intent_only(
         self,
         text: str,
@@ -3317,6 +3381,17 @@ Normalized speech:
         capture_intent = self._detect_capture_intent(normalized_text)
         if capture_intent:
             return capture_intent
+
+        # Gemini Live owns normal conversation. Only hand a transcript
+        # back to the existing command pipeline when it is an explicit
+        # desktop-action request. This prevents words such as Chrome,
+        # Downloads, Word, screenshot, etc. inside a question from
+        # accidentally terminating Live mode.
+        if (
+            not self._is_explicit_action_request(normalized_text)
+            and self._is_conversational_message(normalized_text)
+        ):
+            return "ai_chat"
 
         return self._detect_local_intent(normalized_text)
 

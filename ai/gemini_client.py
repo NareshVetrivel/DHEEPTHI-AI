@@ -11,6 +11,7 @@ Features
 ✓ Invalid-key fallback
 ✓ Temporary server-error fallback
 ✓ Network-error fallback
+✓ Groq cloud planner fallback
 ✓ Conversation memory
 ✓ Temporary in-memory conversation
 ✓ Context-aware replies
@@ -40,6 +41,8 @@ When the application closes:
 
 from __future__ import annotations
 
+import asyncio
+import os
 import threading
 import time
 from typing import Dict, List
@@ -48,6 +51,540 @@ from google import genai
 from google.genai import types
 
 from config import settings
+
+try:
+    from groq import Groq
+except ImportError:
+    Groq = None
+
+
+# ==========================================================
+# Gemini Live Conversation Session
+# ==========================================================
+
+class GeminiLiveSession:
+    """
+    Background-thread wrapper around the Gemini Live API.
+
+    The Live API is intentionally isolated from the existing text Gemini
+    methods.  Existing generate_response() and generate_response_stream()
+    callers continue to work unchanged.
+
+    Audio input expected by Live API
+        Raw PCM, 16-bit, mono, 16 kHz.
+
+    Audio output produced by Live API
+        Raw PCM, 16-bit, mono, 24 kHz.
+
+    Callbacks are optional and are invoked from the Live API worker thread:
+
+        on_connected()
+        on_audio(audio_bytes)
+        on_input_transcript(text)
+        on_output_transcript(text)
+        on_interrupted()
+        on_turn_complete(user_text, assistant_text)
+        on_error(exception)
+        on_closed()
+    """
+
+    def __init__(
+        self,
+        api_key: str,
+        model: str,
+        system_instruction: str,
+        on_connected=None,
+        on_audio=None,
+        on_input_transcript=None,
+        on_output_transcript=None,
+        on_interrupted=None,
+        on_turn_complete=None,
+        on_error=None,
+        on_closed=None,
+    ):
+        self.api_key = str(api_key or "").strip()
+        self.model = str(model or "").strip()
+        self.system_instruction = str(system_instruction or "").strip()
+
+        self.on_connected = on_connected
+        self.on_audio = on_audio
+        self.on_input_transcript = on_input_transcript
+        self.on_output_transcript = on_output_transcript
+        self.on_interrupted = on_interrupted
+        self.on_turn_complete = on_turn_complete
+        self.on_error = on_error
+        self.on_closed = on_closed
+
+        self._thread = None
+        self._loop = None
+        self._session = None
+        self._audio_queue = None
+        self._stop_event = None
+        self._ready_event = threading.Event()
+        self._closed_event = threading.Event()
+        self._closing = threading.Event()
+        self._started = False
+        self._start_error = None
+
+        self._current_user_transcript = ""
+        self._current_output_transcript = ""
+        self._transcript_lock = threading.RLock()
+
+    # ------------------------------------------------------
+    # Start
+    # ------------------------------------------------------
+
+    def start(self, timeout: float = 15.0) -> bool:
+        if self._started:
+            return self._start_error is None
+
+        if not self.api_key:
+            self._start_error = RuntimeError(
+                "Gemini Live API key is not configured."
+            )
+            return False
+
+        if not self.model:
+            self._start_error = RuntimeError(
+                "Gemini Live API model is not configured."
+            )
+            return False
+
+        self._closing.clear()
+        self._ready_event.clear()
+        self._closed_event.clear()
+        self._start_error = None
+
+        self._thread = threading.Thread(
+            target=self._thread_main,
+            name="GeminiLiveSession",
+            daemon=True,
+        )
+        self._started = True
+        self._thread.start()
+
+        if not self._ready_event.wait(timeout=max(0.1, float(timeout))):
+            self._start_error = TimeoutError(
+                "Timed out while connecting to Gemini Live API."
+            )
+            self.stop(timeout=3.0)
+            return False
+
+        return self._start_error is None
+
+    # ------------------------------------------------------
+    # Thread Main
+    # ------------------------------------------------------
+
+    def _thread_main(self):
+        try:
+            asyncio.run(self._run())
+        except Exception as error:
+            self._start_error = error
+            self._safe_callback(self.on_error, error)
+            self._ready_event.set()
+        finally:
+            self._closed_event.set()
+            self._safe_callback(self.on_closed)
+
+    # ------------------------------------------------------
+    # Async Session
+    # ------------------------------------------------------
+
+    async def _run(self):
+        self._loop = asyncio.get_running_loop()
+        self._stop_event = asyncio.Event()
+        self._audio_queue = asyncio.Queue(maxsize=64)
+
+        config = {
+            "response_modalities": ["AUDIO"],
+            "input_audio_transcription": {},
+            "output_audio_transcription": {},
+            "system_instruction": self.system_instruction,
+        }
+
+        receive_task = None
+        audio_task = None
+
+        try:
+            client = genai.Client(api_key=self.api_key)
+
+            async with client.aio.live.connect(
+                model=self.model,
+                config=config,
+            ) as session:
+                self._session = session
+                self._ready_event.set()
+                self._safe_callback(self.on_connected)
+
+                receive_task = asyncio.create_task(
+                    self._receive_loop(session)
+                )
+                audio_task = asyncio.create_task(
+                    self._audio_send_loop(session)
+                )
+
+                await self._stop_event.wait()
+
+        except Exception as error:
+            self._start_error = error
+            self._safe_callback(self.on_error, error)
+            self._ready_event.set()
+
+        finally:
+            for task in (receive_task, audio_task):
+                if task is not None and not task.done():
+                    task.cancel()
+
+            for task in (receive_task, audio_task):
+                if task is not None:
+                    try:
+                        await task
+                    except asyncio.CancelledError:
+                        pass
+                    except Exception:
+                        pass
+
+            self._session = None
+            self._loop = None
+            self._stop_event = None
+            self._audio_queue = None
+
+    # ------------------------------------------------------
+    # Receive Loop
+    # ------------------------------------------------------
+
+    async def _receive_loop(self, session):
+        try:
+            async for response in session.receive():
+                if self._closing.is_set():
+                    break
+
+                server_content = getattr(
+                    response,
+                    "server_content",
+                    None,
+                )
+
+                if server_content is None:
+                    continue
+
+                input_transcription = getattr(
+                    server_content,
+                    "input_transcription",
+                    None,
+                )
+
+                if input_transcription is not None:
+                    text = str(
+                        getattr(
+                            input_transcription,
+                            "text",
+                            "",
+                        )
+                        or ""
+                    ).strip()
+
+                    if text:
+                        with self._transcript_lock:
+                            self._current_user_transcript = text
+
+                        self._safe_callback(
+                            self.on_input_transcript,
+                            text,
+                        )
+
+                output_transcription = getattr(
+                    server_content,
+                    "output_transcription",
+                    None,
+                )
+
+                if output_transcription is not None:
+                    text = str(
+                        getattr(
+                            output_transcription,
+                            "text",
+                            "",
+                        )
+                        or ""
+                    ).strip()
+
+                    if text:
+                        with self._transcript_lock:
+                            self._current_output_transcript += text
+
+                        self._safe_callback(
+                            self.on_output_transcript,
+                            text,
+                        )
+
+                interrupted = bool(
+                    getattr(
+                        server_content,
+                        "interrupted",
+                        False,
+                    )
+                )
+
+                if interrupted:
+                    self._safe_callback(
+                        self.on_interrupted
+                    )
+
+                model_turn = getattr(
+                    server_content,
+                    "model_turn",
+                    None,
+                )
+
+                if model_turn is not None:
+                    parts = getattr(
+                        model_turn,
+                        "parts",
+                        None,
+                    ) or []
+
+                    for part in parts:
+                        inline_data = getattr(
+                            part,
+                            "inline_data",
+                            None,
+                        )
+
+                        if inline_data is None:
+                            continue
+
+                        audio_data = getattr(
+                            inline_data,
+                            "data",
+                            None,
+                        )
+
+                        if audio_data:
+                            self._safe_callback(
+                                self.on_audio,
+                                bytes(audio_data),
+                            )
+
+                turn_complete = bool(
+                    getattr(
+                        server_content,
+                        "turn_complete",
+                        False,
+                    )
+                )
+
+                if turn_complete:
+                    with self._transcript_lock:
+                        user_text = self._current_user_transcript.strip()
+                        assistant_text = self._current_output_transcript.strip()
+                        self._current_user_transcript = ""
+                        self._current_output_transcript = ""
+
+                    self._safe_callback(
+                        self.on_turn_complete,
+                        user_text,
+                        assistant_text,
+                    )
+
+        except asyncio.CancelledError:
+            raise
+        except Exception as error:
+            if not self._closing.is_set():
+                self._safe_callback(
+                    self.on_error,
+                    error,
+                )
+
+    # ------------------------------------------------------
+    # Audio Send Loop
+    # ------------------------------------------------------
+
+    async def _audio_send_loop(self, session):
+        while not self._closing.is_set():
+            audio_data = await self._audio_queue.get()
+
+            if audio_data is None:
+                return
+
+            await session.send_realtime_input(
+                audio=types.Blob(
+                    data=audio_data,
+                    mime_type="audio/pcm;rate=16000",
+                )
+            )
+
+    # ------------------------------------------------------
+    # Send Audio
+    # ------------------------------------------------------
+
+    def send_audio(self, audio_data: bytes) -> bool:
+        if not audio_data or self._closing.is_set():
+            return False
+
+        loop = self._loop
+        queue = self._audio_queue
+
+        if loop is None or queue is None or loop.is_closed():
+            return False
+
+        data = bytes(audio_data)
+
+        def enqueue():
+            if self._closing.is_set():
+                return
+
+            try:
+                queue.put_nowait(data)
+            except asyncio.QueueFull:
+                # Drop the oldest queued chunk so microphone capture does not
+                # block behind network backpressure.
+                try:
+                    queue.get_nowait()
+                except asyncio.QueueEmpty:
+                    pass
+
+                try:
+                    queue.put_nowait(data)
+                except asyncio.QueueFull:
+                    pass
+
+        try:
+            loop.call_soon_threadsafe(enqueue)
+            return True
+        except RuntimeError:
+            return False
+
+    # ------------------------------------------------------
+    # Send Text
+    # ------------------------------------------------------
+
+    def send_text(self, text: str) -> bool:
+        text = str(text or "").strip()
+
+        if not text or self._closing.is_set():
+            return False
+
+        loop = self._loop
+        session = self._session
+
+        if loop is None or session is None or loop.is_closed():
+            return False
+
+        async def send():
+            await session.send_realtime_input(
+                text=text
+            )
+
+        try:
+            asyncio.run_coroutine_threadsafe(
+                send(),
+                loop,
+            )
+            return True
+        except RuntimeError:
+            return False
+
+    # ------------------------------------------------------
+    # End Audio Stream
+    # ------------------------------------------------------
+
+    def end_audio_stream(self) -> bool:
+        if self._closing.is_set():
+            return False
+
+        loop = self._loop
+        session = self._session
+
+        if loop is None or session is None or loop.is_closed():
+            return False
+
+        async def end_stream():
+            await session.send_realtime_input(
+                audio_stream_end=True
+            )
+
+        try:
+            asyncio.run_coroutine_threadsafe(
+                end_stream(),
+                loop,
+            )
+            return True
+        except RuntimeError:
+            return False
+
+    # ------------------------------------------------------
+    # Stop
+    # ------------------------------------------------------
+
+    def stop(self, timeout: float = 5.0):
+        self._closing.set()
+
+        loop = self._loop
+        stop_event = self._stop_event
+        queue = self._audio_queue
+
+        if loop is not None and not loop.is_closed():
+            def request_stop():
+                if queue is not None:
+                    try:
+                        queue.put_nowait(None)
+                    except asyncio.QueueFull:
+                        pass
+
+                if stop_event is not None:
+                    stop_event.set()
+
+            try:
+                loop.call_soon_threadsafe(request_stop)
+            except RuntimeError:
+                pass
+
+        thread = self._thread
+
+        if (
+            thread is not None
+            and thread.is_alive()
+            and thread is not threading.current_thread()
+        ):
+            thread.join(timeout=max(0.1, float(timeout)))
+
+        self._thread = None
+        self._started = False
+
+    # ------------------------------------------------------
+    # Status
+    # ------------------------------------------------------
+
+    @property
+    def is_running(self) -> bool:
+        return bool(
+            self._thread is not None
+            and self._thread.is_alive()
+            and not self._closing.is_set()
+        )
+
+    @property
+    def start_error(self):
+        return self._start_error
+
+    # ------------------------------------------------------
+    # Callback Safety
+    # ------------------------------------------------------
+
+    @staticmethod
+    def _safe_callback(callback, *args):
+        if not callable(callback):
+            return
+
+        try:
+            callback(*args)
+        except Exception as error:
+            print(
+                "Gemini Live callback error:",
+                error,
+            )
 
 
 # ==========================================================
@@ -61,7 +598,8 @@ class GeminiClient:
     Responsibilities
     ----------------
     - Gemini API communication
-    - API key rotation
+    - Gemini API key rotation
+    - Groq cloud fallback for structured planning
     - Temporary conversation memory
     - Context-aware conversation
     - Active topic continuity
@@ -79,7 +617,7 @@ class GeminiClient:
     def __init__(self):
 
         # ------------------------------------------
-        # API Keys
+        # Gemini API Keys
         # ------------------------------------------
 
         self.api_keys: List[str] = []
@@ -119,27 +657,74 @@ class GeminiClient:
         )
 
         # ------------------------------------------
+        # Gemini Live API
+        # ------------------------------------------
+
+        # The Live API model is configurable because availability can
+        # differ by API account and Google can change preview model names.
+        # The attached Google quickstart used gemini-3.1-flash-live-preview.
+        self.live_model = (
+            getattr(
+                settings,
+                "GEMINI_LIVE_MODEL",
+                os.getenv(
+                    "GEMINI_LIVE_MODEL",
+                    "gemini-3.1-flash-live-preview"
+                )
+            )
+            or "gemini-3.1-flash-live-preview"
+        ).strip()
+
+        self.live_session = None
+
+        # ------------------------------------------
+        # Groq Planner Fallback
+        # ------------------------------------------
+        #
+        # IMPORTANT:
+        # GROQ_API_KEY is NOT used here.
+        #
+        # GROQ_API_KEY is reserved for the existing
+        # speech-to-text pipeline.
+        #
+        # This fallback exclusively uses:
+        #
+        #     GROQ_API_KEY_CODE_AGENT
+        #
+        # so the existing STT configuration remains
+        # completely independent.
+        # ------------------------------------------
+
+        self.groq_planner_api_key = (
+            os.getenv(
+                "GROQ_API_KEY_CODE_AGENT",
+                ""
+            )
+            .strip()
+        )
+
+        self.groq_planner_model = (
+            os.getenv(
+                "GROQ_CODE_AGENT_MODEL",
+                "openai/gpt-oss-20b"
+            )
+            .strip()
+        )
+
+        self.groq_planner_client = None
+
+        # ------------------------------------------
         # Temporary Conversation Memory
         # ------------------------------------------
 
         self.history: List[Dict[str, str]] = []
 
-        # Maximum messages retained in RAM.
         self.max_history_messages = 40
 
-        # Number of previous messages actually sent
-        # to Gemini as conversational context.
         self.context_messages = 12
 
         # ------------------------------------------
         # Retry Configuration
-        # ------------------------------------------
-        #
-        # Keep retry behavior lightweight.
-        #
-        # We do not perform long blocking retries.
-        # When a temporary/provider/key error occurs,
-        # we rotate to the next configured key.
         # ------------------------------------------
 
         self.retry_delay_seconds = 0.5
@@ -166,6 +751,27 @@ class GeminiClient:
             f"Keys : {len(self.api_keys)}"
         )
 
+        # ------------------------------------------
+        # Groq Planner Status
+        # ------------------------------------------
+
+        if self.groq_planner_api_key:
+
+            print(
+                "Groq Planner Fallback : CONFIGURED"
+            )
+
+            print(
+                f"Groq Planner Model : "
+                f"{self.groq_planner_model}"
+            )
+
+        else:
+
+            print(
+                "Groq Planner Fallback : NOT CONFIGURED"
+            )
+
     # ------------------------------------------------------
     # Create Gemini Client
     # ------------------------------------------------------
@@ -177,7 +783,6 @@ class GeminiClient:
         """
 
         if self._closing:
-
             return
 
         api_key = self.api_keys[
@@ -202,6 +807,55 @@ class GeminiClient:
         )
 
     # ------------------------------------------------------
+    # Create Groq Planner Client
+    # ------------------------------------------------------
+
+    def _create_groq_planner_client(self):
+        """
+        Lazily create the dedicated Groq planner client.
+
+        This client uses GROQ_API_KEY_CODE_AGENT only.
+
+        The existing GROQ_API_KEY used by STT is never
+        accessed by this method.
+        """
+
+        if self._closing:
+            return None
+
+        if not self.groq_planner_api_key:
+            return None
+
+        if Groq is None:
+            print(
+                "Groq Planner Fallback Error : "
+                "groq package is not installed."
+            )
+            return None
+
+        if self.groq_planner_client is not None:
+            return self.groq_planner_client
+
+        print(
+            "\nCreating Groq Planner Fallback Client..."
+        )
+
+        print(
+            f"Groq Planner Model : "
+            f"{self.groq_planner_model}"
+        )
+
+        print(
+            "Groq Planner API Key : CONFIGURED"
+        )
+
+        self.groq_planner_client = Groq(
+            api_key=self.groq_planner_api_key
+        )
+
+        return self.groq_planner_client
+
+    # ------------------------------------------------------
     # Mask API Key
     # ------------------------------------------------------
 
@@ -215,11 +869,9 @@ class GeminiClient:
         """
 
         if not api_key:
-
             return "Unavailable"
 
         if len(api_key) <= 8:
-
             return "********"
 
         return (
@@ -870,14 +1522,6 @@ and
     def _build_conversation_context(
         self
     ) -> str:
-        """
-        Build recent conversation context.
-
-        Only recent messages are sent to Gemini so that
-        the prompt remains lightweight.
-
-        The complete temporary history remains in RAM.
-        """
 
         if not self.history:
             return ""
@@ -930,15 +1574,6 @@ and
         self,
         user_message: str
     ):
-        """
-        Build a context-aware conversational prompt.
-
-        The current user message is stored in history
-        before this method is called.
-
-        Therefore the newest user message is excluded
-        from historical context and appended separately.
-        """
 
         user_message = str(
             user_message
@@ -947,10 +1582,6 @@ and
         prompt_parts = [
             self.system_prompt()
         ]
-
-        # ------------------------------------------
-        # Historical Context
-        # ------------------------------------------
 
         historical_messages = self.history[:-1]
 
@@ -992,10 +1623,6 @@ and
                     prompt_parts.append(
                         f"DHEEPTHI: {text}"
                     )
-
-        # ------------------------------------------
-        # Current User Message
-        # ------------------------------------------
 
         prompt_parts.append(
             "==================================================\n"
@@ -1023,12 +1650,6 @@ and
         self,
         user_message: str
     ):
-        """
-        Lightweight prompt builder.
-
-        Short messages also receive recent conversation
-        history so that follow-up questions retain context.
-        """
 
         user_message = str(
             user_message
@@ -1037,10 +1658,6 @@ and
         prompt_parts = [
             self.system_prompt()
         ]
-
-        # ------------------------------------------
-        # Recent Context
-        # ------------------------------------------
 
         historical_messages = self.history[:-1]
 
@@ -1082,10 +1699,6 @@ and
                     prompt_parts.append(
                         f"DHEEPTHI: {text}"
                     )
-
-        # ------------------------------------------
-        # Current User Message
-        # ------------------------------------------
 
         prompt_parts.append(
             "==================================================\n"
@@ -1114,19 +1727,8 @@ and
         error
     ):
         """
-        Detect errors where another API key/request attempt
-        should be attempted.
-
-        Retry categories
-        ----------------
-        1. Rate/quota errors
-        2. Authentication/API-key errors
-        3. Temporary Gemini/server errors
-        4. Temporary network/connection errors
-
-        Invalid request arguments are intentionally NOT
-        retryable because changing API keys will not fix
-        the same invalid request.
+        Detect errors where another Gemini key/request
+        attempt should be attempted.
         """
 
         error_text = str(
@@ -1134,20 +1736,12 @@ and
         ).lower()
 
         retry_keywords = (
-            # --------------------------------------
-            # Rate / quota
-            # --------------------------------------
-
             "429",
             "quota",
             "resource_exhausted",
             "rate limit",
             "rate_limit",
             "too many requests",
-
-            # --------------------------------------
-            # Authentication / API key
-            # --------------------------------------
 
             "401",
             "403",
@@ -1157,10 +1751,6 @@ and
             "invalid api key",
             "expired api key",
             "authentication",
-
-            # --------------------------------------
-            # Temporary server errors
-            # --------------------------------------
 
             "500",
             "502",
@@ -1173,10 +1763,6 @@ and
             "temporarily unavailable",
             "unavailable",
             "internal",
-
-            # --------------------------------------
-            # Temporary network errors
-            # --------------------------------------
 
             "timeout",
             "timed out",
@@ -1196,13 +1782,6 @@ and
     # ------------------------------------------------------
 
     def _retry_delay(self):
-        """
-        Small delay before switching to another key.
-
-        This prevents immediate repeated requests during
-        temporary provider/network failures while keeping
-        the application responsive.
-        """
 
         if self.retry_delay_seconds <= 0:
             return
@@ -1219,10 +1798,6 @@ and
     def _clean_response(
         text: str
     ) -> str:
-        """
-        Clean unnecessary formatting while preserving
-        the actual answer.
-        """
 
         if not text:
             return ""
@@ -1262,18 +1837,6 @@ and
         self,
         user_message: str
     ) -> str:
-        """
-        Generate DHEEPTHI response.
-
-        Conversation memory is maintained temporarily
-        in RAM.
-
-        The current user message and recent conversation
-        history are sent together.
-
-        API keys automatically rotate when the current
-        key becomes unavailable.
-        """
 
         if self._closing:
 
@@ -1291,19 +1854,11 @@ and
                 "Please say something."
             )
 
-        # ------------------------------------------
-        # Save User Message
-        # ------------------------------------------
-
         with self.lock:
 
             self.add_user_message(
                 user_message
             )
-
-            # --------------------------------------
-            # Prompt Selection
-            # --------------------------------------
 
             if len(
                 user_message
@@ -1322,10 +1877,6 @@ and
                         user_message
                     )
                 )
-
-        # ------------------------------------------
-        # API Attempts
-        # ------------------------------------------
 
         with self.lock:
 
@@ -1385,10 +1936,6 @@ and
                         )
                     )
 
-                    # ----------------------------------
-                    # Extract Response
-                    # ----------------------------------
-
                     text = ""
 
                     if response is not None:
@@ -1436,10 +1983,6 @@ and
                             "panna mudila."
                         )
 
-                    # ----------------------------------
-                    # Save Assistant Response
-                    # ----------------------------------
-
                     self.add_assistant_message(
                         text
                     )
@@ -1452,10 +1995,6 @@ and
                         "\nGemini Error :",
                         error
                     )
-
-                    # ----------------------------------
-                    # Retry / Fallback
-                    # ----------------------------------
 
                     if self._is_retryable_error(
                         error
@@ -1472,12 +2011,7 @@ and
                         self._retry_delay()
 
                         if self.rotate_api_key():
-
                             continue
-
-                    # ----------------------------------
-                    # Non-retryable Error
-                    # ----------------------------------
 
                     print(
                         "Gemini request failed."
@@ -1494,6 +2028,443 @@ and
         )
 
     # ------------------------------------------------------
+    # Generate Streaming Response
+    # ------------------------------------------------------
+
+    def generate_response_stream(
+        self,
+        user_message: str,
+        cancel_event=None,
+    ):
+        """Yield a Gemini response as text arrives.
+
+        This deliberately leaves ``generate_response()`` unchanged for
+        existing callers.  A streamed turn is committed to conversation
+        history only after its source stream finishes normally; cancelled,
+        empty, and failed turns leave history untouched.
+        """
+
+        if self._closing:
+            return
+
+        user_message = str(
+            user_message
+        ).strip()
+
+        if not user_message:
+            return
+
+        def is_cancelled():
+            return (
+                self._closing
+                or (
+                    cancel_event is not None
+                    and cancel_event.is_set()
+                )
+            )
+
+        if is_cancelled():
+            return
+
+        # The existing prompt builders expect the current user message to
+        # be the final item in history. Build that exact prompt without
+        # persisting a half-finished conversation turn.
+        with self.lock:
+
+            original_history = self.history
+
+            try:
+
+                temporary_history = list(
+                    original_history
+                )
+
+                temporary_history.append(
+                    {
+                        "role": "user",
+                        "text": user_message,
+                    }
+                )
+
+                if len(temporary_history) > self.max_history_messages:
+
+                    temporary_history = temporary_history[
+                        -self.max_history_messages:
+                    ]
+
+                self.history = temporary_history
+
+                if len(user_message) < 150:
+
+                    prompt = self.build_simple_prompt(
+                        user_message
+                    )
+
+                else:
+
+                    prompt = self.build_prompt(
+                        user_message
+                    )
+
+            finally:
+
+                self.history = original_history
+
+        with self.lock:
+
+            total_keys = len(
+                self.api_keys
+            )
+
+            attempted_keys = set()
+
+            for _ in range(total_keys):
+
+                if is_cancelled():
+                    return
+
+                current_index = self.current_key_index
+
+                if current_index in attempted_keys:
+                    break
+
+                attempted_keys.add(current_index)
+
+                yielded_text = False
+                collected_chunks = []
+                stream = None
+
+                try:
+
+                    print(
+                        f"Using Gemini Key "
+                        f"{current_index + 1}/"
+                        f"{total_keys} for streaming"
+                    )
+
+                    stream = self.client.models.generate_content_stream(
+                        model=self.model,
+                        contents=prompt,
+                        config=(
+                            types.GenerateContentConfig(
+                                temperature=0.55,
+                                top_p=0.90,
+                                top_k=40,
+                                max_output_tokens=2048,
+                                candidate_count=1,
+                            )
+                        ),
+                    )
+
+                    for chunk in stream:
+
+                        if is_cancelled():
+                            return
+
+                        text = getattr(
+                            chunk,
+                            "text",
+                            "",
+                        )
+
+                        if text is None:
+                            continue
+
+                        text = str(text)
+
+                        if not text.strip():
+                            continue
+
+                        yielded_text = True
+                        collected_chunks.append(text)
+
+                        yield text
+
+                    if is_cancelled():
+                        return
+
+                    response_text = self._clean_response(
+                        "".join(collected_chunks)
+                    )
+
+                    if not response_text:
+
+                        print(
+                            "Gemini streaming request returned "
+                            "no usable text."
+                        )
+
+                        return
+
+                    with self.lock:
+
+                        if is_cancelled():
+                            return
+
+                        self.add_user_message(user_message)
+                        self.add_assistant_message(response_text)
+
+                    return
+
+                except Exception as error:
+
+                    print(
+                        "\nGemini Streaming Error:",
+                        error,
+                    )
+
+                    # Retrying after visible content would duplicate or
+                    # contradict what the caller has already received.
+                    if yielded_text or is_cancelled():
+                        return
+
+                    if self._is_retryable_error(error):
+
+                        print(
+                            "Retryable Gemini streaming error detected."
+                        )
+
+                        self._retry_delay()
+
+                        if is_cancelled():
+                            return
+
+                        if self.rotate_api_key():
+                            continue
+
+                    return
+
+                finally:
+
+                    if stream is not None and is_cancelled():
+
+                        close_stream = getattr(
+                            stream,
+                            "close",
+                            None,
+                        )
+
+                        if callable(close_stream):
+
+                            try:
+                                close_stream()
+                            except Exception:
+                                pass
+
+    # ------------------------------------------------------
+    # Normalize Structured Planner Response
+    # ------------------------------------------------------
+
+    @staticmethod
+    def _normalize_structured_plan_response(
+        text: str
+    ) -> str:
+        """
+        Normalize a cloud planner response into the raw
+        JSON string expected by MultiCommandPlanner.
+
+        This deliberately does not parse/rewrite the JSON.
+        It only removes accidental Markdown code fences.
+        """
+
+        if not text:
+            return ""
+
+        text = str(
+            text
+        ).strip()
+
+        if text.startswith("```"):
+
+            lines = text.splitlines()
+
+            if lines and lines[0].strip().startswith("```"):
+                lines = lines[1:]
+
+            if lines and lines[-1].strip() == "```":
+                lines = lines[:-1]
+
+            text = "\n".join(
+                lines
+            ).strip()
+
+        if (
+            text.startswith("json\n")
+            or text.startswith("JSON\n")
+        ):
+
+            text = text.split(
+                "\n",
+                1
+            )[1].strip()
+
+        return text
+
+    # ------------------------------------------------------
+    # Generate Groq Structured Action Plan
+    # ------------------------------------------------------
+
+    def _generate_groq_structured_plan(
+        self,
+        prompt: str
+    ) -> str:
+        """
+        Generate the same machine-readable action plan
+        using the dedicated Groq Code Agent API key.
+
+        IMPORTANT:
+        This method is a planner fallback only.
+
+        It does NOT execute commands and does NOT replace
+        the existing CodeAgent execution workflow.
+        """
+
+        if self._closing:
+            return ""
+
+        client = (
+            self._create_groq_planner_client()
+        )
+
+        if client is None:
+
+            print(
+                "Groq Planner Fallback : "
+                "Unavailable."
+            )
+
+            return ""
+
+        try:
+
+            print(
+                "\n========== GROQ PLANNER FALLBACK =========="
+            )
+
+            print(
+                "Provider : Groq"
+            )
+
+            print(
+                f"Model : {self.groq_planner_model}"
+            )
+
+            print(
+                "API Key : GROQ_API_KEY_CODE_AGENT"
+            )
+
+            response = (
+                client.chat.completions.create(
+                    model=self.groq_planner_model,
+                    messages=[
+                        {
+                            "role": "system",
+                            "content": (
+                                "You are DHEEPTHI's desktop "
+                                "action planner.\n\n"
+                                "Return ONLY valid JSON.\n"
+                                "Do not use Markdown.\n"
+                                "Do not add explanations.\n"
+                                "Follow the exact action-plan "
+                                "schema contained in the user prompt.\n"
+                                "Do not execute actions.\n"
+                                "Do not invent unsupported actions."
+                            ),
+                        },
+                        {
+                            "role": "user",
+                            "content": prompt,
+                        },
+                    ],
+                    temperature=0.10,
+                    max_tokens=4096,
+                    response_format={
+                        "type": "json_object"
+                    },
+                )
+            )
+
+            text = ""
+
+            if response is not None:
+
+                choices = getattr(
+                    response,
+                    "choices",
+                    None
+                )
+
+                if choices:
+
+                    message = getattr(
+                        choices[0],
+                        "message",
+                        None
+                    )
+
+                    if message is not None:
+
+                        text = (
+                            getattr(
+                                message,
+                                "content",
+                                ""
+                            )
+                            or ""
+                        ).strip()
+
+            text = (
+                self._normalize_structured_plan_response(
+                    text
+                )
+            )
+
+            if not text:
+
+                print(
+                    "Groq Planner Fallback : "
+                    "Empty response."
+                )
+
+                return ""
+
+            print(
+                "\n========== GROQ ACTION PLAN =========="
+            )
+
+            print(
+                text
+            )
+
+            print(
+                "Length :",
+                len(text)
+            )
+
+            print(
+                "Provider : Groq"
+            )
+
+            print(
+                "=======================================\n"
+            )
+
+            return text
+
+        except Exception as error:
+
+            print(
+                "\nGroq Planner Fallback Error :",
+                error
+            )
+
+            print(
+                "Groq planner fallback failed."
+            )
+
+            return ""
+
+    # ------------------------------------------------------
     # Generate Structured Action Plan
     # ------------------------------------------------------
 
@@ -1504,14 +2475,27 @@ and
         """
         Generate a structured JSON action plan.
 
-        This method is intentionally separate from
-        generate_response() because multi-command planning
-        requires machine-readable JSON instead of a normal
-        conversational response.
+        Primary provider:
+            Gemini using configured API keys.
 
-        Existing API-key rotation and fallback mechanism
-        is preserved and extended for temporary server
-        and network failures.
+        Secondary provider:
+            Groq using GROQ_API_KEY_CODE_AGENT.
+
+        Fallback order:
+            Gemini Key 1
+                ↓
+            Gemini Key 2
+                ↓
+            Gemini Key 3
+                ↓
+            Gemini Key 4
+                ↓
+            Groq planner fallback
+                ↓
+            empty string if all providers fail
+
+        The existing Gemini key rotation is preserved.
+        The existing GROQ_API_KEY used by STT is never used.
         """
 
         if self._closing:
@@ -1525,7 +2509,7 @@ and
             return ""
 
         # ------------------------------------------
-        # API Attempts
+        # Gemini Attempts
         # ------------------------------------------
 
         with self.lock:
@@ -1586,10 +2570,6 @@ and
                         )
                     )
 
-                    # ----------------------------------
-                    # Extract Response
-                    # ----------------------------------
-
                     text = ""
 
                     if response is not None:
@@ -1630,6 +2610,10 @@ and
                     )
 
                     print(
+                        "Provider : Gemini"
+                    )
+
+                    print(
                         "========================================\n"
                     )
 
@@ -1641,10 +2625,6 @@ and
                         "\nGemini Planner Error :",
                         error
                     )
-
-                    # ----------------------------------
-                    # Retry / Fallback
-                    # ----------------------------------
 
                     if self._is_retryable_error(
                         error
@@ -1664,29 +2644,161 @@ and
                         if self.rotate_api_key():
                             continue
 
-                    # ----------------------------------
-                    # Non-retryable Error
-                    # ----------------------------------
+                    else:
 
-                    print(
-                        "Gemini structured planning "
-                        "request failed."
-                    )
+                        print(
+                            "Non-retryable Gemini planner "
+                            "error detected."
+                        )
 
-                    return ""
+                        break
+
+            # --------------------------------------
+            # All Gemini keys exhausted
+            # --------------------------------------
+
+            print(
+                "\n=================================================="
+            )
+
+            print(
+                "All Gemini planner attempts failed."
+            )
+
+            print(
+                "Activating Groq planner fallback..."
+            )
+
+            print(
+                "=================================================="
+            )
+
+            if self._closing:
+                return ""
+
+            # --------------------------------------
+            # Groq fallback
+            # --------------------------------------
+            #
+            # Keep the Groq network request inside the
+            # existing lock so only one planner request
+            # manipulates provider state at a time.
+            # --------------------------------------
+
+            groq_result = (
+                self._generate_groq_structured_plan(
+                    prompt
+                )
+            )
+
+            if groq_result:
+
+                print(
+                    "Planner Provider : Groq Fallback"
+                )
+
+                return groq_result
+
+        print(
+            "All Gemini and Groq planner providers failed."
+        )
 
         return ""
+
+    # ------------------------------------------------------
+    # Gemini Live API Session
+    # ------------------------------------------------------
+
+    def create_live_session(
+        self,
+        on_connected=None,
+        on_audio=None,
+        on_input_transcript=None,
+        on_output_transcript=None,
+        on_interrupted=None,
+        on_turn_complete=None,
+        on_error=None,
+        on_closed=None,
+        auto_start=True,
+    ):
+        """
+        Create the low-latency Gemini Live conversation session.
+
+        The Live API owns the conversation audio path.  Existing text
+        Gemini methods are untouched and remain available for commands,
+        planner work, and non-live conversation callers.
+
+        Returns
+        -------
+        GeminiLiveSession | None
+            A running session when ``auto_start`` is True and connection
+            succeeds; otherwise the created session object or None when
+            DHEEPTHI is shutting down.
+        """
+
+        if self._closing:
+            return None
+
+        # Stop an older live conversation before replacing it.  Do this
+        # outside the client lock so a callback from the old session cannot
+        # wait on the same lock while the session is shutting down.
+        self.close_live_session()
+
+        with self.lock:
+
+            if self._closing:
+                return None
+
+            session = GeminiLiveSession(
+                api_key=self.current_api_key(),
+                model=self.live_model,
+                system_instruction=self.system_prompt(),
+                on_connected=on_connected,
+                on_audio=on_audio,
+                on_input_transcript=on_input_transcript,
+                on_output_transcript=on_output_transcript,
+                on_interrupted=on_interrupted,
+                on_turn_complete=on_turn_complete,
+                on_error=on_error,
+                on_closed=on_closed,
+            )
+
+            self.live_session = session
+
+        if auto_start:
+            if not session.start():
+                print(
+                    "Gemini Live session failed to start:",
+                    session.start_error,
+                )
+                self.close_live_session()
+                return None
+
+        return session
+
+    # ------------------------------------------------------
+    # Close Live Session
+    # ------------------------------------------------------
+
+    def close_live_session(self):
+        with self.lock:
+            session = self.live_session
+            self.live_session = None
+
+        if session is not None:
+            try:
+                session.stop()
+            except Exception as error:
+                print(
+                    "Gemini Live session shutdown error:",
+                    error,
+                )
 
     # ------------------------------------------------------
     # Current API Key
     # ------------------------------------------------------
 
     def current_api_key(self):
-        """
-        Return the currently selected API key.
-
-        Internal use only.
-        """
 
         return self.api_keys[
             self.current_key_index
@@ -1743,30 +2855,33 @@ and
 
     def close(self):
         """
-        Cleanup Gemini resources.
+        Cleanup Gemini/Groq resources.
 
         Conversation history is intentionally cleared here.
-
-        Therefore conversation memory is temporary and
-        disappears when the application shuts down.
         """
 
         with self.lock:
 
             self._closing = True
 
-            # ------------------------------------------
-            # Erase temporary conversation memory
-            # ------------------------------------------
+            live_session = self.live_session
+            self.live_session = None
 
             self.history.clear()
 
-            # ------------------------------------------
-            # Release Gemini client
-            # ------------------------------------------
-
             self.client = None
 
-            print(
-                "Gemini Client shutdown completed."
-            )
+            self.groq_planner_client = None
+
+        if live_session is not None:
+            try:
+                live_session.stop()
+            except Exception as error:
+                print(
+                    "Gemini Live session shutdown error:",
+                    error,
+                )
+
+        print(
+            "Gemini Client shutdown completed."
+        )
