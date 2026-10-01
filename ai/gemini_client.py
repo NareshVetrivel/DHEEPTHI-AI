@@ -121,14 +121,22 @@ class GeminiLiveSession:
         self._audio_queue = None
         self._stop_event = None
         self._ready_event = threading.Event()
+        self._connected_event = threading.Event()
         self._closed_event = threading.Event()
         self._closing = threading.Event()
         self._started = False
         self._start_error = None
 
+        self.session_id = hex(id(self))
         self._current_user_transcript = ""
         self._current_output_transcript = ""
         self._transcript_lock = threading.RLock()
+
+        # Diagnostics for 1011 & lifecycle tracking
+        self.receive_event_count = 0
+        self.send_packet_count = 0
+        self.last_receive_time = 0.0
+        self.last_send_time = 0.0
 
     # ------------------------------------------------------
     # Start
@@ -152,8 +160,13 @@ class GeminiLiveSession:
 
         self._closing.clear()
         self._ready_event.clear()
+        self._connected_event.clear()
         self._closed_event.clear()
         self._start_error = None
+
+        with self._transcript_lock:
+            self._current_user_transcript = ""
+            self._current_output_transcript = ""
 
         self._thread = threading.Thread(
             target=self._thread_main,
@@ -194,13 +207,22 @@ class GeminiLiveSession:
     async def _run(self):
         self._loop = asyncio.get_running_loop()
         self._stop_event = asyncio.Event()
-        self._audio_queue = asyncio.Queue(maxsize=64)
+        self._audio_queue = asyncio.Queue(maxsize=4)
 
+        # Keep Live audio responses enabled, but explicitly configure the
+        # server-side automatic activity detection.  The microphone stream
+        # remains open for the lifetime of the session; Gemini decides when
+        # the user has started/stopped speaking.
         config = {
             "response_modalities": ["AUDIO"],
             "input_audio_transcription": {},
             "output_audio_transcription": {},
             "system_instruction": self.system_instruction,
+            "realtime_input_config": {
+                "automatic_activity_detection": {
+                    "disabled": False,
+                },
+            },
         }
 
         receive_task = None
@@ -214,14 +236,21 @@ class GeminiLiveSession:
                 config=config,
             ) as session:
                 self._session = session
+                self._connected_event.set()
                 self._ready_event.set()
+                print(f"[LIVE DEBUG] session_id={self.session_id} Live session created")
                 self._safe_callback(self.on_connected)
 
+                # These two tasks live for the entire Live session.  They are
+                # NOT recreated per user turn.  Gemini VAD separates turns
+                # while the same bidirectional session remains open.
                 receive_task = asyncio.create_task(
-                    self._receive_loop(session)
+                    self._receive_loop(session),
+                    name="GeminiLiveReceive",
                 )
                 audio_task = asyncio.create_task(
-                    self._audio_send_loop(session)
+                    self._audio_send_loop(session),
+                    name="GeminiLiveAudioSend",
                 )
 
                 await self._stop_event.wait()
@@ -249,6 +278,8 @@ class GeminiLiveSession:
             self._loop = None
             self._stop_event = None
             self._audio_queue = None
+            self._connected_event.clear()
+            print(f"[LIVE DEBUG] session_id={self.session_id} Live session closed")
 
     # ------------------------------------------------------
     # Receive Loop
@@ -256,171 +287,252 @@ class GeminiLiveSession:
 
     async def _receive_loop(self, session):
         try:
-            async for response in session.receive():
-                if self._closing.is_set():
-                    break
+            while not self._closing.is_set():
+                async for response in session.receive():
+                    if self._closing.is_set():
+                        break
 
-                server_content = getattr(
-                    response,
-                    "server_content",
-                    None,
-                )
+                    self.receive_event_count += 1
+                    self.last_receive_time = time.time()
 
-                if server_content is None:
-                    continue
-
-                input_transcription = getattr(
-                    server_content,
-                    "input_transcription",
-                    None,
-                )
-
-                if input_transcription is not None:
-                    text = str(
-                        getattr(
-                            input_transcription,
-                            "text",
-                            "",
-                        )
-                        or ""
-                    ).strip()
-
-                    if text:
-                        with self._transcript_lock:
-                            self._current_user_transcript = text
-
-                        self._safe_callback(
-                            self.on_input_transcript,
-                            text,
-                        )
-
-                output_transcription = getattr(
-                    server_content,
-                    "output_transcription",
-                    None,
-                )
-
-                if output_transcription is not None:
-                    text = str(
-                        getattr(
-                            output_transcription,
-                            "text",
-                            "",
-                        )
-                        or ""
-                    ).strip()
-
-                    if text:
-                        with self._transcript_lock:
-                            self._current_output_transcript += text
-
-                        self._safe_callback(
-                            self.on_output_transcript,
-                            text,
-                        )
-
-                interrupted = bool(
-                    getattr(
-                        server_content,
-                        "interrupted",
-                        False,
-                    )
-                )
-
-                if interrupted:
-                    self._safe_callback(
-                        self.on_interrupted
-                    )
-
-                model_turn = getattr(
-                    server_content,
-                    "model_turn",
-                    None,
-                )
-
-                if model_turn is not None:
-                    parts = getattr(
-                        model_turn,
-                        "parts",
+                    server_content = getattr(
+                        response,
+                        "server_content",
                         None,
-                    ) or []
+                    )
 
-                    for part in parts:
-                        inline_data = getattr(
-                            part,
-                            "inline_data",
-                            None,
-                        )
+                    if server_content is None:
+                        continue
 
-                        if inline_data is None:
-                            continue
+                    input_transcription = getattr(
+                        server_content,
+                        "input_transcription",
+                        None,
+                    ) or getattr(
+                        server_content,
+                        "interim_input_transcription",
+                        None,
+                    )
 
-                        audio_data = getattr(
-                            inline_data,
-                            "data",
-                            None,
-                        )
+                    if input_transcription is not None:
+                        text = str(
+                            getattr(
+                                input_transcription,
+                                "text",
+                                "",
+                            )
+                            or ""
+                        ).strip()
 
-                        if audio_data:
+                        if text:
+                            print(f"[DIAG RX INPUT_TRANSCRIPT] t={time.time():.3f} text='{text}'")
+                            with self._transcript_lock:
+                                self._current_user_transcript = text
+
                             self._safe_callback(
-                                self.on_audio,
-                                bytes(audio_data),
+                                self.on_input_transcript,
+                                text,
                             )
 
-                turn_complete = bool(
-                    getattr(
+                    output_transcription = getattr(
                         server_content,
-                        "turn_complete",
-                        False,
+                        "output_transcription",
+                        None,
+                    ) or getattr(
+                        server_content,
+                        "output_audio_transcription",
+                        None,
                     )
-                )
 
-                if turn_complete:
-                    with self._transcript_lock:
-                        user_text = self._current_user_transcript.strip()
-                        assistant_text = self._current_output_transcript.strip()
-                        self._current_user_transcript = ""
-                        self._current_output_transcript = ""
+                    if output_transcription is not None:
+                        text = str(
+                            getattr(
+                                output_transcription,
+                                "text",
+                                "",
+                            )
+                            or ""
+                        ).strip()
 
-                    self._safe_callback(
-                        self.on_turn_complete,
-                        user_text,
-                        assistant_text,
+                        if text:
+                            print(f"[DIAG RX OUTPUT_TRANSCRIPT] t={time.time():.3f} text='{text}'")
+                            with self._transcript_lock:
+                                self._current_output_transcript += text
+
+                            self._safe_callback(
+                                self.on_output_transcript,
+                                text,
+                            )
+
+                    interrupted = bool(
+                        getattr(
+                            server_content,
+                            "interrupted",
+                            False,
+                        )
                     )
+
+                    if interrupted:
+                        print(
+                            f"[DIAG RX SERVER_INTERRUPTED] t={time.time():.3f} "
+                            f"interrupted=True source=GeminiServer "
+                            f"user_transcript='{self._current_user_transcript}' "
+                            f"output_transcript='{self._current_output_transcript}'"
+                        )
+                        self._safe_callback(
+                            self.on_interrupted
+                        )
+
+                    model_turn = getattr(
+                        server_content,
+                        "model_turn",
+                        None,
+                    )
+
+                    if model_turn is not None:
+                        parts = getattr(
+                            model_turn,
+                            "parts",
+                            None,
+                        ) or []
+
+                        for part in parts:
+                            inline_data = getattr(
+                                part,
+                                "inline_data",
+                                None,
+                            )
+
+                            if inline_data is None:
+                                continue
+
+                            audio_data = getattr(
+                                inline_data,
+                                "data",
+                                None,
+                            )
+
+                            if audio_data:
+                                chunk_bytes = len(audio_data)
+                                print(f"[DIAG RX MODEL_AUDIO] t={time.time():.3f} bytes={chunk_bytes}")
+                                self._safe_callback(
+                                    self.on_audio,
+                                    bytes(audio_data),
+                                )
+
+                    turn_complete = bool(
+                        getattr(
+                            server_content,
+                            "turn_complete",
+                            False,
+                        )
+                    )
+
+                    if turn_complete:
+                        print(f"[DIAG RX TURN_COMPLETE] t={time.time():.3f} turn_complete=True")
+                        with self._transcript_lock:
+                            user_text = self._current_user_transcript.strip()
+                            assistant_text = self._current_output_transcript.strip()
+                            self._current_user_transcript = ""
+                            self._current_output_transcript = ""
+
+                        self._safe_callback(
+                            self.on_turn_complete,
+                            user_text,
+                            assistant_text,
+                        )
 
         except asyncio.CancelledError:
             raise
         except Exception as error:
             if not self._closing.is_set():
+                now = time.time()
+                dt_rx = (now - self.last_receive_time) if self.last_receive_time else -1.0
+                dt_tx = (now - self.last_send_time) if self.last_send_time else -1.0
+                qsize = self._audio_queue.qsize() if self._audio_queue else 0
+                print(
+                    f"[LIVE STAGE 5 ERROR: receive_loop] session_id={self.session_id} "
+                    f"type={type(error).__name__} err='{error}' "
+                    f"rx_cnt={self.receive_event_count} tx_cnt={self.send_packet_count} "
+                    f"last_rx={dt_rx:.1f}s_ago last_tx={dt_tx:.1f}s_ago qdepth={qsize}"
+                )
                 self._safe_callback(
                     self.on_error,
                     error,
                 )
+                if self._stop_event is not None:
+                    self._stop_event.set()
 
     # ------------------------------------------------------
     # Audio Send Loop
     # ------------------------------------------------------
 
     async def _audio_send_loop(self, session):
-        while not self._closing.is_set():
-            audio_data = await self._audio_queue.get()
+        """Continuously upload microphone PCM for the lifetime of the session."""
+        try:
+            while not self._closing.is_set():
+                try:
+                    audio_data = await asyncio.wait_for(
+                        self._audio_queue.get(),
+                        timeout=10.0,
+                    )
+                except asyncio.TimeoutError:
+                    now = time.time()
+                    dt_rx = (now - self.last_receive_time) if self.last_receive_time else -1.0
+                    dt_tx = (now - self.last_send_time) if self.last_send_time else -1.0
+                    qsize = self._audio_queue.qsize() if self._audio_queue else 0
+                    print(
+                        f"[LIVE KEEPALIVE TICK] session_id={self.session_id} "
+                        f"rx_cnt={self.receive_event_count} tx_cnt={self.send_packet_count} "
+                        f"last_rx={dt_rx:.1f}s_ago last_tx={dt_tx:.1f}s_ago qdepth={qsize}"
+                    )
+                    continue
 
-            if audio_data is None:
-                return
+                if audio_data is None:
+                    return
 
-            await session.send_realtime_input(
-                audio=types.Blob(
-                    data=audio_data,
-                    mime_type="audio/pcm;rate=16000",
+                await session.send_realtime_input(
+                    audio=types.Blob(
+                        data=audio_data,
+                        mime_type="audio/pcm",
+                    )
                 )
-            )
+                self.send_packet_count += 1
+                self.last_send_time = time.time()
+        except asyncio.CancelledError:
+            raise
+        except Exception as error:
+            if not self._closing.is_set():
+                now = time.time()
+                dt_rx = (now - self.last_receive_time) if self.last_receive_time else -1.0
+                dt_tx = (now - self.last_send_time) if self.last_send_time else -1.0
+                qsize = self._audio_queue.qsize() if self._audio_queue else 0
+                print(
+                    f"[LIVE STAGE 4 ERROR: send_realtime_input] session_id={self.session_id} "
+                    f"type={type(error).__name__} err='{error}' "
+                    f"rx_cnt={self.receive_event_count} tx_cnt={self.send_packet_count} "
+                    f"last_rx={dt_rx:.1f}s_ago last_tx={dt_tx:.1f}s_ago qdepth={qsize}"
+                )
+                self._safe_callback(self.on_error, error)
+                if self._stop_event is not None:
+                    self._stop_event.set()
+                    self._stop_event.set()
 
     # ------------------------------------------------------
     # Send Audio
     # ------------------------------------------------------
 
     def send_audio(self, audio_data: bytes) -> bool:
+        """Queue one 16 kHz mono PCM chunk for the active Live session.
+
+        This method is safe to call repeatedly from the PortAudio callback.
+        It deliberately does not signal an end-of-stream after a turn; the
+        same audio channel stays open so Gemini VAD can detect the next turn.
+        """
         if not audio_data or self._closing.is_set():
+            return False
+
+        if not self._connected_event.is_set():
             return False
 
         loop = self._loop
@@ -455,6 +567,18 @@ class GeminiLiveSession:
             return True
         except RuntimeError:
             return False
+
+    def clear_pending_audio(self) -> None:
+        """Discard queued microphone packets without closing the Live session."""
+        queue = self._audio_queue
+        if queue is None:
+            return
+
+        while True:
+            try:
+                queue.get_nowait()
+            except asyncio.QueueEmpty:
+                break
 
     # ------------------------------------------------------
     # Send Text
@@ -563,6 +687,15 @@ class GeminiLiveSession:
             self._thread is not None
             and self._thread.is_alive()
             and not self._closing.is_set()
+        )
+
+    @property
+    def is_connected(self) -> bool:
+        """True while the same Gemini Live session is connected and usable."""
+        return bool(
+            self.is_running
+            and self._connected_event.is_set()
+            and self._session is not None
         )
 
     @property

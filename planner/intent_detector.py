@@ -1855,8 +1855,9 @@ class IntentDetector:
             return "browser_history"
 
         if (
-            re.search(r"\b(?:open|show|view|check)\b.*\b(?:browser\s+)?downloads?\b", text)
-            or text in {"downloads", "browser downloads"}
+            re.search(r"\b(?:open|show|view|check)\b.*\b(?:browser\s+)?downloads?\s+(?:page|history)\b", text)
+            or re.search(r"\b(?:chrome|edge|browser)\s+downloads?\b", text)
+            or text in {"browser downloads", "chrome downloads", "edge downloads", "download page", "downloads page"}
         ):
             return "browser_downloads"
 
@@ -2896,13 +2897,16 @@ class IntentDetector:
         if intent:
             return intent
 
-        # 7. Folder operations.
-        intent = self._detect_folder_intent(text)
+        # 7. File operations.
+        # Check file transfers before special-folder keywords so commands
+        # such as "copy file to downloads" are not mistaken for
+        # "open downloads" merely because the destination is a folder.
+        intent = self._detect_file_intent(text)
         if intent:
             return intent
 
-        # 8. File operations.
-        intent = self._detect_file_intent(text)
+        # 8. Folder operations.
+        intent = self._detect_folder_intent(text)
         if intent:
             return intent
 

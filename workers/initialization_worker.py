@@ -164,33 +164,28 @@ class InitializationWorker(QThread):
                 return
 
             # ------------------------------------------
-            # Load Groq Model
+            # Voice Engine / Speech Recognizer
             # ------------------------------------------
 
             self._update_status(
                 10,
-                "Loading Groq Model..."
+                "Configuring Gemini Voice..."
             )
 
-            print(
-                "Loading Groq model..."
-            )
-
-            if self.recognizer is None:
-
-                raise RuntimeError(
-                    "Speech recognizer is not available."
+            # In the normal Gemini Live runtime, Faster-Whisper wake-word detection
+            # is not loaded or initialized on startup.
+            if self.recognizer is not None and getattr(self.recognizer, "wake_word_mode", False):
+                print(
+                    "Loading local Faster-Whisper model..."
                 )
-
-            self.recognizer.load_model()
-
-            if self.should_stop():
-
-                return
-
-            print(
-                "Whisper model loaded."
-            )
+                self.recognizer.load_model()
+                print(
+                    "Whisper model loaded."
+                )
+            else:
+                print(
+                    "Gemini Live active; local Faster-Whisper wake detection skipped."
+                )
 
             # ------------------------------------------
             # Scan Applications
