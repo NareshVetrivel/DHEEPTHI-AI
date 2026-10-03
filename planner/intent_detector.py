@@ -776,6 +776,8 @@ class IntentDetector:
             (r"^listing\b", "list"),
             (r"^showing\b", "show"),
             (r"^playing\b", "play"),
+            (r"^listening(?:\s+to)?\b", "listen to"),
+            (r"^watching\b", "watch"),
             (r"^bookmarking\b", "bookmark"),
             (r"^refreshing\b", "refresh"),
             (r"^reloading\b", "reload"),
@@ -880,7 +882,7 @@ class IntentDetector:
             r"shutdown|shut\s+down|restart|reboot|sleep|logout|log\s+out|"
             r"sign\s+out|lock|create|make|new|delete|remove|rename|move|"
             r"compress|extract|unzip|save|print|search|find|list|locate|"
-            r"show|look\s+for|look\s+up|google\s+search|youtube\s+search|play|bookmark|refresh|"
+            r"show|look\s+for|look\s+up|google\s+search|youtube\s+search|play|listen(?:\s+to)?|watch|bookmark|refresh|"
             r"reload|new\s+tab|close\s+tab|next\s+tab|previous\s+tab|"
             r"go\s+back|go\s+forward|visit|add|insert|replace|clear|"
             r"apply|set|change|turn|increase|decrease|raise|lower|underline|italic|bold|highlight|justify"
@@ -989,7 +991,7 @@ class IntentDetector:
             r"^(create|make|new|delete|remove|rename|move|copy|"
             r"compress|extract)\b",
 
-            r"^(search|google|youtube|play)\b",
+            r"^(search|google|youtube|play|listen\s+to|listen|watch)\b",
 
             # Natural-English explicit desktop/browser/file-search forms.
             r"^(show|open|view|check)\s+(?:the\s+)?(?:browser\s+)?(?:history|downloads?)\b",
@@ -1892,6 +1894,18 @@ class IntentDetector:
             return "play_youtube"
         if re.search(r"\byoutube\b.*\b(?:play|watch)\b", text):
             return "play_youtube"
+
+        # Natural YouTube playback requests without explicitly saying "YouTube"
+        # (e.g., "play karuppu song", "play tamil songs", "listen to karuppu song",
+        # "play some music", "play a movie", "watch karuppu movie").
+        # DHEEPTHI-AI routes all natural playback requests to YouTube.
+        if re.search(r"^(?:play|listen\s+to|watch)\b", text):
+            if not re.search(r"\b(?:record|recording|screen)\b", text):
+                return "play_youtube"
+
+        if re.search(r"\b(?:play|listen\s+to|watch)\s*$", text):
+            if not re.search(r"\b(?:record|recording|screen)\b", text):
+                return "play_youtube"
 
         # Exact Google/YouTube site requests only. Do not steal
         # "open google chrome" or "open youtube music".
@@ -3335,7 +3349,7 @@ Normalized speech:
             r"open|start|run|launch|close|exit|quit|terminate|"
             r"create|make|new|delete|remove|rename|move|copy|paste|cut|"
             r"type|write|click|double\s+click|right\s+click|scroll|"
-            r"search|find|locate|show|view|check|play|bookmark|refresh|reload|"
+            r"search|find|locate|show|view|check|play|listen(?:\s+to)?|watch|bookmark|refresh|reload|"
             r"screenshot|record|capture|mute|lock|shutdown|restart|reboot|"
             r"sleep|logout|signout|save|print|select|undo|redo|"
             r"minimize|maximize|restore|press|set|increase|decrease|"

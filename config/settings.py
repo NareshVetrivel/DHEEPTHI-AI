@@ -145,6 +145,25 @@ GEMINI_MODEL = os.getenv(
     "models/gemini-3.5-flash"
 ).strip()
 
+# ----------------------------------------------------------
+# Gemini Semantic Planner Model Hierarchy
+# ----------------------------------------------------------
+
+GEMINI_PLANNER_PRIMARY_MODEL = os.getenv(
+    "GEMINI_PLANNER_PRIMARY_MODEL",
+    "gemini-3.8-flash"
+).strip()
+
+GEMINI_PLANNER_FALLBACK_1 = os.getenv(
+    "GEMINI_PLANNER_FALLBACK_1",
+    "gemini-3.7-flash"
+).strip()
+
+GEMINI_PLANNER_FALLBACK_2 = os.getenv(
+    "GEMINI_PLANNER_FALLBACK_2",
+    "gemini-3.6-flash"
+).strip()
+
 
 # ==========================================================
 # Debug Configuration

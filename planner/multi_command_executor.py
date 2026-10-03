@@ -183,6 +183,14 @@ class MultiCommandExecutor:
         # create_blank_document -> Microsoft Word document
         #
         # -----------------------------------------------------
+        # Code Agent Actions
+        # -----------------------------------------------------
+
+        "code_agent":
+            "code_agent",
+
+        "write_code":
+            "code_agent",
 
         "create_blank_document":
             "create_blank_document",
@@ -270,6 +278,8 @@ class MultiCommandExecutor:
             "Starting multi-command execution: %d step(s)",
             plan.total_steps,
         )
+        print("\n[SEMANTIC] PLAN RECEIVED")
+        print(f"Total Steps: {plan.total_steps}")
 
         results = []
 
@@ -282,6 +292,9 @@ class MultiCommandExecutor:
         for index, step in enumerate(
             plan.steps
         ):
+            print(f"\n[SEMANTIC] ACTION {index + 1}/{plan.total_steps}")
+            print(f"[SEMANTIC] DISPATCHING {step.action}")
+            print(f"[SEMANTIC] ENTITIES: {step.parameters}")
 
             logger.info(
                 "Executing step %d/%d: %s",
@@ -294,6 +307,8 @@ class MultiCommandExecutor:
                 step
             )
 
+            print(f"[SEMANTIC] DISPATCH RESULT: {step_result.get('status')}")
+
             results.append(
                 step_result
             )
@@ -303,6 +318,10 @@ class MultiCommandExecutor:
             # -------------------------------------------------
 
             if not step_result["success"]:
+                print("[SEMANTIC] COMMAND FAILED")
+                print(f"[SEMANTIC] INTENT: {step.action}")
+                print(f"[SEMANTIC] ENTITIES: {step.parameters}")
+                print(f"[SEMANTIC] ERROR: {step_result.get('status')}")
 
                 logger.warning(
                     "Multi-command execution stopped at "
@@ -325,6 +344,17 @@ class MultiCommandExecutor:
 
             completed_steps += 1
 
+            # Pause briefly if launch_application is followed by a browser action
+            if index + 1 < plan.total_steps:
+                next_step = plan.steps[index + 1]
+                if step.action == "launch_application" and next_step.action in {
+                    "play_youtube", "youtube_search", "open_website", "google_search"
+                }:
+                    print("[SEMANTIC] Pausing 1.0s for browser session to be ready...")
+                    import time
+                    time.sleep(1.0)
+
+        print("[SEMANTIC] COMMAND COMPLETE\n")
         logger.info(
             "Multi-command execution completed successfully."
         )
@@ -681,6 +711,18 @@ class MultiCommandExecutor:
                     or parameters.get(
                         "search_query"
                     )
+                    or parameters.get(
+                        "song"
+                    )
+                    or parameters.get(
+                        "video"
+                    )
+                    or parameters.get(
+                        "target"
+                    )
+                    or parameters.get(
+                        "entity"
+                    )
                 ),
 
                 "browser": parameters.get(
@@ -751,20 +793,53 @@ class MultiCommandExecutor:
             }
 
         # -----------------------------------------------------
+        # Code Agent Actions
+        # -----------------------------------------------------
+
+        if action in {"code_agent", "write_code"}:
+            lang = parameters.get("language") or "python"
+            task = parameters.get("task") or parameters.get("query") or parameters.get("code") or parameters.get("description") or ""
+            req = f"{lang} program for {task}" if task else str(lang)
+            return {
+                "entity": parameters,
+                "user_text": req,
+            }
+
+        # -----------------------------------------------------
         # File Actions
         # -----------------------------------------------------
+
+        if action in {
+            "copy_file",
+            "move_file",
+            "rename_file",
+        }:
+            if "destination" in parameters or "to" in parameters or "source" in parameters:
+                return {
+                    "entity": parameters,
+                }
+            return {
+                "entity": (
+                    parameters.get(
+                        "target"
+                    )
+                    or parameters.get(
+                        "file"
+                    )
+                    or parameters.get(
+                        "filename"
+                    )
+                    or parameters.get(
+                        "name"
+                    )
+                ),
+            }
 
         if action in {
 
             "open_file",
 
             "create_file",
-
-            "rename_file",
-
-            "copy_file",
-
-            "move_file",
 
             "delete_file",
 
@@ -835,19 +910,32 @@ class MultiCommandExecutor:
         # -----------------------------------------------------
 
         if action in {
-
-            "open_folder",
-
-            "create_folder",
-
-            "rename_folder",
-
             "copy_folder",
-
             "move_folder",
+            "rename_folder",
+        }:
+            if "destination" in parameters or "to" in parameters or "source" in parameters:
+                return {
+                    "entity": parameters,
+                }
+            return {
+                "entity": (
+                    parameters.get(
+                        "target"
+                    )
+                    or parameters.get(
+                        "folder"
+                    )
+                    or parameters.get(
+                        "name"
+                    )
+                ),
+            }
 
+        if action in {
+            "open_folder",
+            "create_folder",
             "delete_folder",
-
         }:
 
             return {

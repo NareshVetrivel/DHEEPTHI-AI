@@ -101,6 +101,7 @@ class GeminiLiveSession:
         on_turn_complete=None,
         on_error=None,
         on_closed=None,
+        on_go_away=None,
     ):
         self.api_key = str(api_key or "").strip()
         self.model = str(model or "").strip()
@@ -114,6 +115,7 @@ class GeminiLiveSession:
         self.on_turn_complete = on_turn_complete
         self.on_error = on_error
         self.on_closed = on_closed
+        self.on_go_away = on_go_away
 
         self._thread = None
         self._loop = None
@@ -132,9 +134,17 @@ class GeminiLiveSession:
         self._current_output_transcript = ""
         self._transcript_lock = threading.RLock()
 
+        # Response Generation ID and Barge-in Tracking
+        self._active_response_id = 0
+        self._invalidated_response_ids = set()
+        self._response_lock = threading.RLock()
+        self._is_model_speaking = False
+        self._suppress_upcoming_response = False
+
         # Diagnostics for 1011 & lifecycle tracking
         self.receive_event_count = 0
         self.send_packet_count = 0
+        self.dropped_packet_count = 0
         self.last_receive_time = 0.0
         self.last_send_time = 0.0
 
@@ -167,6 +177,13 @@ class GeminiLiveSession:
         with self._transcript_lock:
             self._current_user_transcript = ""
             self._current_output_transcript = ""
+
+        with self._response_lock:
+            self._active_response_id = 0
+            self._invalidated_response_ids.clear()
+            self._is_model_speaking = False
+            self._suppress_upcoming_response = False
+        self.dropped_packet_count = 0
 
         self._thread = threading.Thread(
             target=self._thread_main,
@@ -207,7 +224,7 @@ class GeminiLiveSession:
     async def _run(self):
         self._loop = asyncio.get_running_loop()
         self._stop_event = asyncio.Event()
-        self._audio_queue = asyncio.Queue(maxsize=4)
+        self._audio_queue = asyncio.Queue(maxsize=128)
 
         # Keep Live audio responses enabled, but explicitly configure the
         # server-side automatic activity detection.  The microphone stream
@@ -295,6 +312,25 @@ class GeminiLiveSession:
                     self.receive_event_count += 1
                     self.last_receive_time = time.time()
 
+                    # Check for server GoAway notification (approaching max duration or maintenance)
+                    go_away = getattr(
+                        response,
+                        "go_away",
+                        None,
+                    )
+                    if go_away is not None:
+                        time_left = getattr(
+                            go_away,
+                            "time_left",
+                            None,
+                        )
+                        print(f"[LIVE LIFECYCLE] GoAway detected (time_left={time_left})")
+                        print(f"[DIAG RX GO_AWAY] t={time.time():.3f} time_left={time_left}")
+                        self._safe_callback(
+                            self.on_go_away,
+                            str(time_left) if time_left is not None else "",
+                        )
+
                     server_content = getattr(
                         response,
                         "server_content",
@@ -304,66 +340,27 @@ class GeminiLiveSession:
                     if server_content is None:
                         continue
 
-                    input_transcription = getattr(
-                        server_content,
-                        "input_transcription",
-                        None,
-                    ) or getattr(
-                        server_content,
-                        "interim_input_transcription",
-                        None,
-                    )
+                    # Check finalized input_transcription or streaming interim_input_transcription
+                    in_t = getattr(server_content, "input_transcription", None)
+                    interim_in_t = getattr(server_content, "interim_input_transcription", None)
 
-                    if input_transcription is not None:
-                        text = str(
-                            getattr(
-                                input_transcription,
-                                "text",
-                                "",
-                            )
-                            or ""
-                        ).strip()
+                    text = ""
+                    if in_t is not None:
+                        text = str(getattr(in_t, "text", "") or "").strip()
+                    if not text and interim_in_t is not None:
+                        text = str(getattr(interim_in_t, "text", "") or "").strip()
 
-                        if text:
-                            print(f"[DIAG RX INPUT_TRANSCRIPT] t={time.time():.3f} text='{text}'")
-                            with self._transcript_lock:
-                                self._current_user_transcript = text
+                    if text:
+                        print(f"[DIAG RX INPUT_TRANSCRIPT] t={time.time():.3f} text='{text}'")
+                        with self._transcript_lock:
+                            self._current_user_transcript = text
 
-                            self._safe_callback(
-                                self.on_input_transcript,
-                                text,
-                            )
+                        self._safe_callback(
+                            self.on_input_transcript,
+                            text,
+                        )
 
-                    output_transcription = getattr(
-                        server_content,
-                        "output_transcription",
-                        None,
-                    ) or getattr(
-                        server_content,
-                        "output_audio_transcription",
-                        None,
-                    )
-
-                    if output_transcription is not None:
-                        text = str(
-                            getattr(
-                                output_transcription,
-                                "text",
-                                "",
-                            )
-                            or ""
-                        ).strip()
-
-                        if text:
-                            print(f"[DIAG RX OUTPUT_TRANSCRIPT] t={time.time():.3f} text='{text}'")
-                            with self._transcript_lock:
-                                self._current_output_transcript += text
-
-                            self._safe_callback(
-                                self.on_output_transcript,
-                                text,
-                            )
-
+                    # Check server-side interruption flag first
                     interrupted = bool(
                         getattr(
                             server_content,
@@ -373,15 +370,32 @@ class GeminiLiveSession:
                     )
 
                     if interrupted:
-                        print(
-                            f"[DIAG RX SERVER_INTERRUPTED] t={time.time():.3f} "
-                            f"interrupted=True source=GeminiServer "
-                            f"user_transcript='{self._current_user_transcript}' "
-                            f"output_transcript='{self._current_output_transcript}'"
-                        )
+                        with self._response_lock:
+                            interrupted_id = self._active_response_id
+                            self._invalidated_response_ids.add(interrupted_id)
+                            self._is_model_speaking = False
+                            print(f"[LIVE] USER INTERRUPTION")
+                            print(f"[LIVE] INVALIDATING RESPONSE: {interrupted_id}")
+                            print(
+                                f"[DIAG RX SERVER_INTERRUPTED] t={time.time():.3f} "
+                                f"interrupted=True source=GeminiServer "
+                                f"response_id={interrupted_id} "
+                                f"user_transcript='{self._current_user_transcript}' "
+                                f"output_transcript='{self._current_output_transcript}'"
+                            )
                         self._safe_callback(
-                            self.on_interrupted
+                            self.on_interrupted,
+                            interrupted_id,
                         )
+
+                    out_t = getattr(server_content, "output_transcription", None)
+                    out_audio_t = getattr(server_content, "output_audio_transcription", None)
+
+                    output_text = ""
+                    if out_t is not None:
+                        output_text = str(getattr(out_t, "text", "") or "").strip()
+                    if not output_text and out_audio_t is not None:
+                        output_text = str(getattr(out_audio_t, "text", "") or "").strip()
 
                     model_turn = getattr(
                         server_content,
@@ -389,36 +403,81 @@ class GeminiLiveSession:
                         None,
                     )
 
-                    if model_turn is not None:
-                        parts = getattr(
-                            model_turn,
-                            "parts",
-                            None,
-                        ) or []
+                    parts = getattr(model_turn, "parts", None) or [] if model_turn is not None else []
+                    has_audio_parts = any(
+                        getattr(getattr(p, "inline_data", None), "data", None) for p in parts
+                    )
 
-                        for part in parts:
-                            inline_data = getattr(
-                                part,
-                                "inline_data",
-                                None,
+                    has_model_content = bool(output_text) or has_audio_parts
+
+                    if has_model_content:
+                        with self._response_lock:
+                            if not self._is_model_speaking:
+                                self._is_model_speaking = True
+                                self._active_response_id += 1
+                                current_resp_id = self._active_response_id
+                                if getattr(self, "_suppress_upcoming_response", False):
+                                    self._invalidated_response_ids.add(current_resp_id)
+                                is_stale = current_resp_id in self._invalidated_response_ids
+                                if not is_stale:
+                                    print(f"[LIVE] SPEAKING START")
+                                    print(f"[LIVE] RESPONSE ID: {current_resp_id}")
+                                else:
+                                    print(f"[LIVE] SUPPRESSED RESPONSE DETECTED: {current_resp_id} (SPEAKING BLOCKED)")
+                            else:
+                                current_resp_id = self._active_response_id
+                                if getattr(self, "_suppress_upcoming_response", False):
+                                    self._invalidated_response_ids.add(current_resp_id)
+                                is_stale = current_resp_id in self._invalidated_response_ids
+                    else:
+                        with self._response_lock:
+                            current_resp_id = self._active_response_id
+                            if getattr(self, "_suppress_upcoming_response", False):
+                                self._invalidated_response_ids.add(current_resp_id)
+                            is_stale = current_resp_id in self._invalidated_response_ids
+
+                    if is_stale:
+                        if has_audio_parts:
+                            print(f"[LIVE] STALE AUDIO DROPPED: {current_resp_id}")
+                        if output_text:
+                            print(f"[LIVE] STALE TRANSCRIPT DROPPED: '{output_text}' (resp_id={current_resp_id})")
+                    else:
+                        if output_text:
+                            print(f"[DIAG RX OUTPUT_TRANSCRIPT] t={time.time():.3f} text='{output_text}' resp_id={current_resp_id}")
+                            with self._transcript_lock:
+                                self._current_output_transcript += output_text
+
+                            self._safe_callback(
+                                self.on_output_transcript,
+                                output_text,
+                                current_resp_id,
                             )
 
-                            if inline_data is None:
-                                continue
-
-                            audio_data = getattr(
-                                inline_data,
-                                "data",
-                                None,
-                            )
-
-                            if audio_data:
-                                chunk_bytes = len(audio_data)
-                                print(f"[DIAG RX MODEL_AUDIO] t={time.time():.3f} bytes={chunk_bytes}")
-                                self._safe_callback(
-                                    self.on_audio,
-                                    bytes(audio_data),
+                        if model_turn is not None:
+                            for part in parts:
+                                inline_data = getattr(
+                                    part,
+                                    "inline_data",
+                                    None,
                                 )
+
+                                if inline_data is None:
+                                    continue
+
+                                audio_data = getattr(
+                                    inline_data,
+                                    "data",
+                                    None,
+                                )
+
+                                if audio_data:
+                                    chunk_bytes = len(audio_data)
+                                    print(f"[DIAG RX MODEL_AUDIO] t={time.time():.3f} bytes={chunk_bytes} resp_id={current_resp_id}")
+                                    self._safe_callback(
+                                        self.on_audio,
+                                        bytes(audio_data),
+                                        current_resp_id,
+                                    )
 
                     turn_complete = bool(
                         getattr(
@@ -430,17 +489,24 @@ class GeminiLiveSession:
 
                     if turn_complete:
                         print(f"[DIAG RX TURN_COMPLETE] t={time.time():.3f} turn_complete=True")
+                        with self._response_lock:
+                            self._is_model_speaking = False
+                            was_suppressed = getattr(self, "_suppress_upcoming_response", False) or (self._active_response_id in self._invalidated_response_ids)
+                            self._suppress_upcoming_response = False
                         with self._transcript_lock:
                             user_text = self._current_user_transcript.strip()
-                            assistant_text = self._current_output_transcript.strip()
+                            assistant_text = "" if was_suppressed else self._current_output_transcript.strip()
                             self._current_user_transcript = ""
                             self._current_output_transcript = ""
 
-                        self._safe_callback(
-                            self.on_turn_complete,
-                            user_text,
-                            assistant_text,
-                        )
+                        if not was_suppressed:
+                            self._safe_callback(
+                                self.on_turn_complete,
+                                user_text,
+                                assistant_text,
+                            )
+                        else:
+                            print(f"[LIVE] SUPPRESSED TURN COMPLETE: assistant text blocked from callback.")
 
         except asyncio.CancelledError:
             raise
@@ -550,6 +616,12 @@ class GeminiLiveSession:
             try:
                 queue.put_nowait(data)
             except asyncio.QueueFull:
+                self.dropped_packet_count += 1
+                if self.dropped_packet_count in (1, 10, 50) or self.dropped_packet_count % 100 == 0:
+                    print(
+                        f"[LIVE AUDIO DROP] session_id={self.session_id} "
+                        f"dropped_packets={self.dropped_packet_count} qsize={queue.qsize()}"
+                    )
                 # Drop the oldest queued chunk so microphone capture does not
                 # block behind network backpressure.
                 try:
@@ -570,15 +642,52 @@ class GeminiLiveSession:
 
     def clear_pending_audio(self) -> None:
         """Discard queued microphone packets without closing the Live session."""
+        loop = self._loop
         queue = self._audio_queue
-        if queue is None:
+        if loop is None or queue is None or loop.is_closed():
             return
 
-        while True:
-            try:
-                queue.get_nowait()
-            except asyncio.QueueEmpty:
-                break
+        def _drain():
+            while not queue.empty():
+                try:
+                    queue.get_nowait()
+                except asyncio.QueueEmpty:
+                    break
+
+        try:
+            loop.call_soon_threadsafe(_drain)
+        except RuntimeError:
+            pass
+
+    def interrupt_current_response(self) -> int:
+        """Immediately invalidate current model response token and trigger interruption callback."""
+        with self._response_lock:
+            interrupted_id = self._active_response_id
+            self._invalidated_response_ids.add(interrupted_id)
+            self._is_model_speaking = False
+            print(f"[LIVE] USER INTERRUPTION")
+            print(f"[LIVE] INVALIDATING RESPONSE: {interrupted_id}")
+        self._safe_callback(self.on_interrupted, interrupted_id)
+        return interrupted_id
+
+    def suppress_active_and_next_response(self) -> int:
+        """Immediately invalidate current model response token, upcoming token, and suppress output."""
+        with self._response_lock:
+            self._suppress_upcoming_response = True
+            current_id = self._active_response_id
+            self._invalidated_response_ids.add(current_id)
+            self._invalidated_response_ids.add(current_id + 1)
+            self._is_model_speaking = False
+            print(f"[LIVE] RESPONSE SUPPRESSED FOR COMMAND HANDOFF: invalidated_ids={self._invalidated_response_ids}")
+        self.clear_pending_audio()
+        return current_id
+
+    def reset_suppression(self) -> None:
+        """Clear output suppression and invalidated response IDs for future turns."""
+        with self._response_lock:
+            self._suppress_upcoming_response = False
+            self._invalidated_response_ids.clear()
+            print(f"[LIVE] Suppression state reset on session {self.session_id}")
 
     # ------------------------------------------------------
     # Send Text
@@ -713,6 +822,17 @@ class GeminiLiveSession:
 
         try:
             callback(*args)
+        except TypeError:
+            try:
+                import inspect
+                sig = inspect.signature(callback)
+                param_count = len(sig.parameters)
+                callback(*args[:param_count])
+            except Exception as error:
+                print(
+                    "Gemini Live callback error:",
+                    error,
+                )
         except Exception as error:
             print(
                 "Gemini Live callback error:",
@@ -788,6 +908,27 @@ class GeminiClient:
             "GEMINI_MODEL",
             "models/gemini-3.5-flash"
         )
+
+        # ------------------------------------------
+        # Semantic Planner Model Hierarchy
+        # ------------------------------------------
+        # Priority order:
+        # 1. Gemini 3.8 Flash High
+        # 2. Gemini 3.7 Flash Medium
+        # 3. Gemini 3.6 Flash Medium
+        # 4. Existing valid Gemini fallback (gemini-3.5-flash)
+        # 5. Groq cloud planner fallback
+        raw_planner_models = [
+            getattr(settings, "GEMINI_PLANNER_PRIMARY_MODEL", "gemini-3.8-flash"),
+            getattr(settings, "GEMINI_PLANNER_FALLBACK_1", "gemini-3.7-flash"),
+            getattr(settings, "GEMINI_PLANNER_FALLBACK_2", "gemini-3.6-flash"),
+            getattr(settings, "GEMINI_MODEL", "models/gemini-3.5-flash"),
+        ]
+        self.semantic_planner_models = []
+        for pm in raw_planner_models:
+            pm_str = str(pm or "").strip()
+            if pm_str and pm_str not in self.semantic_planner_models:
+                self.semantic_planner_models.append(pm_str)
 
         # ------------------------------------------
         # Gemini Live API
@@ -1911,6 +2052,67 @@ and
         )
 
     # ------------------------------------------------------
+    # Is Service Unavailable Error (503 / High Demand)
+    # ------------------------------------------------------
+
+    @staticmethod
+    def _is_service_unavailable_error(
+        error
+    ) -> bool:
+        """
+        Detect errors where model backend is overloaded / unavailable (503).
+        Rotating API keys on 503 is counterproductive since all keys hit the same
+        overloaded model backend cluster. Fails fast to the next model tier.
+        """
+        error_text = str(
+            error
+        ).lower()
+
+        unavailable_keywords = (
+            "503",
+            "unavailable",
+            "high demand",
+            "spikes in demand",
+            "service unavailable",
+            "temporarily unavailable",
+            "overloaded",
+            "capacity",
+        )
+
+        return any(
+            keyword in error_text
+            for keyword in unavailable_keywords
+        )
+
+    # ------------------------------------------------------
+    # Is Quota Exhausted Error (429 / RESOURCE_EXHAUSTED)
+    # ------------------------------------------------------
+
+    @staticmethod
+    def _is_quota_exhausted_error(
+        error
+    ) -> bool:
+        """
+        Detect errors where model daily/per-minute quota is exhausted (429 / RESOURCE_EXHAUSTED).
+        Model quota is model/project wide (e.g. 20 req/day for Free Tier gemini-3.8-flash).
+        Rotating API keys against the same exhausted model is useless.
+        Fails fast immediately to the next configured model tier or Groq.
+        """
+        error_text = str(error).lower()
+        quota_keywords = (
+            "429",
+            "resource_exhausted",
+            "quota",
+            "rate limit",
+            "rate_limit",
+            "too many requests",
+            "generaterequestsperday",
+            "free-tier limit",
+            "exceeded your current quota",
+        )
+        return any(k in error_text for k in quota_keywords)
+
+    # ------------------------------------------------------
     # Retry Delay
     # ------------------------------------------------------
 
@@ -2608,27 +2810,18 @@ and
         """
         Generate a structured JSON action plan.
 
-        Primary provider:
-            Gemini using configured API keys.
+        Model Priority Hierarchy:
+            1. Gemini 3.8 Flash High (gemini-3.8-flash)
+            2. Gemini 3.7 Flash Medium (gemini-3.7-flash)
+            3. Gemini 3.6 Flash Medium (gemini-3.6-flash)
+            4. Existing valid Gemini fallback (gemini-3.5-flash)
+            5. Groq cloud planner fallback (openai/gpt-oss-20b)
 
-        Secondary provider:
-            Groq using GROQ_API_KEY_CODE_AGENT.
+        On 503 / UNAVAILABLE / high demand:
+            Fails fast to the next model tier without cycling keys on the same overloaded model.
 
-        Fallback order:
-            Gemini Key 1
-                ↓
-            Gemini Key 2
-                ↓
-            Gemini Key 3
-                ↓
-            Gemini Key 4
-                ↓
-            Groq planner fallback
-                ↓
-            empty string if all providers fail
-
-        The existing Gemini key rotation is preserved.
-        The existing GROQ_API_KEY used by STT is never used.
+        On 429 / quota / auth errors:
+            Rotates API keys on that model tier.
         """
 
         if self._closing:
@@ -2641,153 +2834,206 @@ and
         if not prompt:
             return ""
 
-        # ------------------------------------------
-        # Gemini Attempts
-        # ------------------------------------------
-
         with self.lock:
 
             total_keys = len(
                 self.api_keys
             )
 
-            attempted_keys = set()
+            planner_models = (
+                self.semantic_planner_models
+                if hasattr(self, "semantic_planner_models") and self.semantic_planner_models
+                else [self.model]
+            )
 
-            for _ in range(
-                total_keys
-            ):
+            for model_index, model_name in enumerate(planner_models, 1):
 
                 if self._closing:
                     return ""
 
-                current_index = (
-                    self.current_key_index
+                print(
+                    f"\n[SEMANTIC MODEL] Tier {model_index}/{len(planner_models)}: {model_name}"
                 )
 
-                if current_index in attempted_keys:
-                    break
+                attempted_keys = set()
+                model_failed = False
 
-                attempted_keys.add(
-                    current_index
-                )
+                for _ in range(
+                    total_keys
+                ):
 
-                try:
+                    if self._closing or model_failed:
+                        break
 
-                    print(
-                        f"Using Gemini Planner Key "
-                        f"{current_index + 1}/"
-                        f"{total_keys}"
+                    current_index = (
+                        self.current_key_index
                     )
 
-                    print(
-                        f"Using Model : "
-                        f"{self.model}"
+                    if current_index in attempted_keys:
+                        break
+
+                    attempted_keys.add(
+                        current_index
                     )
 
-                    response = (
-                        self.client.models.generate_content(
-                            model=self.model,
-                            contents=prompt,
-                            config=(
-                                types.GenerateContentConfig(
-                                    temperature=0.10,
-                                    top_p=0.90,
-                                    top_k=20,
-                                    max_output_tokens=4096,
-                                    candidate_count=1,
-                                    response_mime_type=(
-                                        "application/json"
+                    try:
+
+                        print(
+                            f"Using Gemini Planner Key "
+                            f"{current_index + 1}/"
+                            f"{total_keys} | Model: {model_name}"
+                        )
+
+                        response = (
+                            self.client.models.generate_content(
+                                model=model_name,
+                                contents=prompt,
+                                config=(
+                                    types.GenerateContentConfig(
+                                        temperature=0.10,
+                                        top_p=0.90,
+                                        top_k=20,
+                                        max_output_tokens=4096,
+                                        candidate_count=1,
+                                        response_mime_type=(
+                                            "application/json"
+                                        )
                                     )
                                 )
                             )
                         )
-                    )
 
-                    text = ""
+                        text = ""
 
-                    if response is not None:
+                        if response is not None:
 
-                        if hasattr(
-                            response,
-                            "text"
+                            if hasattr(
+                                response,
+                                "text"
+                            ):
+
+                                text = (
+                                    response.text
+                                    or ""
+                                ).strip()
+
+                        if not text:
+
+                            raise RuntimeError(
+                                f"Gemini model {model_name} returned an empty "
+                                "structured-plan response."
+                            )
+
+                        print(
+                            "\n========== GEMINI ACTION PLAN =========="
+                        )
+
+                        print(
+                            text
+                        )
+
+                        print(
+                            "Length :",
+                            len(text)
+                        )
+
+                        print(
+                            "Key Used :",
+                            current_index + 1
+                        )
+
+                        print(
+                            f"Provider : Gemini ({model_name})"
+                        )
+
+                        print(
+                            "========================================\n"
+                        )
+
+                        return text
+
+                    except Exception as error:
+
+                        print(
+                            f"\nGemini Planner Error on {model_name}: {error}"
+                        )
+
+                        # FAST 503/UNAVAILABLE FAILOVER:
+                        # Server-side overload affects all keys on the same model.
+                        # Do NOT burn time rotating keys on an overloaded model.
+                        if self._is_service_unavailable_error(
+                            error
                         ):
 
-                            text = (
-                                response.text
-                                or ""
-                            ).strip()
+                            print(
+                                f"[SEMANTIC MODEL FALLBACK] Model '{model_name}' returned 503/UNAVAILABLE. "
+                                f"Failing fast to next model tier without key retry delays."
+                            )
 
-                    if not text:
+                            model_failed = True
+                            break
 
-                        raise RuntimeError(
-                            "Gemini returned an empty "
-                            "structured-plan response."
-                        )
+                        # HARD 429 / RESOURCE_EXHAUSTED FAILOVER:
+                        # Model quota (e.g. 20 req/day on Free Tier for gemini-3.8-flash) is model/project wide.
+                        # Do NOT burn time rotating keys or sleeping on an exhausted model tier.
+                        if self._is_quota_exhausted_error(
+                            error
+                        ):
+                            next_tier_desc = (
+                                f"Gemini ({planner_models[model_index]})"
+                                if model_index < len(planner_models)
+                                else "Groq (openai/gpt-oss-20b)"
+                            )
+                            print("\n[SEMANTIC] PLANNER FAILOVER")
+                            print(f"Model  : {model_name}")
+                            print(f"Reason : 429 RESOURCE_EXHAUSTED ({error})")
+                            print(f"Next   : {next_tier_desc}\n")
 
-                    print(
-                        "\n========== GEMINI ACTION PLAN =========="
-                    )
+                            model_failed = True
+                            break
 
-                    print(
-                        text
-                    )
+                        # Check if model identifier is not supported/not found (e.g. 404)
+                        err_str = str(error).lower()
+                        if (
+                            "404" in err_str
+                            or "not found" in err_str
+                            or "is no longer available" in err_str
+                            or "not supported" in err_str
+                        ):
 
-                    print(
-                        "Length :",
-                        len(text)
-                    )
+                            print(
+                                f"[SEMANTIC MODEL FALLBACK] Model '{model_name}' not available ({error}). "
+                                f"Advancing to next model tier."
+                            )
 
-                    print(
-                        "Key Used :",
-                        current_index + 1
-                    )
+                            model_failed = True
+                            break
 
-                    print(
-                        "Provider : Gemini"
-                    )
+                        # Key-specific auth or network error: rotate key
+                        if self._is_retryable_error(
+                            error
+                        ):
 
-                    print(
-                        "========================================\n"
-                    )
+                            print(
+                                f"Retryable key error on {model_name}. Trying next key..."
+                            )
 
-                    return text
+                            self._retry_delay()
 
-                except Exception as error:
+                            if self.rotate_api_key():
+                                continue
 
-                    print(
-                        "\nGemini Planner Error :",
-                        error
-                    )
+                        else:
 
-                    if self._is_retryable_error(
-                        error
-                    ):
+                            print(
+                                f"Non-retryable error on model {model_name}. Advancing to next model tier."
+                            )
 
-                        print(
-                            "Retryable Gemini planner "
-                            "error detected."
-                        )
-
-                        print(
-                            "Trying another Gemini API key..."
-                        )
-
-                        self._retry_delay()
-
-                        if self.rotate_api_key():
-                            continue
-
-                    else:
-
-                        print(
-                            "Non-retryable Gemini planner "
-                            "error detected."
-                        )
-
-                        break
+                            model_failed = True
+                            break
 
             # --------------------------------------
-            # All Gemini keys exhausted
+            # All Gemini models exhausted
             # --------------------------------------
 
             print(
@@ -2795,7 +3041,7 @@ and
             )
 
             print(
-                "All Gemini planner attempts failed."
+                "All Gemini planner models failed or unavailable."
             )
 
             print(
@@ -2811,11 +3057,6 @@ and
 
             # --------------------------------------
             # Groq fallback
-            # --------------------------------------
-            #
-            # Keep the Groq network request inside the
-            # existing lock so only one planner request
-            # manipulates provider state at a time.
             # --------------------------------------
 
             groq_result = (
@@ -2852,6 +3093,7 @@ and
         on_turn_complete=None,
         on_error=None,
         on_closed=None,
+        on_go_away=None,
         auto_start=True,
     ):
         """
@@ -2894,6 +3136,7 @@ and
                 on_turn_complete=on_turn_complete,
                 on_error=on_error,
                 on_closed=on_closed,
+                on_go_away=on_go_away,
             )
 
             self.live_session = session

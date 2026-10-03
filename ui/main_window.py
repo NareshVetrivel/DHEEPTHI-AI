@@ -132,6 +132,7 @@ from planner.command_dispatcher import CommandDispatcher
 from ai.gemini_client import GeminiClient
 from planner.multi_command_planner import MultiCommandPlanner
 from planner.multi_command_executor import MultiCommandExecutor
+from planner.semantic_command_planner import SemanticCommandPlanner
 
 from automation.keyboard_controller import KeyboardController
 from automation.mouse_controller import MouseController
@@ -780,6 +781,10 @@ class GeminiLiveAudioWorker(QThread):
         self._output_lock = threading.RLock()
         self._input_stream = None
         self._output_stream = None
+        self._is_speaker_playing = False
+        self._active_response_id = 0
+        self._invalidated_response_ids = set()
+        self._suppress_upcoming_response = False
         print(f"[LIVE DEBUG] worker_id={self.worker_id} worker created")
 
     def run(self):
@@ -889,6 +894,9 @@ class GeminiLiveAudioWorker(QThread):
                             # Diagnostic logging for representative chunks
                             if self.captured_packets in (1, 10, 50) or self.captured_packets % 100 == 0:
                                 queue_depth = getattr(getattr(self.live_session, "_audio_queue", None), "qsize", lambda: 0)()
+                                session_send_cnt = getattr(self.live_session, "send_packet_count", 0)
+                                session_rx_cnt = getattr(self.live_session, "receive_event_count", 0)
+                                session_drop_cnt = getattr(self.live_session, "dropped_packet_count", 0)
                                 print(
                                     f"[PCM DIAGNOSTIC] packet={self.captured_packets} bytes={len(send_chunk)} exp={self.CHUNK_BYTES} "
                                     f"samples=512 RMS={rms:.2f} min={min_sample} max={max_sample} zeros={zero_pct:.1f}% "
@@ -899,7 +907,7 @@ class GeminiLiveAudioWorker(QThread):
                                     f"[PCM STATS] session_id={session_id} worker_id={self.worker_id} "
                                     f"captured={self.captured_packets} valid={self.valid_pcm_packets} "
                                     f"queued={self.queued_packets} sent={self.sent_packets} dropped={self.dropped_packets} "
-                                    f"bytes_sent={self.bytes_sent} receive_loop_active={getattr(self.live_session, 'is_running', False)}"
+                                    f"bytes_sent={self.bytes_sent} session_sent={session_send_cnt} session_rx={session_rx_cnt} session_dropped={session_drop_cnt} receive_loop_active={getattr(self.live_session, 'is_running', False)}"
                                 )
                         else:
                             self.dropped_packets += 1
@@ -919,10 +927,19 @@ class GeminiLiveAudioWorker(QThread):
             with self._output_lock:
                 while len(self._output_buffer) < needed:
                     try:
-                        chunk = self._output_queue.get_nowait()
+                        item = self._output_queue.get_nowait()
                     except queue.Empty:
                         break
-                    if chunk:
+                    if item:
+                        if isinstance(item, tuple):
+                            resp_id, chunk = item
+                        else:
+                            resp_id, chunk = 0, item
+
+                        if resp_id in self._invalidated_response_ids or (resp_id != 0 and resp_id < self._active_response_id):
+                            print(f"[LIVE] STALE AUDIO DROPPED: {resp_id}")
+                            continue
+
                         self._output_buffer.extend(chunk)
 
                 available = min(len(self._output_buffer), needed)
@@ -946,7 +963,11 @@ class GeminiLiveAudioWorker(QThread):
 
     def is_output_playing(self) -> bool:
         with self._output_lock:
-            return bool(getattr(self, "_is_speaker_playing", False) or len(self._output_buffer) > 0 or not self._output_queue.empty())
+            return bool(
+                getattr(self, "_is_speaker_playing", False)
+                or len(self._output_buffer) > 0
+                or not self._output_queue.empty()
+            )
 
     def clear_input_buffer(self):
         with self._input_lock:
@@ -965,11 +986,6 @@ class GeminiLiveAudioWorker(QThread):
                     self.live_session.clear_pending_audio()
                 except Exception:
                     pass
-            if self.live_session is not None:
-                try:
-                    self.live_session.clear_pending_audio()
-                except Exception:
-                    pass
         if prev != self._input_enabled:
             session_id = getattr(self.live_session, "session_id", "unknown") if self.live_session else "none"
             print(
@@ -980,33 +996,84 @@ class GeminiLiveAudioWorker(QThread):
     def input_enabled(self) -> bool:
         return bool(self._input_enabled)
 
-    def enqueue_output(self, audio_data: bytes):
+    def enqueue_output(self, audio_data: bytes, response_id: int = 0):
         if self._stop_requested or not audio_data:
             return
 
+        with self._output_lock:
+            if getattr(self, "_suppress_upcoming_response", False):
+                self._invalidated_response_ids.add(response_id)
+            if response_id in self._invalidated_response_ids or (response_id != 0 and response_id < self._active_response_id):
+                print(f"[LIVE] STALE AUDIO DROPPED: {response_id}")
+                return
+            if response_id > self._active_response_id:
+                self._active_response_id = response_id
+
         data = bytes(audio_data)
+        item = (response_id, data)
         try:
-            self._output_queue.put_nowait(data)
+            self._output_queue.put_nowait(item)
         except queue.Full:
             try:
                 self._output_queue.get_nowait()
             except queue.Empty:
                 pass
             try:
-                self._output_queue.put_nowait(data)
+                self._output_queue.put_nowait(item)
             except queue.Full:
                 pass
 
+    def interrupt_and_flush(self, response_id: int = 0):
+        """Immediately discard buffered model audio, stop speaker, and invalidate response."""
+        with self._output_lock:
+            target_id = response_id or self._active_response_id
+            if target_id:
+                self._invalidated_response_ids.add(target_id)
+            print(f"[LIVE] STOPPING PLAYBACK")
+            print(f"[LIVE] FLUSHING PLAYBACK QUEUE")
+            self._output_buffer.clear()
+            self._is_speaker_playing = False
+
+            while True:
+                try:
+                    self._output_queue.get_nowait()
+                except queue.Empty:
+                    break
+
+            print(f"[LIVE] PLAYBACK QUEUE CLEARED")
+
+    def suppress_active_and_next_response(self):
+        """Immediately discard buffered model audio, stop speaker, and invalidate upcoming response."""
+        with self._output_lock:
+            self._suppress_upcoming_response = True
+            target_id = self._active_response_id
+            self._invalidated_response_ids.add(target_id)
+            self._invalidated_response_ids.add(target_id + 1)
+            self.interrupt_and_flush(target_id)
+        if self.live_session is not None:
+            try:
+                self.live_session.suppress_active_and_next_response()
+            except Exception:
+                pass
+
+    def reset_suppression(self):
+        """Clear output suppression and invalidated response IDs for future turns."""
+        with self._output_lock:
+            self._suppress_upcoming_response = False
+            self._invalidated_response_ids.clear()
+            print(f"[LIVE] Suppression state reset on worker {self.worker_id}")
+
     def clear_output(self):
         """Immediately discard buffered model audio for barge-in."""
-        with self._output_lock:
-            self._output_buffer.clear()
+        self.interrupt_and_flush(self._active_response_id)
 
-        while True:
-            try:
-                self._output_queue.get_nowait()
-            except queue.Empty:
-                break
+    def stop_playback(self):
+        """Immediately stop speaker and flush output queue."""
+        self.interrupt_and_flush(self._active_response_id)
+
+    def clear_pending_audio(self):
+        """Alias for clearing pending model audio queue."""
+        self.interrupt_and_flush(self._active_response_id)
 
     def stop(self):
         self._stop_requested = True
@@ -1028,6 +1095,10 @@ class GeminiLiveAudioWorker(QThread):
             if stream is None:
                 continue
             setattr(self, stream_name, None)
+            try:
+                stream.abort()
+            except Exception:
+                pass
             try:
                 stream.stop()
             except Exception:
@@ -1053,12 +1124,14 @@ class MainWindow(QMainWindow):
     gemini_live_turn_complete_signal = Signal(str, str)
     gemini_live_error_signal = Signal(str)
     gemini_live_closed_signal = Signal()
+    gemini_live_go_away_signal = Signal(str)
 
     def __init__(self):
 
         super().__init__()
 
         self._closing = False
+        self.shutdown_started = False
 
         # ----------------------------------
         # Graceful Okii, byee! See youu soon 🫶 Shutdown
@@ -1124,6 +1197,8 @@ class MainWindow(QMainWindow):
         self.multi_command_planner = None
 
         self.multi_command_executor = None
+
+        self.semantic_command_planner = None
 
         self.app_launcher = None
 
@@ -1376,6 +1451,9 @@ class MainWindow(QMainWindow):
         )
         self.gemini_live_closed_signal.connect(
             self._handle_gemini_live_closed
+        )
+        self.gemini_live_go_away_signal.connect(
+            self._handle_gemini_live_go_away
         )
 
         # Prepare the physical laptop microphone monitor. It starts only
@@ -2131,6 +2209,10 @@ class MainWindow(QMainWindow):
         # ------------------------------------------
 
         self.multi_command_planner = MultiCommandPlanner(
+            gemini_client=self.gemini
+        )
+
+        self.semantic_command_planner = SemanticCommandPlanner(
             gemini_client=self.gemini
         )
 
@@ -9840,8 +9922,11 @@ class MainWindow(QMainWindow):
         if self.gemini_live_active and worker is not None:
             try:
                 self._gemini_live_output_suppressed = False
-                worker.set_input_enabled(True)
+                worker.reset_suppression()
                 session = self.gemini_live_session
+                if session is not None:
+                    session.reset_suppression()
+                worker.set_input_enabled(True)
                 session_id = getattr(session, "session_id", "none") if session else "none"
                 worker_id = getattr(worker, "worker_id", "none") if worker else "none"
                 print(f"[LIVE DEBUG] session_id={session_id} worker_id={worker_id} physical_mic_muted=False input_enabled=True")
@@ -10054,7 +10139,11 @@ class MainWindow(QMainWindow):
             print(f"[LIVE] Continuous input watchdog error: {error}")
 
     def _start_gemini_live_conversation(self):
-        if self._closing or not self._gemini_live_pending_start:
+        if getattr(self, "shutdown_started", False) or self._closing:
+            print("[LIVE LIFECYCLE] Reconnect suppressed because shutdown_started=True")
+            return
+
+        if not self._gemini_live_pending_start:
             return
 
         self._gemini_live_pending_start = False
@@ -10078,6 +10167,7 @@ class MainWindow(QMainWindow):
                 on_turn_complete=self._on_gemini_live_turn_complete,
                 on_error=self._on_gemini_live_error,
                 on_closed=self._on_gemini_live_closed,
+                on_go_away=self._on_gemini_live_go_away,
                 auto_start=False,
             )
 
@@ -10106,8 +10196,11 @@ class MainWindow(QMainWindow):
             self._handle_gemini_live_error(str(error))
 
     def _on_gemini_live_audio_worker_connected(self):
-        if self._closing or not self.gemini_live_active:
+        if getattr(self, "shutdown_started", False) or self._closing or not self.gemini_live_active:
+            if getattr(self, "shutdown_started", False) or self._closing:
+                print("[LIVE LIFECYCLE] Reconnect suppressed because shutdown_started=True")
             return
+        print("[LIVE LIFECYCLE] Replacement Live session connected")
         try:
             input_enabled = not self.physical_microphone_muted
             if self.gemini_live_audio_worker is not None:
@@ -10146,257 +10239,1065 @@ class MainWindow(QMainWindow):
         # bridge emitted finished. The error/closed handlers own full-session
         # recovery.
 
+    INTERRUPTION_PHRASES = {
+        "stop",
+        "wait",
+        "pothum",
+        "podhum",
+        "enough",
+        "stop talking",
+        "pesadha",
+        "pesama iru",
+        "wait wait",
+        "niruthu",
+        "niruthunga",
+        "shut up",
+        "pause",
+        "shh",
+        "silence",
+    }
+
+    @classmethod
+    def _is_interruption_phrase(cls, text: str) -> bool:
+        if not text:
+            return False
+        clean = re.sub(r"[^\w\s]", "", text.strip().lower()).strip()
+        if clean in cls.INTERRUPTION_PHRASES:
+            return True
+        words = clean.split()
+        if words and all(w in cls.INTERRUPTION_PHRASES for w in words):
+            return True
+        return False
+
+    def _is_semantic_command_candidate(self, text: str) -> bool:
+        if not text or len(text.strip()) <= 1:
+            return False
+
+        clean = text.strip()
+
+        # Check 1: If interruption phrase -> NOT a command candidate
+        if self._is_interruption_phrase(clean):
+            return False
+
+        # Check 2: Check obvious conversation guard from SemanticCommandPlanner
+        if hasattr(self, "semantic_command_planner") and self.semantic_command_planner is not None:
+            try:
+                if self.semantic_command_planner._is_obviously_conversational(clean):
+                    return False
+            except Exception:
+                pass
+        else:
+            try:
+                from planner.semantic_command_planner import SemanticCommandPlanner
+                if SemanticCommandPlanner._is_obviously_conversational(clean):
+                    return False
+            except Exception:
+                pass
+
+        # Check 3: Deterministic local intent check
+        if hasattr(self, "intent_detector") and self.intent_detector is not None:
+            try:
+                local_intent = self.intent_detector.detect_local_intent_only(clean)
+                if local_intent not in (None, "ai_chat"):
+                    return True
+            except Exception:
+                pass
+
+        # Check 4: Structural Action Evidence:
+        # A valid candidate MUST have an action verb + application/file/media/system target
+        lower = clean.lower()
+
+        # 4A. Application + action verb
+        app_names_pattern = (
+            r"\b(?:chrome|edge|firefox|notepad|calculator|calc|vs\s*code|vscode|"
+            r"visual\s*studio\s*code|word|excel|powerpoint|power\s*pnt|explorer|"
+            r"file\s*explorer|whatsapp|spotify|discord|teams|terminal|cmd|"
+            r"command\s*prompt|paint)\b"
+        )
+        app_action_pattern = (
+            r"\b(?:open|start|launch|run|close|exit|quit|kill|thiranthu|moodu|"
+            r"திறந்து|மூடு)\b"
+        )
+        if re.search(app_names_pattern, lower) and re.search(app_action_pattern, lower):
+            return True
+
+        # 4B. Media play structure (song, music, video, artist, YouTube)
+        # e.g. "Pavalamalli song play pannu", "play Pavalamalli song", "podu Pavalamalli song"
+        media_terms_pattern = r"\b(?:song|songs|video|music|paatu|paattu|track|youtube)\b"
+        media_action_pattern = r"\b(?:play|podu|போடு|paadu|பாட்டு|kekkanum|ketka)\b"
+        if re.search(media_terms_pattern, lower) and re.search(media_action_pattern, lower):
+            return True
+        if re.search(r"^(?:play|podu)\s+.+", lower):
+            return True
+
+        # 4C. File / folder operations
+        # e.g. "Downloads folder open panni report.pdf ah Desktop ku copy pannu"
+        file_target_pattern = r"\b(?:folder|file|desktop|downloads|documents|document|pdf|txt|py|doc|docx|csv|report)\b"
+        file_action_pattern = r"\b(?:copy|move|delete|create|make|rename|remove|azhi|uruvakku)\b"
+        if re.search(file_target_pattern, lower) and re.search(file_action_pattern, lower):
+            return True
+
+        # 4D. System control actions
+        system_action_pattern = (
+            r"\b(?:screenshot|screen\s*shot|screen\s*record|record\s*screen|"
+            r"mute|unmute|brightness|volume|shutdown|shut\s*down|restart|"
+            r"lock\s*screen)\b"
+        )
+        if re.search(system_action_pattern, lower):
+            return True
+
+        # 4E. Multi-action Tanglish connector with action verbs
+        # Must have connector (panni/pannitu/seythu) AND at least one executable action verb
+        tanglish_connector = r"\b(?:panni|pannitu|seythu|seithu|செய்து)\b"
+        executable_actions = r"\b(?:open|play|copy|create|move|delete|launch|write|type|thiranthu|podu)\b"
+        if re.search(tanglish_connector, lower) and re.search(executable_actions, lower):
+            return True
+
+        return False
+
     def _on_gemini_live_connected(self):
-        if not self._closing:
-            print("[LIVE] Gemini Live API connected.")
-
-    def _on_gemini_live_audio(self, audio_data):
-        now = time.time()
-        chunk_len = len(audio_data) if audio_data else 0
-        worker = self.gemini_live_audio_worker
-        q_depth = worker._output_queue.qsize() if worker else 0
-        print(f"[DIAG UI AUDIO CHUNK] t={now:.3f} bytes={chunk_len} qdepth={q_depth}")
-        if getattr(self, "_gemini_live_output_suppressed", False):
+        if getattr(self, "shutdown_started", False) or getattr(self, "_closing", False):
             return
+        print("[LIVE] Gemini Live API connected.")
 
-        if worker is not None and self.gemini_live_active:
-            worker.enqueue_output(audio_data)
+    def _on_gemini_live_audio(self, audio_data, response_id=0):
+        try:
+            if getattr(self, "shutdown_started", False) or getattr(self, "_closing", False):
+                return
+            session = self.gemini_live_session
+            worker = self.gemini_live_audio_worker
+
+            if (
+                getattr(self, "_gemini_live_output_suppressed", False)
+                or getattr(self, "gemini_live_command_handoff", False)
+                or getattr(self, "processing_voice", False)
+                or (session and response_id in getattr(session, "_invalidated_response_ids", set()))
+                or (worker and response_id in getattr(worker, "_invalidated_response_ids", set()))
+            ):
+                return
+
+            now = time.time()
+            chunk_len = len(audio_data) if audio_data else 0
+            q_depth = worker._output_queue.qsize() if worker else 0
+            print(f"[DIAG UI AUDIO CHUNK] t={now:.3f} bytes={chunk_len} qdepth={q_depth} resp_id={response_id}")
+
+            if worker is not None and self.gemini_live_active:
+                worker.enqueue_output(audio_data, response_id=response_id)
+        except Exception as error:
+            import traceback
+            print(f"[CRITICAL LIVE ERROR] In _on_gemini_live_audio: {error}")
+            print(f"[CRITICAL LIVE TRACEBACK]\n{traceback.format_exc()}")
 
     def _on_gemini_live_input_transcript(self, text):
-        now = time.time()
-        print(f"[DIAG UI INPUT_TRANSCRIPT] t={now:.3f} text='{text}'")
+        try:
+            if getattr(self, "shutdown_started", False) or getattr(self, "_closing", False):
+                return
+            now = time.time()
+            text_str = str(text or "").strip()
+            if not text_str:
+                return
 
-        # RACE-SAFE COMMAND SUPPRESSION: Check local intent synchronously on the callback
-        # thread BEFORE Gemini response audio reaches speaker queue.
-        text_str = str(text or "").strip()
-        if text_str and hasattr(self, "intent_detector") and self.intent_detector is not None:
-            try:
-                local_intent = self.intent_detector.detect_local_intent_only(text_str)
-                if local_intent not in (None, "ai_chat"):
-                    self._gemini_live_output_suppressed = True
-                    worker = self.gemini_live_audio_worker
-                    if worker is not None:
-                        worker.clear_output()
-                    print(f"[LIVE RACESAFE] Local command detected on transcript callback: '{text_str}' (intent={local_intent}) -> Gemini model output suppressed immediately.")
-            except Exception as error:
-                print(f"[LIVE RACESAFE] Intent check error: {error}")
+            print(f"[PERF] COMMAND_RECEIVED t={now:.3f} text='{text_str}'")
+            print(f"[DIAG UI INPUT_TRANSCRIPT] t={now:.3f} text='{text}'")
 
-        self.gemini_live_input_signal.emit(text_str)
+            worker = self.gemini_live_audio_worker
+            session = self.gemini_live_session
 
-    def _on_gemini_live_output_transcript(self, text):
-        now = time.time()
-        print(f"[DIAG UI OUTPUT_TRANSCRIPT] t={now:.3f} text='{text}'")
-        self.gemini_live_output_signal.emit(str(text or ""))
+            # BARGE-IN INTERRUPTION CHECK:
+            # If user speaks an interruption phrase while model is speaking or audio is playing:
+            is_interrupt = self._is_interruption_phrase(text_str)
+            is_speaking = False
+            if worker and worker.is_output_playing():
+                is_speaking = True
+            if session and getattr(session, "_is_model_speaking", False):
+                is_speaking = True
 
-    def _on_gemini_live_interrupted(self):
-        now = time.time()
-        worker = self.gemini_live_audio_worker
-        playing = worker.is_output_playing() if worker else False
-        print(f"[DIAG UI INTERRUPTED CALLBACK] t={now:.3f} source=GeminiServer speaker_playing={playing}")
-        self.gemini_live_interrupted_signal.emit()
+            if is_interrupt and is_speaking:
+                print(f"[LIVE] USER INTERRUPTION DETECTED VIA VOICE COMMAND: '{text_str}'")
+                if session is not None:
+                    session.interrupt_current_response()
+                elif worker is not None:
+                    worker.interrupt_and_flush()
+                self.gemini_live_interrupted_signal.emit()
+                return
+
+            # RACE-SAFE COMMAND SUPPRESSION: Check local intent & command markers synchronously
+            # on the callback thread BEFORE Gemini response audio reaches speaker queue.
+            is_potential_command = False
+
+            # Fast check 1: deterministic local intent
+            if hasattr(self, "intent_detector") and self.intent_detector is not None:
+                try:
+                    local_intent = self.intent_detector.detect_local_intent_only(text_str)
+                    if local_intent not in (None, "ai_chat"):
+                        is_potential_command = True
+                except Exception as error:
+                    print(f"[LIVE RACESAFE] Intent check error: {error}")
+
+            # Fast check 2: structural action evidence
+            if not is_potential_command:
+                try:
+                    if self._is_semantic_command_candidate(text_str):
+                        is_potential_command = True
+                except Exception:
+                    pass
+
+            if is_potential_command:
+                self._gemini_live_output_suppressed = True
+                if session is not None:
+                    try:
+                        session.suppress_active_and_next_response()
+                    except Exception as err:
+                        print(f"[LIVE] Error suppressing session response: {err}")
+                if worker is not None:
+                    try:
+                        worker.suppress_active_and_next_response()
+                    except Exception as err:
+                        print(f"[LIVE] Error suppressing worker response: {err}")
+                print(f"[LIVE RACESAFE] Command pattern detected on transcript callback: '{text_str}' -> Gemini model output suppressed immediately.")
+
+            self.gemini_live_input_signal.emit(text_str)
+
+        except Exception as error:
+            import traceback
+            print(f"[CRITICAL LIVE ERROR] In _on_gemini_live_input_transcript: {error}")
+            print(f"[CRITICAL LIVE TRACEBACK]\n{traceback.format_exc()}")
+
+    def _on_gemini_live_output_transcript(self, text, response_id=0):
+        try:
+            if getattr(self, "shutdown_started", False) or getattr(self, "_closing", False):
+                return
+            session = self.gemini_live_session
+            worker = self.gemini_live_audio_worker
+            if (
+                getattr(self, "_gemini_live_output_suppressed", False)
+                or getattr(self, "gemini_live_command_handoff", False)
+                or getattr(self, "processing_voice", False)
+                or (session and response_id in getattr(session, "_invalidated_response_ids", set()))
+                or (worker and response_id in getattr(worker, "_invalidated_response_ids", set()))
+            ):
+                print(f"[LIVE] DROPPED SUPPRESSED OUTPUT TRANSCRIPT: '{text}' resp_id={response_id}")
+                return
+
+            now = time.time()
+            print(f"[DIAG UI OUTPUT_TRANSCRIPT] t={now:.3f} text='{text}' resp_id={response_id}")
+            self.gemini_live_output_signal.emit(str(text or ""))
+        except Exception as error:
+            import traceback
+            print(f"[CRITICAL LIVE ERROR] In _on_gemini_live_output_transcript: {error}")
+            print(f"[CRITICAL LIVE TRACEBACK]\n{traceback.format_exc()}")
+
+    def _on_gemini_live_interrupted(self, response_id=0):
+        try:
+            if getattr(self, "shutdown_started", False) or getattr(self, "_closing", False):
+                return
+            now = time.time()
+            worker = self.gemini_live_audio_worker
+            playing = worker.is_output_playing() if worker else False
+            print(f"[DIAG UI INTERRUPTED CALLBACK] t={now:.3f} source=GeminiServer speaker_playing={playing} resp_id={response_id}")
+
+            # IMMEDIATE SYNCHRONOUS CANCELLATION ON CALLBACK THREAD
+            if worker is not None:
+                worker.interrupt_and_flush(response_id=response_id or 0)
+
+            self.gemini_live_interrupted_signal.emit()
+        except Exception as error:
+            import traceback
+            print(f"[CRITICAL LIVE ERROR] In _on_gemini_live_interrupted: {error}")
+            print(f"[CRITICAL LIVE TRACEBACK]\n{traceback.format_exc()}")
 
     def _on_gemini_live_turn_complete(self, user_text, assistant_text):
-        now = time.time()
-        print(f"[DIAG UI TURN_COMPLETE] t={now:.3f} user='{user_text}' assistant='{assistant_text}'")
-        self.gemini_live_turn_complete_signal.emit(
-            str(user_text or ""),
-            str(assistant_text or ""),
-        )
+        try:
+            if getattr(self, "shutdown_started", False) or getattr(self, "_closing", False):
+                return
+            now = time.time()
+            print(f"[DIAG UI TURN_COMPLETE] t={now:.3f} user='{user_text}' assistant='{assistant_text}'")
+            self.gemini_live_turn_complete_signal.emit(
+                str(user_text or ""),
+                str(assistant_text or ""),
+            )
+        except Exception as error:
+            import traceback
+            print(f"[CRITICAL LIVE ERROR] In _on_gemini_live_turn_complete: {error}")
+            print(f"[CRITICAL LIVE TRACEBACK]\n{traceback.format_exc()}")
 
     def _on_gemini_live_error(self, error):
-        self.gemini_live_error_signal.emit(str(error or "Gemini Live error."))
+        try:
+            if getattr(self, "shutdown_started", False) or getattr(self, "_closing", False):
+                return
+            self.gemini_live_error_signal.emit(str(error or "Gemini Live error."))
+        except Exception as err:
+            import traceback
+            print(f"[CRITICAL LIVE ERROR] In _on_gemini_live_error: {err}")
+            print(f"[CRITICAL LIVE TRACEBACK]\n{traceback.format_exc()}")
 
     def _on_gemini_live_closed(self):
-        self.gemini_live_closed_signal.emit()
+        try:
+            if getattr(self, "shutdown_started", False) or getattr(self, "_closing", False):
+                return
+            self.gemini_live_closed_signal.emit()
+        except Exception as err:
+            import traceback
+            print(f"[CRITICAL LIVE ERROR] In _on_gemini_live_closed: {err}")
+            print(f"[CRITICAL LIVE TRACEBACK]\n{traceback.format_exc()}")
+
+    def _on_gemini_live_go_away(self, time_left=None):
+        try:
+            if getattr(self, "shutdown_started", False) or getattr(self, "_closing", False):
+                print("[LIVE LIFECYCLE] GoAway recovery suppressed because shutdown_started=True")
+                return
+            self.gemini_live_go_away_signal.emit(str(time_left or ""))
+        except Exception as err:
+            import traceback
+            print(f"[CRITICAL LIVE ERROR] In _on_gemini_live_go_away: {err}")
+            print(f"[CRITICAL LIVE TRACEBACK]\n{traceback.format_exc()}")
 
     @Slot(str)
     def _handle_gemini_live_input_transcript(self, text):
-        text = str(text or "").strip()
-        if not text or self._closing or not self.gemini_live_active:
-            return
-
-        self.gemini_live_user_transcript = text
-
+        t_cmd_start = time.time()
         try:
-            self.mic_widget.update_user_message(text)
-        except Exception:
-            pass
+            text = str(text or "").strip()
+            if not text or getattr(self, "shutdown_started", False) or self._closing or not self.gemini_live_active:
+                return
 
-        try:
-            local_intent = self.intent_detector.detect_local_intent_only(text)
-        except Exception as error:
-            print(f"[LIVE] Local intent routing error: {error}")
-            local_intent = None
+            print(f"[PERF] TRANSCRIPT_READY t={t_cmd_start:.3f} text='{text}'")
 
-        # Native Gemini Live owns normal conversation. No second STT/LLM/TTS
-        # pipeline is started for these messages.
-        if local_intent in (None, "ai_chat"):
-            print(f"[LIVE] User Turn : {text}")
+            # If user spoke an interruption word, it was handled by barge-in logic.
+            # Do NOT invoke SemanticCommandPlanner!
+            if self._is_interruption_phrase(text):
+                print(f"[SEMANTIC] PLANNER SKIPPED: CONVERSATION (Interruption '{text}')")
+                return
+
+            # Gating: If a command is actively executing, ignore subsequent streaming transcript chunks
+            if getattr(self, "gemini_live_command_handoff", False) or getattr(self, "processing_voice", False):
+                print(f"[LIVE] Gated transcript chunk '{text}' during active command execution.")
+                return
+
+            # Deduplicate identical consecutive transcripts
+            if text == getattr(self, "gemini_live_last_command", ""):
+                return
+
+            self.gemini_live_user_transcript = text
+
             try:
-                self.status_label.setText("Status : DHEEPTHI Listening")
-                self._set_avatar_state("listening")
-                self.left_panel.set_listening("Listening")
+                self.mic_widget.update_user_message(text)
             except Exception:
                 pass
+
+            t_route_start = time.time()
+            print(f"[PERF] ROUTING_START t={t_route_start:.3f}")
+
+            # -----------------------------------------------------------------
+            # 1. FAST LOCAL DETERMINISTIC PATH:
+            # If the command is a deterministic single laptop command:
+            # ("Open Chrome", "Open Notepad", "Open Downloads", "Close Notepad",
+            #  "Take a screenshot", "Open VS Code", etc.)
+            # Check if IntentDetector resolves a deterministic action WITHOUT connectors/Tanglish chaining.
+            # -----------------------------------------------------------------
+            is_multi_or_tanglish = False
+            if hasattr(self, "multi_command_planner") and self.multi_command_planner is not None:
+                try:
+                    if self.multi_command_planner.is_multi_command(text):
+                        is_multi_or_tanglish = True
+                except Exception:
+                    pass
+
+            if not is_multi_or_tanglish:
+                chaining_pattern = (
+                    r"\b(?:panni|pannu|pannunga|seythu|seidu|podu|thiranthu|ezhuthu|eduthu|maatru|anuppu)\b|"
+                    r"\b(?:செய்து|பண்ணு|போடு|திறந்து)\b"
+                )
+                if re.search(chaining_pattern, text, re.IGNORECASE):
+                    is_multi_or_tanglish = True
+
+            local_intent = None
+            if hasattr(self, "intent_detector") and self.intent_detector is not None:
+                try:
+                    local_intent = self.intent_detector.detect_local_intent_only(text)
+                except Exception as error:
+                    print(f"[LIVE] Local intent check error: {error}")
+                    local_intent = None
+
+            # FAST LOCAL MATCH:
+            if local_intent not in (None, "ai_chat") and not is_multi_or_tanglish:
+                t_route_end = time.time()
+                print(f"[PERF] ROUTING_END ROUTE=LOCAL_DETERMINISTIC INTENT={local_intent} ({t_route_end - t_route_start:.3f}s)")
+                print(f"[ROUTING] ROUTE=LOCAL_DETERMINISTIC")
+
+                self.gemini_live_last_command = text
+                self.gemini_live_command_handoff = True
+                self._gemini_live_output_suppressed = True
+
+                print("\n========== LIVE -> FAST LOCAL COMMAND ROUTE ==========")
+                print(f"Recognized command : {text}")
+                print(f"Local intent       : {local_intent}")
+                print("=======================================================\n")
+
+                self.processing_voice = True
+
+                worker = self.gemini_live_audio_worker
+                if worker is not None:
+                    try:
+                        worker.clear_output()
+                        worker.set_input_enabled(False)
+                    except Exception as error:
+                        print(f"[LIVE -> COMMAND] Failed to gate Live audio input: {error}")
+
+                self.gemini_live_mic_enabled = False
+
+                t_dispatch_start = time.time()
+                print(f"[PERF] DISPATCH_START t={t_dispatch_start:.3f}")
+                self.process_command(text)
+                t_dispatch_end = time.time()
+                print(f"[PERF] DISPATCH_END t={t_dispatch_end:.3f} ({t_dispatch_end - t_dispatch_start:.3f}s)")
+                print(f"[PERF] EXECUTION_COMPLETE ROUTE=LOCAL_DETERMINISTIC TOTAL_COMMAND_TIME={t_dispatch_end - t_cmd_start:.3f}s\n")
+                return
+
+            # -----------------------------------------------------------------
+            # 2. PURE CONVERSATION CHECK:
+            # If local_intent is ai_chat or conversational guard passes -> Gemini Live conversation
+            # -----------------------------------------------------------------
+            if not self._is_semantic_command_candidate(text):
+                t_route_end = time.time()
+                self._gemini_live_output_suppressed = False
+                worker = self.gemini_live_audio_worker
+                if worker is not None:
+                    worker.reset_suppression()
+                session = self.gemini_live_session
+                if session is not None:
+                    session.reset_suppression()
+                print(f"[PERF] ROUTING_END ROUTE=CONVERSATION ({t_route_end - t_route_start:.3f}s)")
+                print(f"[ROUTING] ROUTE=CONVERSATION")
+                print(f"[ROUTING] SEMANTIC PLANNER SKIPPED")
+                print(f"[SEMANTIC] PLANNER SKIPPED: CONVERSATION")
+                print(f"[LIVE] User Turn : {text}")
+                try:
+                    self.status_label.setText("Status : DHEEPTHI Listening")
+                    self._set_avatar_state("listening")
+                    self.left_panel.set_listening("Listening")
+                except Exception:
+                    pass
+                return
+
+            # -----------------------------------------------------------------
+            # 3. SEMANTIC PLANNER ROUTE (Multi-step / Tanglish / Natural Commands):
+            # -----------------------------------------------------------------
+            t_route_end = time.time()
+            print(f"[PERF] ROUTING_END ROUTE=SEMANTIC_PLANNER ({t_route_end - t_route_start:.3f}s)")
+            print(f"[ROUTING] ROUTE=SEMANTIC_PLANNER")
+            print(f"[SEMANTIC] COMMAND CANDIDATE")
+            print(f"[SEMANTIC] PLANNER INVOKED")
+
+            semantic_plan = None
+            t_planner_start = time.time()
+            print(f"[PERF] PLANNER_START t={t_planner_start:.3f}")
+            try:
+                self.status_label.setText("Status : Planning...")
+                self._set_thinking_state("Planning", avatar_state="thinking_laptop")
+                QApplication.processEvents()
+            except Exception:
+                pass
+            if hasattr(self, "semantic_command_planner") and self.semantic_command_planner is not None:
+                try:
+                    semantic_plan = self.semantic_command_planner.plan(text)
+                except Exception as error:
+                    print(f"[LIVE] Semantic command planning error: {error}")
+                    semantic_plan = None
+            t_planner_end = time.time()
+            print(f"[PERF] PLANNER_END t={t_planner_end:.3f} ({t_planner_end - t_planner_start:.3f}s)")
+
+            if semantic_plan and semantic_plan.get("type") == "command" and semantic_plan.get("actions"):
+                self.gemini_live_last_command = text
+                self.gemini_live_command_handoff = True
+                self._gemini_live_output_suppressed = True
+
+                print("\n========== LIVE -> SEMANTIC COMMAND ROUTE ==========")
+                print(f"Recognized command : {text}")
+                print(f"Plan Actions       : {semantic_plan.get('actions')}")
+                print("=====================================================\n")
+
+                self.processing_voice = True
+
+                worker = self.gemini_live_audio_worker
+                if worker is not None:
+                    try:
+                        worker.clear_output()
+                        worker.set_input_enabled(False)
+                    except Exception as error:
+                        print(f"[LIVE -> COMMAND] Failed to gate Live audio input: {error}")
+
+                self.gemini_live_mic_enabled = False
+
+                t_dispatch_start = time.time()
+                print(f"[PERF] DISPATCH_START t={t_dispatch_start:.3f}")
+                self._execute_semantic_plan(semantic_plan, text, t_cmd_start=t_cmd_start)
+                return
+
+            # If semantic planner did not return actions, check conversation vs fallback
+            if local_intent in (None, "ai_chat"):
+                self._gemini_live_output_suppressed = False
+                worker = self.gemini_live_audio_worker
+                if worker is not None:
+                    worker.reset_suppression()
+                session = self.gemini_live_session
+                if session is not None:
+                    session.reset_suppression()
+                print(f"[LIVE] User Turn : {text}")
+                try:
+                    self.status_label.setText("Status : DHEEPTHI Listening")
+                    self._set_avatar_state("listening")
+                    self.left_panel.set_listening("Listening")
+                except Exception:
+                    pass
+                return
+
+            # Fallback local command
+            self.gemini_live_last_command = text
+            self.gemini_live_command_handoff = True
+            self._gemini_live_output_suppressed = True
+
+            print("\n========== LIVE -> LOCAL COMMAND ROUTE ==========")
+            print(f"Recognized command : {text}")
+            print(f"Local intent       : {local_intent}")
+            print("=================================================\n")
+
+            self.processing_voice = True
+
+            worker = self.gemini_live_audio_worker
+            if worker is not None:
+                try:
+                    worker.clear_output()
+                    worker.set_input_enabled(False)
+                except Exception as error:
+                    print(f"[LIVE -> COMMAND] Failed to gate Live audio input: {error}")
+
+            self.gemini_live_mic_enabled = False
+            t_dispatch_start = time.time()
+            print(f"[PERF] DISPATCH_START t={t_dispatch_start:.3f}")
+            self.process_command(text)
+            t_dispatch_end = time.time()
+            print(f"[PERF] DISPATCH_END t={t_dispatch_end:.3f} ({t_dispatch_end - t_dispatch_start:.3f}s)")
+            print(f"[PERF] EXECUTION_COMPLETE ROUTE=LOCAL_FALLBACK TOTAL_COMMAND_TIME={t_dispatch_end - t_cmd_start:.3f}s\n")
+
+
+        except Exception as error:
+            import traceback
+            print(f"[CRITICAL LIVE ERROR] In _handle_gemini_live_input_transcript: {error}")
+            print(f"[CRITICAL LIVE TRACEBACK]\n{traceback.format_exc()}")
+            try:
+                if not self._closing and self.gemini_live_active and not self.gemini_live_command_handoff:
+                    self.status_label.setText("Status : Listening")
+                    self._set_avatar_state("listening")
+            except Exception:
+                pass
+
+    def _build_dispatch_kwargs_for_semantic_action(
+        self,
+        intent: str,
+        entities: dict,
+        raw_text: str,
+        is_multi: bool,
+    ) -> dict:
+        """Translate semantic plan entities to CommandDispatcher kwargs."""
+        kwargs = {}
+        if intent in {"launch_application", "close_application"}:
+            app = (
+                entities.get("application")
+                or entities.get("app")
+                or entities.get("target")
+                or entities.get("name")
+                or entities.get("entity")
+            )
+            kwargs["entity"] = app
+            kwargs["browser"] = entities.get("browser")
+            kwargs["website"] = entities.get("website")
+            kwargs["profile"] = entities.get("profile")
+
+        elif intent == "play_youtube":
+            query = (
+                entities.get("search_query")
+                or entities.get("query")
+                or entities.get("song")
+                or entities.get("video")
+                or entities.get("music")
+                or entities.get("target")
+                or entities.get("entity")
+            )
+            kwargs["search_query"] = query
+            kwargs["entity"] = query
+            kwargs["browser"] = entities.get("browser") or "chrome"
+            kwargs["profile"] = entities.get("profile")
+
+        elif intent in {"youtube_search", "google_search"}:
+            query = (
+                entities.get("search_query")
+                or entities.get("query")
+                or entities.get("target")
+                or entities.get("entity")
+            )
+            kwargs["search_query"] = query
+            kwargs["entity"] = query
+            kwargs["browser"] = entities.get("browser") or "chrome"
+            kwargs["profile"] = entities.get("profile")
+
+        elif intent == "open_website":
+            site = (
+                entities.get("website")
+                or entities.get("url")
+                or entities.get("target")
+            )
+            kwargs["website"] = site
+            kwargs["entity"] = site
+            kwargs["browser"] = entities.get("browser")
+
+        elif intent in {"open_folder", "create_folder", "delete_folder"}:
+            folder = (
+                entities.get("folder")
+                or entities.get("target")
+                or entities.get("name")
+                or entities.get("entity")
+            )
+            kwargs["entity"] = folder
+
+        elif intent in {"copy_folder", "move_folder", "rename_folder"}:
+            if "destination" in entities or "to" in entities or "source" in entities:
+                kwargs["entity"] = entities
+            else:
+                kwargs["entity"] = (
+                    entities.get("folder")
+                    or entities.get("target")
+                    or entities.get("name")
+                )
+
+        elif intent in {"open_file", "create_file", "delete_file"}:
+            f = (
+                entities.get("file")
+                or entities.get("filename")
+                or entities.get("target")
+                or entities.get("name")
+                or entities.get("entity")
+            )
+            kwargs["entity"] = f
+
+        elif intent in {"copy_file", "move_file", "rename_file"}:
+            if "destination" in entities or "to" in entities or "source" in entities:
+                kwargs["entity"] = entities
+            else:
+                kwargs["entity"] = (
+                    entities.get("file")
+                    or entities.get("filename")
+                    or entities.get("target")
+                )
+
+        elif intent in {"code_agent", "write_code"}:
+            lang = entities.get("language") or ("python" if "python" in raw_text.lower() else "java")
+            task = (
+                entities.get("task")
+                or entities.get("query")
+                or entities.get("description")
+                or entities.get("code")
+                or ""
+            )
+            req = f"{lang} program for {task}" if task else raw_text
+            kwargs["entity"] = entities
+            kwargs["user_text"] = req
+
+        elif intent == "type_text":
+            txt = (
+                entities.get("text")
+                or entities.get("typed_text")
+                or entities.get("content")
+                or ""
+            )
+            kwargs["typed_text"] = txt
+
+        elif intent == "press_key":
+            kwargs["entity"] = (
+                entities.get("key")
+                or entities.get("target")
+                or ""
+            )
+
+        else:
+            kwargs["entity"] = (
+                entities.get("entity")
+                or entities.get("target")
+                or entities
+            )
+
+        return kwargs
+
+    def _execute_semantic_plan(self, plan: dict, raw_text: str, t_cmd_start: float = None):
+        """Execute a validated semantic action plan from SemanticCommandPlanner."""
+        actions = plan.get("actions", [])
+        if not actions:
+            print("[SEMANTIC] COMMAND FAILED")
+            print("[SEMANTIC] ERROR: No actions in plan.")
+            self._unlock_after_speech(restart_live=True)
             return
 
-        # Deterministic local command: temporarily hand microphone input
-        # to the existing command processor, but KEEP the Gemini Live
-        # session and audio bridge alive.  The command pipeline below is
-        # intentionally unchanged; only the Live input gate is closed while
-        # the laptop automation is executing.
-        if text == self.gemini_live_last_command:
-            return
-
-        self.gemini_live_last_command = text
-        self.gemini_live_command_handoff = True
-        self._gemini_live_output_suppressed = True
-
-        print("\n========== LIVE -> COMMAND ROUTE ==========")
-        print(f"Recognized command : {text}")
-        print(f"Local intent       : {local_intent}")
-        print("===========================================\n")
+        total_actions = len(actions)
+        print("\n[SEMANTIC] PLAN RECEIVED")
+        print(f"Command       : {raw_text}")
+        print(f"Total Actions : {total_actions}")
+        for idx, act in enumerate(actions, 1):
+            act_intent = act.get('intent', '')
+            act_entity = act.get('entities', {}).get('application') or act.get('entities', {}).get('target') or act.get('entities', {}).get('song') or act.get('entities', {}).get('query') or ''
+            print(f"  Step {idx}: intent={act.get('intent')} entities={act.get('entities')}")
+            print(f"[SEMANTIC PLAN] ACTION {idx}: {act_intent} {act_entity}".strip())
+        print()
 
         self.processing_voice = True
+        self.gemini_live_command_handoff = True
+        self._gemini_live_output_suppressed = True
+        self.lock_microphone()
 
-        # IMPORTANT: Do NOT call _stop_gemini_live_conversation() here.
-        # Gemini Live must remain connected so the next user utterance uses
-        # the same persistent bidirectional session.
-        worker = self.gemini_live_audio_worker
-        if worker is not None:
+        # Special case: single code_agent request
+        if total_actions == 1 and actions[0].get("intent") in {"code_agent", "write_code"}:
+            act = actions[0]
+            entities = act.get("entities", {})
+            lang = entities.get("language") or "python"
+            task = entities.get("task") or ""
+            code_req = f"{lang} program for {task}" if task else raw_text
+            print("\n[SEMANTIC] ACTION 1/1")
+            print("[SEMANTIC] DISPATCHING code_agent")
+            print(f"[SEMANTIC] ENTITIES: {entities}")
+            self.mic_widget.show_conversation(raw_text, "Generating code...")
+            print(f"[SEMANTIC] Starting CodeAgent route for: {code_req}")
+            t_exec_end = time.time()
+            print(f"[PERF] DISPATCH_END t={t_exec_end:.3f}")
+            total_time = (t_exec_end - t_cmd_start) if t_cmd_start else 0.0
+            print(f"[PERF] EXECUTION_COMPLETE ROUTE=SEMANTIC_PLANNER TOTAL_COMMAND_TIME={total_time:.3f}s\n")
+            self._start_code_agent_route(code_req)
+            return
+
+        self.mic_widget.show_conversation(
+            raw_text,
+            "Executing command..." if total_actions == 1 else "Executing multi-step command..."
+        )
+
+        all_success = True
+        last_result = None
+        failed_info = None
+
+        for idx, action in enumerate(actions, 1):
+            intent = action.get("intent")
+            entities = action.get("entities", {})
+
+            print(f"\n[SEMANTIC] ACTION {idx}/{total_actions}")
+            print(f"[SEMANTIC] DISPATCHING {intent}")
+            print(f"[SEMANTIC] ENTITIES: {entities}")
+
+            # Visual state updates
+            thinking_avatar = self._set_thinking_avatar_for_intent(intent)
             try:
-                worker.clear_output()
-                worker.set_input_enabled(False)
-            except Exception as error:
-                print(f"[LIVE -> COMMAND] Failed to gate Live audio input: {error}")
+                self.left_panel.set_listening("Idle")
+                self._set_thinking_state("Thinking", avatar_state=thinking_avatar)
+                self.left_panel.set_speaking("Silent")
+                self.status_label.setText(f"Status : Executing {intent}...")
+                QApplication.processEvents()
+            except Exception:
+                pass
 
-        self.gemini_live_mic_enabled = False
-        QTimer.singleShot(0, lambda command=text: self.process_command(command))
+            is_multi = (total_actions > 1)
+            dispatch_kwargs = self._build_dispatch_kwargs_for_semantic_action(
+                intent, entities, raw_text, is_multi
+            )
+
+            try:
+                result = self.dispatcher.dispatch(
+                    intent=intent,
+                    multi_command=is_multi,
+                    **dispatch_kwargs
+                )
+                print(f"[SEMANTIC] DISPATCH RESULT: {result}")
+            except Exception as exc:
+                print("[SEMANTIC] COMMAND FAILED")
+                print(f"[SEMANTIC] INTENT: {intent}")
+                print(f"[SEMANTIC] ENTITIES: {entities}")
+                print(f"[SEMANTIC] ERROR: {exc}")
+                all_success = False
+                failed_info = (intent, entities, str(exc))
+                break
+
+            last_result = result
+            success = bool(result.get("success", False)) if isinstance(result, dict) else bool(result)
+            if not success:
+                err_msg = (
+                    result.get("message")
+                    or result.get("status")
+                    or "Action failed"
+                    if isinstance(result, dict)
+                    else "Action failed"
+                )
+                print("[SEMANTIC] COMMAND FAILED")
+                print(f"[SEMANTIC] INTENT: {intent}")
+                print(f"[SEMANTIC] ENTITIES: {entities}")
+                print(f"[SEMANTIC] ERROR: {err_msg}")
+                all_success = False
+                failed_info = (intent, entities, err_msg)
+                break
+
+            print(f"[EXECUTION] ACTION {idx} SUCCESS")
+
+            # If launch_application was executed and next action is a browser action, pause briefly
+            if idx < total_actions and intent == "launch_application":
+                next_intent = actions[idx].get("intent")
+                if next_intent in {"play_youtube", "youtube_search", "open_website", "google_search"}:
+                    print("[SEMANTIC] Pausing 1.0s for browser session to be ready...")
+                    pause_end = time.time() + 1.0
+                    while time.time() < pause_end:
+                        try:
+                            QApplication.processEvents()
+                        except Exception:
+                            pass
+                        time.sleep(0.05)
+
+        t_exec_end = time.time()
+        print(f"[PERF] DISPATCH_END t={t_exec_end:.3f}")
+        total_time = (t_exec_end - t_cmd_start) if t_cmd_start else 0.0
+        print(f"[PERF] EXECUTION_COMPLETE ROUTE=SEMANTIC_PLANNER TOTAL_COMMAND_TIME={total_time:.3f}s\n")
+
+        if all_success:
+            print("[SEMANTIC] COMMAND COMPLETE\n")
+            if total_actions == 1:
+                status_text = (
+                    last_result.get("status_text", "Command Completed")
+                    if isinstance(last_result, dict)
+                    else "Command Completed"
+                )
+                message = (
+                    last_result.get("message", "Done")
+                    if isinstance(last_result, dict)
+                    else "Done"
+                )
+                self.status_label.setText(f"Status : {status_text}")
+                self.mic_widget.update_ai_message(message)
+                self._set_avatar_state("success")
+                self._unlock_after_speech(restart_live=True, terminal_avatar_state="success")
+            else:
+                reply = f"Completed all {total_actions} steps successfully."
+                self.mic_widget.update_ai_message(reply)
+                self.status_label.setText("Status : Multi-Command Completed")
+                self._set_avatar_state("success")
+                self.tts.speak(reply)
+                self._unlock_after_speech(restart_live=True, terminal_avatar_state="success")
+        else:
+            fail_intent, fail_ent, fail_err = failed_info or ("unknown", {}, "Action failed")
+            error_msg = f"I could not complete {fail_intent}."
+            self.mic_widget.update_ai_message(error_msg)
+            self.status_label.setText("Status : Command Failed")
+            self._set_avatar_state("error")
+            self.tts.speak(error_msg)
+            self._unlock_after_speech(restart_live=True, terminal_avatar_state="error")
 
     @Slot(str)
     def _handle_gemini_live_output_transcript(self, text):
-        if self._closing or not text:
-            return
-
-        if getattr(self, "_gemini_live_output_suppressed", False):
-            return
-
-        self.gemini_live_output_transcript += text
-
-        if self.physical_microphone_muted:
-            # Keep the hardware-mute state authoritative for the UI.
-            # Gemini Live may still finish an already-generated response,
-            # but DHEEPTHI must remain visually IDLE.
-            return
-
         try:
-            self.mic_widget.update_ai_message(
-                self.gemini_live_output_transcript.strip()
-            )
-            self.status_label.setText("Status : DHEEPTHI Speaking")
-            self._set_avatar_state("speaking")
-            self.left_panel.set_speaking("Speaking")
-            self._set_thinking_state("Inactive")
-        except Exception:
-            pass
+            if getattr(self, "shutdown_started", False) or self._closing or not text:
+                return
+
+            if (
+                getattr(self, "_gemini_live_output_suppressed", False)
+                or getattr(self, "gemini_live_command_handoff", False)
+                or getattr(self, "processing_voice", False)
+            ):
+                return
+
+            self.gemini_live_output_transcript += text
+
+            if self.physical_microphone_muted:
+                return
+
+            try:
+                self.mic_widget.update_ai_message(
+                    self.gemini_live_output_transcript.strip()
+                )
+                self.status_label.setText("Status : DHEEPTHI Speaking")
+                self._set_avatar_state("speaking")
+                self.left_panel.set_speaking("Speaking")
+                self._set_thinking_state("Inactive")
+            except Exception:
+                pass
+        except Exception as error:
+            import traceback
+            print(f"[CRITICAL LIVE ERROR] In _handle_gemini_live_output_transcript: {error}")
+            print(f"[CRITICAL LIVE TRACEBACK]\n{traceback.format_exc()}")
 
     @Slot()
     def _handle_gemini_live_interrupted(self):
-        worker = self.gemini_live_audio_worker
-        playing = worker.is_output_playing() if worker else False
-        print(f"[DIAG UI HANDLE INTERRUPTED] t={time.time():.3f} speaker_playing={playing} mic_enabled={self.gemini_live_mic_enabled}")
-        if worker is not None:
-            worker.clear_output()
-
-        if self._closing or not self.gemini_live_active:
-            return
-
-        if self.physical_microphone_muted:
-            self._set_gemini_live_input_from_physical_mic(False)
-            return
-
-        print("[LIVE] Model response interrupted by user speech.")
         try:
+            if getattr(self, "shutdown_started", False) or self._closing:
+                return
+
+            worker = self.gemini_live_audio_worker
+            playing = worker.is_output_playing() if worker else False
+            print(f"[DIAG UI HANDLE INTERRUPTED] t={time.time():.3f} speaker_playing={playing} mic_enabled={self.gemini_live_mic_enabled}")
+            if worker is not None:
+                worker.clear_output()
+
+            if not self.gemini_live_active:
+                return
+
+            # Do not disrupt an active desktop automation flow
+            if (
+                getattr(self, "gemini_live_command_handoff", False)
+                or getattr(self, "processing_voice", False)
+            ):
+                print("[LIVE] Interruption ignored during active command handoff.")
+                return
+
+            if self.physical_microphone_muted:
+                self._set_gemini_live_input_from_physical_mic(False)
+                return
+
+            print("[LIVE] Model response interrupted by user speech.")
+            self.gemini_live_output_transcript = ""
             self.status_label.setText("Status : Listening")
             self._set_avatar_state("listening")
             self.left_panel.set_listening("Listening")
             self.left_panel.set_speaking("Silent")
             self.microphone_button.setEnabled(True)
             self.mic_widget.setEnabled(True)
-        except Exception:
-            pass
-
-    @Slot(str, str)
-    def _handle_gemini_live_turn_complete(self, user_text, assistant_text):
-        if self._closing:
-            return
-
-        if user_text:
-            self.gemini_live_user_transcript = user_text
-
-        if assistant_text:
-            self.gemini_live_output_transcript = assistant_text
-            try:
-                self.mic_widget.update_ai_message(assistant_text)
-            except Exception:
-                pass
-
-        if (
-            self.gemini_live_active
-            and not self.physical_microphone_muted
-            and not self.gemini_live_command_handoff
-        ):
-            # Turn completion must return directly to an armed microphone.
-            # Do not stop/recreate the Live session here: Gemini VAD should
-            # receive the next utterance on the same bidirectional session.
-            worker = self.gemini_live_audio_worker
-            if worker is not None:
-                try:
-                    self._gemini_live_output_suppressed = False
-                    worker.set_input_enabled(True)
-                except Exception as error:
-                    print(f"[LIVE] Failed to re-arm input after turn completion: {error}")
-            self.gemini_live_mic_enabled = True
-            self._start_gemini_live_input_watchdog()
+            self.mic_widget.set_listening(True)
+            print("[LIVE] LISTENING READY")
+        except Exception as error:
+            import traceback
+            print(f"[CRITICAL LIVE ERROR] In _handle_gemini_live_interrupted: {error}")
+            print(f"[CRITICAL LIVE TRACEBACK]\n{traceback.format_exc()}")
             try:
                 self.status_label.setText("Status : Listening")
                 self._set_avatar_state("listening")
-                self.left_panel.set_listening("Listening")
-                self.left_panel.set_speaking("Silent")
-                self._set_thinking_state("Inactive")
-                self.microphone_button.setEnabled(True)
-                self.mic_widget.setEnabled(True)
             except Exception:
                 pass
 
-        self.gemini_live_output_transcript = ""
+    @Slot(str, str)
+    def _handle_gemini_live_turn_complete(self, user_text, assistant_text):
+        try:
+            if getattr(self, "shutdown_started", False) or self._closing:
+                return
+
+            # Do not disrupt an active desktop automation flow
+            if (
+                getattr(self, "gemini_live_command_handoff", False)
+                or getattr(self, "processing_voice", False)
+            ):
+                print("[LIVE] Turn complete ignored during active command handoff.")
+                return
+
+            if user_text:
+                self.gemini_live_user_transcript = user_text
+
+            if assistant_text and not getattr(self, "_gemini_live_output_suppressed", False):
+                self.gemini_live_output_transcript = assistant_text
+                try:
+                    self.mic_widget.update_ai_message(assistant_text)
+                except Exception:
+                    pass
+
+            if (
+                self.gemini_live_active
+                and not self.physical_microphone_muted
+                and not self.gemini_live_command_handoff
+            ):
+                # Turn completion must return directly to an armed microphone.
+                # Do not stop/recreate the Live session here: Gemini VAD should
+                # receive the next utterance on the same bidirectional session.
+                worker = self.gemini_live_audio_worker
+                if worker is not None:
+                    try:
+                        self._gemini_live_output_suppressed = False
+                        worker.reset_suppression()
+                        session = self.gemini_live_session
+                        if session is not None:
+                            session.reset_suppression()
+                        worker.set_input_enabled(True)
+                    except Exception as error:
+                        print(f"[LIVE] Failed to re-arm input after turn completion: {error}")
+                self.gemini_live_mic_enabled = True
+                self._start_gemini_live_input_watchdog()
+                try:
+                    self.status_label.setText("Status : Listening")
+                    self._set_avatar_state("listening")
+                    self.left_panel.set_listening("Listening")
+                    self.left_panel.set_speaking("Silent")
+                    self.microphone_button.setEnabled(True)
+                    self.mic_widget.setEnabled(True)
+                    self.mic_widget.set_listening(True)
+                    print("[LIVE] LISTENING READY")
+                except Exception:
+                    pass
+
+            self.gemini_live_output_transcript = ""
+
+        except Exception as error:
+            import traceback
+            print(f"[CRITICAL LIVE ERROR] In _handle_gemini_live_turn_complete: {error}")
+            print(f"[CRITICAL LIVE TRACEBACK]\n{traceback.format_exc()}")
+            try:
+                self.status_label.setText("Status : Listening")
+                self._set_avatar_state("listening")
+            except Exception:
+                pass
 
     @Slot(str)
     def _handle_gemini_live_error(self, message):
-        if self._closing:
-            return
-
-        print(f"[LIVE] Gemini Live error: {message}")
-        handoff = self.gemini_live_command_handoff
-        self.gemini_live_active = False
-        self._stop_gemini_live_conversation(clear_audio=True, restart_live=False)
-
-        if handoff:
-            return
-
         try:
-            self.mic_widget.update_ai_message(
-                "Sorry, Gemini Live is unavailable right now."
-            )
-            self._set_avatar_state("error")
-            self.status_label.setText("Status : Gemini Live Error")
-        except Exception:
-            pass
+            if getattr(self, "shutdown_started", False) or self._closing:
+                print("[LIVE LIFECYCLE] Reconnect suppressed because shutdown_started=True")
+                return
+
+            print(f"[LIVE] Gemini Live error: {message}")
+            handoff = self.gemini_live_command_handoff
+            self.gemini_live_active = False
+            self._stop_gemini_live_conversation(clear_audio=True, restart_live=False)
+
+            if handoff:
+                return
+
+            try:
+                self.mic_widget.update_ai_message(
+                    "Sorry, Gemini Live is unavailable right now."
+                )
+                self._set_avatar_state("error")
+                self.status_label.setText("Status : Gemini Live Error")
+            except Exception:
+                pass
+
+            if getattr(self, "shutdown_started", False) or self._closing:
+                print("[LIVE LIFECYCLE] Reconnect suppressed because shutdown_started=True")
+                return
+
+            if not self.physical_microphone_muted:
+                self._gemini_live_pending_start = True
+                print("[LIVE DEBUG] Recovery timer scheduled (1200ms)...")
+                QTimer.singleShot(1200, self._start_gemini_live_conversation)
+        except Exception as error:
+            import traceback
+            print(f"[CRITICAL LIVE ERROR] In _handle_gemini_live_error: {error}")
+            print(f"[CRITICAL LIVE TRACEBACK]\n{traceback.format_exc()}")
+
+    @Slot()
+    def _handle_gemini_live_closed(self):
+        try:
+            if getattr(self, "shutdown_started", False) or self._closing:
+                print("[LIVE LIFECYCLE] Reconnect suppressed because shutdown_started=True")
+                return
+            if not self.gemini_live_command_handoff:
+                print("[LIVE] Gemini Live session closed.")
+        except Exception as error:
+            import traceback
+            print(f"[CRITICAL LIVE ERROR] In _handle_gemini_live_closed: {error}")
+            print(f"[CRITICAL LIVE TRACEBACK]\n{traceback.format_exc()}")
 
         self.processing_voice = False
         self.manual_listening_requested = False
         self.gemini_live_mic_enabled = not self.physical_microphone_muted
         self.unlock_microphone()
+
+        if getattr(self, "shutdown_started", False) or self._closing:
+            print("[LIVE LIFECYCLE] Reconnect suppressed because shutdown_started=True")
+            return
 
         if not self._closing:
             self._gemini_live_output_suppressed = False
@@ -10404,10 +11305,24 @@ class MainWindow(QMainWindow):
             print("[LIVE DEBUG] Recovery timer scheduled (1200ms)...")
             QTimer.singleShot(1200, self._start_gemini_live_conversation)
 
-    @Slot()
-    def _handle_gemini_live_closed(self):
-        if not self._closing and not self.gemini_live_command_handoff:
-            print("[LIVE] Gemini Live session closed.")
+    @Slot(str)
+    def _handle_gemini_live_go_away(self, time_left=""):
+        if getattr(self, "shutdown_started", False) or self._closing:
+            print("[LIVE LIFECYCLE] GoAway recovery suppressed because shutdown_started=True")
+            return
+
+        print(f"[LIVE LIFECYCLE] GoAway detected (time_left={time_left})")
+        print("[LIVE LIFECYCLE] Closing old Live session")
+        self._stop_gemini_live_conversation(clear_audio=True, restart_live=False)
+        print("[LIVE LIFECYCLE] Old worker stopped")
+
+        if getattr(self, "shutdown_started", False) or self._closing:
+            print("[LIVE LIFECYCLE] GoAway recovery suppressed because shutdown_started=True")
+            return
+
+        print("[LIVE LIFECYCLE] Starting replacement Live session")
+        self._gemini_live_pending_start = True
+        self._start_gemini_live_conversation()
 
     def _stop_gemini_live_conversation(self, clear_audio=True, restart_live=False):
         """Stop the current Live session; restart_live is kept for compatibility and ignored."""
@@ -10470,7 +11385,7 @@ class MainWindow(QMainWindow):
         flow completes.  A healthy Gemini Live session is NEVER recreated
         here; only its microphone input gate is re-enabled.
         """
-        if self._closing or getattr(self, "_startup_greeting_active", False):
+        if getattr(self, "shutdown_started", False) or self._closing or getattr(self, "_startup_greeting_active", False):
             return
 
         self.processing_voice = False
@@ -10496,6 +11411,10 @@ class MainWindow(QMainWindow):
         ):
             try:
                 worker.clear_output()
+                worker.reset_suppression()
+                session = self.gemini_live_session
+                if session is not None:
+                    session.reset_suppression()
                 worker.set_input_enabled(True)
                 self._gemini_live_output_suppressed = False
                 self.gemini_live_command_handoff = False
@@ -14244,6 +15163,116 @@ class MainWindow(QMainWindow):
 
             self._finish_goodbye_shutdown()
 
+    def _shutdown_gemini_live_synchronously(self):
+        """
+        Synchronously and sequentially shut down Gemini Live before goodbye Edge TTS starts.
+        Zero Gemini Live audio, transcripts, or callbacks may occur after this begins.
+        """
+        self.shutdown_started = True
+        self._closing = True
+        self.gemini_live_active = False
+        self._gemini_live_pending_start = False
+        self.gemini_live_command_handoff = True
+        self._gemini_live_output_suppressed = True
+
+        # 1. Input disabled
+        worker = getattr(self, "gemini_live_audio_worker", None)
+        session = getattr(self, "gemini_live_session", None)
+        if worker is not None:
+            try:
+                worker.set_input_enabled(False)
+            except Exception:
+                pass
+        self._stop_gemini_live_input_watchdog()
+        print("[LIVE SHUTDOWN] Input disabled")
+
+        # 2. New transcripts blocked
+        if session is not None:
+            try:
+                session.on_input_transcript = None
+                session.on_output_transcript = None
+                session.on_turn_complete = None
+            except Exception:
+                pass
+        print("[LIVE SHUTDOWN] New transcripts blocked")
+
+        # 3. Active response invalidated
+        if session is not None:
+            try:
+                session.interrupt_current_response()
+            except Exception:
+                pass
+        print("[LIVE SHUTDOWN] Active response invalidated")
+
+        # 4. Playback stopped
+        if worker is not None:
+            try:
+                worker.stop_playback()
+            except Exception:
+                pass
+        print("[LIVE SHUTDOWN] Playback stopped")
+
+        # 5. Playback queue flushed
+        if worker is not None:
+            try:
+                worker.clear_output()
+            except Exception:
+                pass
+        print("[LIVE SHUTDOWN] Playback queue flushed")
+
+        # 6. Receive loop stopping
+        print("[LIVE SHUTDOWN] Receive loop stopping")
+
+        # 7. Live session closing
+        print("[LIVE SHUTDOWN] Live session closing")
+        if session is not None:
+            try:
+                session.on_connected = None
+                session.on_audio = None
+                session.on_interrupted = None
+                session.on_go_away = None
+                session.on_error = None
+                session.on_closed = None
+                session.stop(timeout=2.0)
+            except Exception as error:
+                print(f"[LIVE SHUTDOWN] Session stop error: {error}")
+            self.gemini_live_session = None
+
+        try:
+            if getattr(self, "gemini", None) is not None:
+                self.gemini.close_live_session()
+        except Exception as error:
+            print(f"[LIVE SHUTDOWN] Gemini client close error: {error}")
+
+        # 8. Worker stopping
+        print("[LIVE SHUTDOWN] Worker stopping")
+        if worker is not None:
+            try:
+                try:
+                    worker.connected.disconnect()
+                except Exception:
+                    pass
+                try:
+                    worker.failed.disconnect()
+                except Exception:
+                    pass
+                try:
+                    worker.finished_audio.disconnect()
+                except Exception:
+                    pass
+                worker.stop()
+                if worker.isRunning() and worker is not QThread.currentThread():
+                    worker.wait(2000)
+            except Exception as error:
+                print(f"[LIVE SHUTDOWN] Audio worker stop error: {error}")
+            self.gemini_live_audio_worker = None
+
+        # 9. Worker stopped
+        print("[LIVE SHUTDOWN] Worker stopped")
+
+        # 10. Live session fully stopped
+        print("[LIVE SHUTDOWN] Live session fully stopped")
+
     def _begin_goodbye_shutdown(self, event=None):
         """
         Start the goodbye sequence without destroying the window.
@@ -14265,6 +15294,8 @@ class MainWindow(QMainWindow):
         self._shutdown_goodbye_started = True
         self._closing = True
         self._goodbye_tts_finished = False
+
+        print("[DHEEPTHI SHUTDOWN] Starting goodbye TTS")
 
         # ----------------------------------------------
         # Lock microphone for the entire goodbye lifecycle.
@@ -14470,6 +15501,19 @@ class MainWindow(QMainWindow):
 
         if not self._shutdown_finalizing:
 
+            # Idempotency check: if shutdown is already started, ignore subsequent close attempts
+            if getattr(self, "shutdown_started", False):
+                if event is not None:
+                    event.ignore()
+                return
+
+            self.shutdown_started = True
+            self._closing = True
+            print("[DHEEPTHI SHUTDOWN] shutdown_started=True")
+
+            # Synchronously and sequentially tear down Gemini Live BEFORE goodbye TTS
+            self._shutdown_gemini_live_synchronously()
+
             self._begin_goodbye_shutdown(
                 event
             )
@@ -14477,7 +15521,8 @@ class MainWindow(QMainWindow):
             # IMPORTANT:
             # Do not let Qt destroy the window while
             # goodbye avatar/TTS is still running.
-            event.ignore()
+            if event is not None:
+                event.ignore()
 
             return
 

@@ -59,10 +59,46 @@ async def run_automated_tests():
     detector = IntentDetector()
     
     test_cases = [
-        ("Hello, how are you?", "ai_chat"),
-        ("Open Chrome", "launch_application"),
-        ("Open Downloads", "open_folder"),
+        # Normal chat
         ("Tell me about Chrome", "ai_chat"),
+        ("Why should I use Chrome?", "ai_chat"),
+        ("How do I open Chrome?", "ai_chat"),
+        ("Tell me about Karuppu song", "ai_chat"),
+        ("Tell me how to play a song", "ai_chat"),
+        ("Why should I play a song?", "ai_chat"),
+        ("Can you explain YouTube?", "ai_chat"),
+        ("Tell me about the Music folder", "ai_chat"),
+        ("Can you explain how YouTube works?", "ai_chat"),
+
+        # Application commands
+        ("Open Chrome", "launch_application"),
+        ("Can you open Chrome for me?", "launch_application"),
+        ("Please open Chrome", "launch_application"),
+
+        # Folder commands
+        ("Open Downloads", "open_folder"),
+        ("Please open my Downloads folder", "open_folder"),
+        ("Open Music folder", "open_folder"),
+
+        # YouTube play commands
+        ("Play Karuppu song", "play_youtube"),
+        ("Play Tamil songs", "play_youtube"),
+        ("Play Anirudh songs", "play_youtube"),
+        ("Can you play Karuppu song?", "play_youtube"),
+        ("Play Karuppu song on YouTube", "play_youtube"),
+        ("Listen to Karuppu song", "play_youtube"),
+        ("Play some music", "play_youtube"),
+
+        # YouTube search
+        ("Search YouTube for Tamil comedy", "youtube_search"),
+
+        # File commands
+        ("Copy report.pdf to Downloads", "copy_file"),
+        ("Move photos to Desktop", "move_file"),
+
+        # Screen commands
+        ("Take a screenshot", "take_screenshot"),
+        ("Start screen recording", "start_screen_recording"),
     ]
 
     routing_passed = True
@@ -71,9 +107,9 @@ async def run_automated_tests():
         status = "PASS" if actual_intent == expected_intent else "FAIL"
         if status == "FAIL":
             routing_passed = False
-        print(f"Phrase: '{phrase}' | Expected: {expected_intent} | Actual: {actual_intent} | [{status}]")
+        print(f"[{status:4s}] Phrase: {phrase!r:36s} | Expected: {expected_intent:22s} | Actual: {str(actual_intent):22s}")
 
-    print(f"Intent Routing Test Result: {'PASS' if routing_passed else 'FAIL'}")
+    print(f"\nIntent Routing Test Result: {'PASS' if routing_passed else 'FAIL'}")
 
     # ----------------------------------------------------
     # TEST SUITE 2: Persistent Gemini Live Multi-Turn Test
@@ -142,7 +178,7 @@ async def run_automated_tests():
     session = GeminiLiveSession(
         api_key=api_key,
         model=model,
-        system_instruction="You are DHEEPTHI. Reply concisely.",
+        system_instruction="You are a helpful assistant. Reply concisely in one sentence.",
         on_connected=on_connected,
         on_audio=on_audio,
         on_input_transcript=on_input_transcript,
@@ -184,7 +220,7 @@ async def run_automated_tests():
     mic_task = asyncio.create_task(virtual_mic_loop())
 
     # Generate test audio for Turn 1
-    pcm_turn_1 = await generate_speech_pcm("Hello DHEEPTHI, how are you doing today?")
+    pcm_turn_1 = await generate_speech_pcm("Hello, can you hear me clearly?")
     print(f"\n[TURN 1] Streaming {len(pcm_turn_1)} bytes of PCM speech...")
 
     chunk_size = 1024
@@ -206,7 +242,7 @@ async def run_automated_tests():
     session_id_turn2 = session.session_id
     print(f"[TURN 2] Testing second turn on SAME session_id: {session_id_turn2}")
 
-    pcm_turn_2 = await generate_speech_pcm("Tell me a short interesting fact about outer space.")
+    pcm_turn_2 = await generate_speech_pcm("What is the capital of France?")
     print(f"[TURN 2] Streaming {len(pcm_turn_2)} bytes of PCM speech...")
 
     for offset in range(0, len(pcm_turn_2), chunk_size):

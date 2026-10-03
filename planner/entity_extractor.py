@@ -397,6 +397,8 @@ class EntityExtractor:
             ("printing", "print"),
             ("searching", "search"),
             ("playing", "play"),
+            ("listening", "listen"),
+            ("watching", "watch"),
             ("bookmarking", "bookmark"),
             ("refreshing", "refresh"),
             ("reloading", "reload"),
@@ -1340,12 +1342,14 @@ class EntityExtractor:
             r"^search\s+on\s+youtube\s+(?:for\s+)?(.+)$",
             r"^find\s+(?:on\s+)?youtube\s+(?:for\s+)?(.+)$",
             r"^look\s+up\s+(?:on\s+)?youtube\s+(?:for\s+)?(.+)$",
-            r"^play\s+(.+?)\s+on\s+youtube$",
-            r"^play\s+(?:a\s+)?song\s+(.+)$",
-            r"^play\s+(?:some\s+)?music\s+(.+)$",
-            r"^play\s+(?:a\s+)?video\s+(.+)$",
+            r"^(?:play|watch|listen\s+to)\s+(.+?)\s+on\s+youtube$",
+            r"^(?:play|listen\s+to)\s+(?:a\s+)?song\s+(?:called\s+|named\s+)?(.+)$",
+            r"^(?:play|listen\s+to)\s+(?:some\s+)?music\s+(?:by\s+|from\s+)?(.+)$",
+            r"^(?:play|watch)\s+(?:a\s+)?video\s+(?:of\s+|about\s+)?(.+)$",
+            r"^(?:play|watch)\s+(?:a\s+)?movie\s+(?:called\s+|named\s+)?(.+)$",
             r"^youtube\s+(.+)$",
-            r"^play\s+(.+)$",
+            r"^(?:play|listen\s+to|watch)\s+(.+)$",
+            r"^(.+?)\s+(?:play|listen\s+to|watch)$",
         )
 
         for pattern in patterns:
