@@ -6214,6 +6214,10 @@ class MainWindow(QMainWindow):
         # Command Normalization
         # ------------------------------------------
 
+        action_cmd = self._extract_action_command(text)
+        if action_cmd:
+            text = action_cmd
+
         original_text = text
 
         if self.command_normalizer:
@@ -6380,7 +6384,16 @@ class MainWindow(QMainWindow):
 
                 is_multi_command = False
 
+        if not is_multi_command and hasattr(self, "_is_semantic_command_candidate"):
+            try:
+                chaining_markers = r"\b(?:panni|pannitu|pannittu|seythu|seidu|seithu|thiranthu|eduthu|and\s+then|then|after\s+that|apram|appuram|aduthu)\b"
+                if re.search(chaining_markers, text, re.I) and self._is_semantic_command_candidate(text):
+                    is_multi_command = True
+            except Exception:
+                pass
+
         if is_multi_command and not code_agent_requested:
+
 
             print(
                 "\n========== MULTI COMMAND =========="
@@ -6439,9 +6452,12 @@ class MainWindow(QMainWindow):
                 except Exception:
                     pass
 
-                # ----------------------------------
-                # Create Action Plan
-                # ----------------------------------
+                # Prefer SemanticCommandPlanner for multi-step & natural language commands
+                if hasattr(self, "semantic_command_planner") and self.semantic_command_planner is not None:
+                    semantic_plan = self.semantic_command_planner.plan(text)
+                    if semantic_plan and semantic_plan.get("type") == "command" and semantic_plan.get("actions"):
+                        self._execute_semantic_plan(semantic_plan, text)
+                        return
 
                 plan = (
                     self.multi_command_planner
@@ -10421,28 +10437,26 @@ class MainWindow(QMainWindow):
                 self.gemini_live_interrupted_signal.emit()
                 return
 
-            # RACE-SAFE COMMAND SUPPRESSION: Check local intent & command markers synchronously
-            # on the callback thread BEFORE Gemini response audio reaches speaker queue.
-            is_potential_command = False
-
-            # Fast check 1: deterministic local intent
+            # FAST LOCAL DETERMINISTIC COMMAND SUPPRESSION:
+            # Only exact single English commands (e.g., "Open Chrome", "Close Notepad")
+            # execute locally and should be pre-suppressed. Tanglish, mixed language,
+            # and natural requests MUST stream to Gemini Live so it can generate
+            # semantic <ACTION> tags or normal conversation without audio interruption.
+            is_fast_local_command = False
             if hasattr(self, "intent_detector") and self.intent_detector is not None:
                 try:
                     local_intent = self.intent_detector.detect_local_intent_only(text_str)
                     if local_intent not in (None, "ai_chat"):
-                        is_potential_command = True
+                        is_multi = False
+                        has_tanglish = bool(re.search(r"\b(?:panni|pannu|pannidu|kooda|serthu|apparam|apram|nu|la\b|ah\b|ku\b)\b", text_str, re.I))
+                        if hasattr(self, "semantic_command_planner") and self.semantic_command_planner is not None:
+                            is_multi = self.semantic_command_planner._is_multi_command(text_str)
+                        if not is_multi and not has_tanglish:
+                            is_fast_local_command = True
                 except Exception as error:
                     print(f"[LIVE RACESAFE] Intent check error: {error}")
 
-            # Fast check 2: structural action evidence
-            if not is_potential_command:
-                try:
-                    if self._is_semantic_command_candidate(text_str):
-                        is_potential_command = True
-                except Exception:
-                    pass
-
-            if is_potential_command:
+            if is_fast_local_command:
                 self._gemini_live_output_suppressed = True
                 if session is not None:
                     try:
@@ -10454,7 +10468,7 @@ class MainWindow(QMainWindow):
                         worker.suppress_active_and_next_response()
                     except Exception as err:
                         print(f"[LIVE] Error suppressing worker response: {err}")
-                print(f"[LIVE RACESAFE] Command pattern detected on transcript callback: '{text_str}' -> Gemini model output suppressed immediately.")
+                print(f"[LIVE RACESAFE] Deterministic local command detected: '{text_str}' -> Gemini model output suppressed.")
 
             self.gemini_live_input_signal.emit(text_str)
 
@@ -10604,8 +10618,8 @@ class MainWindow(QMainWindow):
 
             if not is_multi_or_tanglish:
                 chaining_pattern = (
-                    r"\b(?:panni|pannu|pannunga|seythu|seidu|podu|thiranthu|ezhuthu|eduthu|maatru|anuppu)\b|"
-                    r"\b(?:செய்து|பண்ணு|போடு|திறந்து)\b"
+                    r"\b(?:panni|pannitu|pannittu|seythu|seidu|seithu|thiranthu|ezhuthu|eduthu|maatru|anuppu|apram|appuram|aduthu)\b|"
+                    r"\b(?:செய்து|பண்ணி|திறந்து|எடுத்து)\b"
                 )
                 if re.search(chaining_pattern, text, re.IGNORECASE):
                     is_multi_or_tanglish = True
@@ -10621,8 +10635,19 @@ class MainWindow(QMainWindow):
             # FAST LOCAL MATCH:
             if local_intent not in (None, "ai_chat") and not is_multi_or_tanglish:
                 t_route_end = time.time()
+                detected_lang = "English"
+                if hasattr(self, "semantic_command_planner") and self.semantic_command_planner is not None:
+                    detected_lang = self.semantic_command_planner.detect_language(text)
+                elif hasattr(SemanticCommandPlanner, "detect_language"):
+                    detected_lang = SemanticCommandPlanner.detect_language(text)
+
                 print(f"[PERF] ROUTING_END ROUTE=LOCAL_DETERMINISTIC INTENT={local_intent} ({t_route_end - t_route_start:.3f}s)")
                 print(f"[ROUTING] ROUTE=LOCAL_DETERMINISTIC")
+                print(f"[SEMANTIC] Input: {text}")
+                print(f"[SEMANTIC] Language: {detected_lang}")
+                print(f"[SEMANTIC] Intent: {local_intent}")
+                print(f"[SEMANTIC] Commands: 1. {local_intent}")
+                print(f"[SEMANTIC] Dispatch: {local_intent} [FAST LOCAL PATH]")
 
                 self.gemini_live_last_command = text
                 self.gemini_live_command_handoff = True
@@ -10632,6 +10657,7 @@ class MainWindow(QMainWindow):
                 print(f"Recognized command : {text}")
                 print(f"Local intent       : {local_intent}")
                 print("=======================================================\n")
+
 
                 self.processing_voice = True
 
@@ -10654,130 +10680,31 @@ class MainWindow(QMainWindow):
                 return
 
             # -----------------------------------------------------------------
-            # 2. PURE CONVERSATION CHECK:
-            # If local_intent is ai_chat or conversational guard passes -> Gemini Live conversation
-            # -----------------------------------------------------------------
-            if not self._is_semantic_command_candidate(text):
-                t_route_end = time.time()
-                self._gemini_live_output_suppressed = False
-                worker = self.gemini_live_audio_worker
-                if worker is not None:
-                    worker.reset_suppression()
-                session = self.gemini_live_session
-                if session is not None:
-                    session.reset_suppression()
-                print(f"[PERF] ROUTING_END ROUTE=CONVERSATION ({t_route_end - t_route_start:.3f}s)")
-                print(f"[ROUTING] ROUTE=CONVERSATION")
-                print(f"[ROUTING] SEMANTIC PLANNER SKIPPED")
-                print(f"[SEMANTIC] PLANNER SKIPPED: CONVERSATION")
-                print(f"[LIVE] User Turn : {text}")
-                try:
-                    self.status_label.setText("Status : DHEEPTHI Listening")
-                    self._set_avatar_state("listening")
-                    self.left_panel.set_listening("Listening")
-                except Exception:
-                    pass
-                return
-
-            # -----------------------------------------------------------------
-            # 3. SEMANTIC PLANNER ROUTE (Multi-step / Tanglish / Natural Commands):
+            # 2. GEMINI LIVE SEMANTIC UNDERSTANDING ROUTE:
+            # Let Gemini Live understand the natural / mixed / Tanglish speech.
+            # Gemini Live will emit <ACTION>...</ACTION> for automation requests,
+            # or a normal conversational response for conversation.
             # -----------------------------------------------------------------
             t_route_end = time.time()
-            print(f"[PERF] ROUTING_END ROUTE=SEMANTIC_PLANNER ({t_route_end - t_route_start:.3f}s)")
-            print(f"[ROUTING] ROUTE=SEMANTIC_PLANNER")
-            print(f"[SEMANTIC] COMMAND CANDIDATE")
-            print(f"[SEMANTIC] PLANNER INVOKED")
-
-            semantic_plan = None
-            t_planner_start = time.time()
-            print(f"[PERF] PLANNER_START t={t_planner_start:.3f}")
-            try:
-                self.status_label.setText("Status : Planning...")
-                self._set_thinking_state("Planning", avatar_state="thinking_laptop")
-                QApplication.processEvents()
-            except Exception:
-                pass
-            if hasattr(self, "semantic_command_planner") and self.semantic_command_planner is not None:
-                try:
-                    semantic_plan = self.semantic_command_planner.plan(text)
-                except Exception as error:
-                    print(f"[LIVE] Semantic command planning error: {error}")
-                    semantic_plan = None
-            t_planner_end = time.time()
-            print(f"[PERF] PLANNER_END t={t_planner_end:.3f} ({t_planner_end - t_planner_start:.3f}s)")
-
-            if semantic_plan and semantic_plan.get("type") == "command" and semantic_plan.get("actions"):
-                self.gemini_live_last_command = text
-                self.gemini_live_command_handoff = True
-                self._gemini_live_output_suppressed = True
-
-                print("\n========== LIVE -> SEMANTIC COMMAND ROUTE ==========")
-                print(f"Recognized command : {text}")
-                print(f"Plan Actions       : {semantic_plan.get('actions')}")
-                print("=====================================================\n")
-
-                self.processing_voice = True
-
-                worker = self.gemini_live_audio_worker
-                if worker is not None:
-                    try:
-                        worker.clear_output()
-                        worker.set_input_enabled(False)
-                    except Exception as error:
-                        print(f"[LIVE -> COMMAND] Failed to gate Live audio input: {error}")
-
-                self.gemini_live_mic_enabled = False
-
-                t_dispatch_start = time.time()
-                print(f"[PERF] DISPATCH_START t={t_dispatch_start:.3f}")
-                self._execute_semantic_plan(semantic_plan, text, t_cmd_start=t_cmd_start)
-                return
-
-            # If semantic planner did not return actions, check conversation vs fallback
-            if local_intent in (None, "ai_chat"):
-                self._gemini_live_output_suppressed = False
-                worker = self.gemini_live_audio_worker
-                if worker is not None:
-                    worker.reset_suppression()
-                session = self.gemini_live_session
-                if session is not None:
-                    session.reset_suppression()
-                print(f"[LIVE] User Turn : {text}")
-                try:
-                    self.status_label.setText("Status : DHEEPTHI Listening")
-                    self._set_avatar_state("listening")
-                    self.left_panel.set_listening("Listening")
-                except Exception:
-                    pass
-                return
-
-            # Fallback local command
-            self.gemini_live_last_command = text
-            self.gemini_live_command_handoff = True
-            self._gemini_live_output_suppressed = True
-
-            print("\n========== LIVE -> LOCAL COMMAND ROUTE ==========")
-            print(f"Recognized command : {text}")
-            print(f"Local intent       : {local_intent}")
-            print("=================================================\n")
-
-            self.processing_voice = True
-
+            self._gemini_live_output_suppressed = False
             worker = self.gemini_live_audio_worker
             if worker is not None:
-                try:
-                    worker.clear_output()
-                    worker.set_input_enabled(False)
-                except Exception as error:
-                    print(f"[LIVE -> COMMAND] Failed to gate Live audio input: {error}")
+                worker.reset_suppression()
+            session = self.gemini_live_session
+            if session is not None:
+                session.reset_suppression()
 
-            self.gemini_live_mic_enabled = False
-            t_dispatch_start = time.time()
-            print(f"[PERF] DISPATCH_START t={t_dispatch_start:.3f}")
-            self.process_command(text)
-            t_dispatch_end = time.time()
-            print(f"[PERF] DISPATCH_END t={t_dispatch_end:.3f} ({t_dispatch_end - t_dispatch_start:.3f}s)")
-            print(f"[PERF] EXECUTION_COMPLETE ROUTE=LOCAL_FALLBACK TOTAL_COMMAND_TIME={t_dispatch_end - t_cmd_start:.3f}s\n")
+            print(f"[PERF] ROUTING_END ROUTE=GEMINI_LIVE ({t_route_end - t_route_start:.3f}s)")
+            print(f"[ROUTING] ROUTE=GEMINI_LIVE")
+            print(f"[LIVE] User Turn : {text}")
+            print(f"[SEMANTIC] Input transcript: {text}")
+            try:
+                self.status_label.setText("Status : DHEEPTHI Listening")
+                self._set_avatar_state("listening")
+                self.left_panel.set_listening("Listening")
+            except Exception:
+                pass
+            return
 
 
         except Exception as error:
@@ -10987,6 +10914,8 @@ class MainWindow(QMainWindow):
             print(f"\n[SEMANTIC] ACTION {idx}/{total_actions}")
             print(f"[SEMANTIC] DISPATCHING {intent}")
             print(f"[SEMANTIC] ENTITIES: {entities}")
+            print(f"[SEMANTIC] Dispatch: Step {idx}/{total_actions} -> {intent} entities={entities}")
+
 
             # Visual state updates
             thinking_avatar = self._set_thinking_avatar_for_intent(intent)
@@ -11091,6 +11020,33 @@ class MainWindow(QMainWindow):
             self.tts.speak(error_msg)
             self._unlock_after_speech(restart_live=True, terminal_avatar_state="error")
 
+    def _extract_action_command(self, text: str):
+        """Extract standardized English automation command from <ACTION>...</ACTION> tag."""
+        if hasattr(self, "semantic_command_planner") and self.semantic_command_planner is not None:
+            return self.semantic_command_planner.extract_action_command(text)
+        from planner.semantic_command_planner import extract_action_command
+        return extract_action_command(text)
+
+    def _route_action_command_to_semantic_pipeline(self, action_cmd: str):
+        """
+        Send extracted standardized English command to existing semantic understanding
+        and execution pipeline:
+        action_cmd -> semantic_command_planner.plan() -> _execute_semantic_plan() -> CommandDispatcher
+        """
+        print(f"[SEMANTIC] Routing extracted command to semantic planner: '{action_cmd}'")
+        semantic_plan = None
+        if hasattr(self, "semantic_command_planner") and self.semantic_command_planner is not None:
+            try:
+                semantic_plan = self.semantic_command_planner.plan(action_cmd)
+            except Exception as error:
+                print(f"[SEMANTIC] Planner error for action command: {error}")
+                semantic_plan = None
+
+        if semantic_plan and semantic_plan.get("type") == "command" and semantic_plan.get("actions"):
+            self._execute_semantic_plan(semantic_plan, action_cmd)
+        else:
+            self.process_command(action_cmd)
+
     @Slot(str)
     def _handle_gemini_live_output_transcript(self, text):
         try:
@@ -11106,13 +11062,44 @@ class MainWindow(QMainWindow):
 
             self.gemini_live_output_transcript += text
 
+            # Application-side ACTION extraction layer
+            action_cmd = self._extract_action_command(self.gemini_live_output_transcript)
+            if action_cmd:
+                print(f"[SEMANTIC] Gemini output: {self.gemini_live_output_transcript.strip()}")
+                print("[SEMANTIC] ACTION detected")
+                print(f"[SEMANTIC] Normalized command: {action_cmd}")
+
+                # Immediately suppress Gemini live audio so it doesn't speak raw action tag
+                self.gemini_live_command_handoff = True
+                self._gemini_live_output_suppressed = True
+                worker = self.gemini_live_audio_worker
+                if worker is not None:
+                    try:
+                        worker.clear_output()
+                        worker.set_input_enabled(False)
+                    except Exception as error:
+                        print(f"[LIVE -> COMMAND] Failed to gate Live audio: {error}")
+                self.gemini_live_mic_enabled = False
+                self.processing_voice = True
+
+                # Do not display raw <ACTION> tag to user
+                try:
+                    self.mic_widget.update_ai_message(f"Executing: {action_cmd}")
+                except Exception:
+                    pass
+
+                self.gemini_live_output_transcript = ""
+                self._route_action_command_to_semantic_pipeline(action_cmd)
+                return
+
             if self.physical_microphone_muted:
                 return
 
             try:
-                self.mic_widget.update_ai_message(
-                    self.gemini_live_output_transcript.strip()
-                )
+                # Do not show incomplete <ACTION> tag in user-facing message
+                clean_display = re.sub(r"<ACTION\b[\s\S]*", "", self.gemini_live_output_transcript, flags=re.IGNORECASE).strip()
+                if clean_display:
+                    self.mic_widget.update_ai_message(clean_display)
                 self.status_label.setText("Status : DHEEPTHI Speaking")
                 self._set_avatar_state("speaking")
                 self.left_panel.set_speaking("Speaking")
@@ -11188,10 +11175,46 @@ class MainWindow(QMainWindow):
             if user_text:
                 self.gemini_live_user_transcript = user_text
 
-            if assistant_text and not getattr(self, "_gemini_live_output_suppressed", False):
-                self.gemini_live_output_transcript = assistant_text
+            target_assistant_text = assistant_text or self.gemini_live_output_transcript
+
+            # Application-side ACTION extraction check on completed turn
+            action_cmd = self._extract_action_command(target_assistant_text)
+            if action_cmd:
+                print(f"[SEMANTIC] Gemini output: {target_assistant_text.strip()}")
+                print("[SEMANTIC] ACTION detected")
+                print(f"[SEMANTIC] Normalized command: {action_cmd}")
+
+                self.gemini_live_command_handoff = True
+                self._gemini_live_output_suppressed = True
+                worker = self.gemini_live_audio_worker
+                if worker is not None:
+                    try:
+                        worker.clear_output()
+                        worker.set_input_enabled(False)
+                    except Exception as error:
+                        print(f"[LIVE -> COMMAND] Failed to gate Live audio: {error}")
+                self.gemini_live_mic_enabled = False
+                self.processing_voice = True
+
                 try:
-                    self.mic_widget.update_ai_message(assistant_text)
+                    self.mic_widget.update_ai_message(f"Executing: {action_cmd}")
+                except Exception:
+                    pass
+
+                self.gemini_live_output_transcript = ""
+                self._route_action_command_to_semantic_pipeline(action_cmd)
+                return
+
+            # NON-ACTION OUTPUT:
+            # Treat as normal conversation. Do not send to automation planner.
+            # Do not execute any OS action.
+            print(f"[SEMANTIC] Gemini output: {target_assistant_text.strip()}")
+            print("[SEMANTIC] Conversation response")
+
+            if target_assistant_text and not getattr(self, "_gemini_live_output_suppressed", False):
+                self.gemini_live_output_transcript = target_assistant_text
+                try:
+                    self.mic_widget.update_ai_message(target_assistant_text)
                 except Exception:
                     pass
 
@@ -11267,6 +11290,13 @@ class MainWindow(QMainWindow):
             if getattr(self, "shutdown_started", False) or self._closing:
                 print("[LIVE LIFECYCLE] Reconnect suppressed because shutdown_started=True")
                 return
+
+            # Rotate key on 1011 / quota / internal errors so recovery does not loop on an exhausted key
+            if hasattr(self, "gemini") and self.gemini is not None:
+                err_str = str(message or "").lower()
+                if "1011" in err_str or "quota" in err_str or "resource" in err_str or "internal" in err_str:
+                    print("[LIVE] Rotating Gemini API key on error recovery...")
+                    self.gemini.rotate_api_key()
 
             if not self.physical_microphone_muted:
                 self._gemini_live_pending_start = True

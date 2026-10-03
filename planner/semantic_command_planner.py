@@ -101,6 +101,10 @@ class SemanticCommandPlanner:
     }
 
     INTENT_ALIASES = {
+        "open_application": "launch_application",
+        "open_app": "launch_application",
+        "launch_app": "launch_application",
+        "close_app": "close_application",
         "write_code": "code_agent",
         "create_code": "code_agent",
         "generate_code": "code_agent",
@@ -118,9 +122,11 @@ class SemanticCommandPlanner:
         "watch_movie": "play_youtube",
         "search": "google_search",
         "web_search": "google_search",
+        "search_web": "google_search",
         "screenshot": "take_screenshot",
         "record_screen": "start_screen_recording",
     }
+
 
     PLANNER_PROMPT_TEMPLATE = """
 You are the semantic command planner for DHEEPTHI-AI.
@@ -231,11 +237,97 @@ Return ONLY valid JSON matching this schema:
         self._plan_cache: Dict[str, Dict[str, Any]] = {}
 
     # ==========================================================
-    # Fast Local Conversation Guard
+    # ACTION Tag Extraction Layer
     # ==========================================================
 
     @staticmethod
+    def extract_action_command(text: str) -> Optional[str]:
+        """
+        Extract standardized English automation command from <ACTION>...</ACTION> tag.
+        Returns None if no complete, non-empty ACTION tag is present, or if any tag is malformed/unclosed.
+        """
+        if not text or not isinstance(text, str):
+            return None
+
+        # Check for unclosed or mismatched tags
+        open_tags = len(re.findall(r"<ACTION\b", text, flags=re.IGNORECASE))
+        close_tags = len(re.findall(r"</ACTION>", text, flags=re.IGNORECASE))
+        if open_tags == 0 or open_tags != close_tags:
+            return None
+
+        # Find all complete <ACTION>...</ACTION> tags (case-insensitive, multiline DOTALL)
+        matches = re.findall(r"<ACTION>\s*([\s\S]*?)\s*</ACTION>", text, flags=re.IGNORECASE)
+        if not matches:
+            return None
+
+        valid_actions = []
+        for m in matches:
+            m_clean = m.strip()
+            if not m_clean or "<action" in m_clean.lower() or "</action" in m_clean.lower():
+                return None
+            valid_actions.append(m_clean)
+
+        if not valid_actions:
+            return None
+
+        # Return normalized command (joined with ' and ' if multiple tags)
+        return " and ".join(valid_actions)
+
+    @staticmethod
+    def has_action_command(text: str) -> bool:
+        """Check whether input contains a valid, complete <ACTION>...</ACTION> tag."""
+        return SemanticCommandPlanner.extract_action_command(text) is not None
+
+    # ==========================================================
+    # Language Detection & Fast Local Conversation Guard
+    # ==========================================================
+
+    @staticmethod
+    def detect_language(text: str) -> str:
+        """
+        Detect whether input is English, Tamil, Tanglish, or Mixed.
+        """
+        if not text:
+            return "English"
+        # Check Tamil script
+        if re.search(r"[\u0b80-\u0bff]", text):
+            if re.search(r"[a-zA-Z]{2,}", text):
+                return "Mixed (Tamil + English)"
+            return "Tamil"
+
+        # Check Tanglish marker words
+        tanglish_words = {
+            "panni", "pannitu", "pannittu", "pannu", "pannunga", "panra", "pandra",
+            "seythu", "seithu", "seyi", "seyyunga", "podu", "podunga", "pottu",
+            "thira", "thiranthu", "thoraku", "moodu", "eduthu", "anuppu", "ezhudhu",
+            "la", "ku", "kku", "ah", "ai", "nu", "da", "pa", "oru", "enna",
+            "iruku", "irukum", "sollu", "solla", "pesu", "pathi", "paththi",
+            "evlo", "evvalavu", "ethana", "ethanai", "apram", "appuram", "aduthu",
+            "kooda", "koodave", "paattu", "paatu", "thedu", "theda", "azhichu",
+            "azhichidu", "uruvakku", "kekkanum", "ketka", "dheepthi", "dei", "thala"
+        }
+        words = set(re.findall(r"[a-zA-Z]+", text.lower()))
+        matched_tanglish = words.intersection(tanglish_words)
+
+        has_english_app_or_verb = any(
+            w in words for w in {
+                "chrome", "edge", "notepad", "vs", "code", "vscode", "word", "excel",
+                "calculator", "calc", "downloads", "desktop", "documents", "folder",
+                "file", "open", "close", "play", "type", "copy", "move", "delete",
+                "search", "create", "screenshot", "youtube", "google", "song", "python"
+            }
+        )
+
+        if matched_tanglish and has_english_app_or_verb:
+            return "Mixed (English + Tanglish)"
+        elif matched_tanglish:
+            return "Tanglish"
+        else:
+            return "English"
+
+    @staticmethod
     def _is_obviously_conversational(text: str) -> bool:
+
         """
         Fast heuristic check to protect obvious questions, discussions,
         interruption commands, Tanglish queries, and greetings from being routed to desktop actions.
@@ -329,62 +421,137 @@ Return ONLY valid JSON matching this schema:
     # Main Planning API
     # ==========================================================
 
+    APP_NAME_MAP = {
+        "chrome": "Chrome",
+        "google chrome": "Chrome",
+        "edge": "Edge",
+        "ms edge": "Edge",
+        "microsoft edge": "Edge",
+        "notepad": "Notepad",
+        "note pad": "Notepad",
+        "vs code": "VS Code",
+        "vscode": "VS Code",
+        "visual studio code": "VS Code",
+        "word": "Word",
+        "ms word": "Word",
+        "microsoft word": "Word",
+        "excel": "Excel",
+        "ms excel": "Excel",
+        "microsoft excel": "Excel",
+        "powerpoint": "PowerPoint",
+        "ppt": "PowerPoint",
+        "calculator": "Calculator",
+        "calc": "Calculator",
+        "paint": "Paint",
+        "file explorer": "File Explorer",
+        "explorer": "File Explorer",
+        "firefox": "Firefox",
+        "terminal": "Terminal",
+        "cmd": "Command Prompt",
+        "powershell": "PowerShell",
+    }
+
+    FOLDER_NAME_MAP = {
+        "downloads": "Downloads",
+        "desktop": "Desktop",
+        "documents": "Documents",
+        "pictures": "Pictures",
+        "photos": "Pictures",
+        "videos": "Videos",
+        "music": "Music",
+        "this pc": "This PC",
+        "my computer": "This PC",
+        "recycle bin": "Recycle Bin",
+    }
+
+    # ==========================================================
+    # Main Planning API
+    # ==========================================================
+
     def plan(self, text: str) -> Dict[str, Any]:
         """
         Interpret the speech transcript and return a validated structured plan.
         """
         cleaned_text = str(text or "").strip()
+
+        # Check and extract <ACTION> wrapper if present
+        action_cmd = self.extract_action_command(cleaned_text)
+        if action_cmd:
+            cleaned_text = action_cmd
+
+        detected_lang = self.detect_language(cleaned_text)
+
         if not cleaned_text or len(cleaned_text) <= 1:
-            return {"type": "conversation", "actions": []}
+            print(f"[SEMANTIC] Input: {cleaned_text}")
+            print(f"[SEMANTIC] Language: {detected_lang}")
+            print("[SEMANTIC] Type: CONVERSATION (OS automation bypassed)")
+            return {"type": "conversation", "actions": [], "language": detected_lang}
 
         # Fast conversation check
         if self._is_obviously_conversational(cleaned_text):
-            return {"type": "conversation", "actions": []}
+            print(f"[SEMANTIC] Input: {cleaned_text}")
+            print(f"[SEMANTIC] Language: {detected_lang}")
+            print("[SEMANTIC] Type: CONVERSATION (OS automation bypassed)")
+            return {"type": "conversation", "actions": [], "language": detected_lang}
 
         # Plan cache lookup: strips punctuation and normalizes casing
         cache_key = re.sub(r"[^\w\s]", "", cleaned_text.lower()).strip()
         if cache_key in self._plan_cache:
             logger.info("Semantic plan cache hit for: '%s'", cleaned_text)
-            return dict(self._plan_cache[cache_key])
+            cached_plan = dict(self._plan_cache[cache_key])
+            cached_plan["language"] = detected_lang
+            self._log_plan_details(cleaned_text, detected_lang, cached_plan)
+            return cached_plan
 
+        plan = None
         prompt = self.PLANNER_PROMPT_TEMPLATE.replace("{input_text}", cleaned_text)
 
         try:
             response = self.gemini_client.generate_structured_plan(prompt)
-            if not response:
-                logger.warning("Empty response from semantic planner. Attempting fallback...")
-                fallback_plan = self._fallback_extract_structural_actions(cleaned_text)
-                if fallback_plan and fallback_plan.get("actions"):
-                    self._plan_cache[cache_key] = fallback_plan
-                    return fallback_plan
-                return {"type": "conversation", "actions": []}
-
-            data = self._parse_json(response)
-            if not isinstance(data, dict):
-                logger.warning("Semantic planner did not return a valid dict: %s. Attempting fallback...", response)
-                fallback_plan = self._fallback_extract_structural_actions(cleaned_text)
-                if fallback_plan and fallback_plan.get("actions"):
-                    self._plan_cache[cache_key] = fallback_plan
-                    return fallback_plan
-                return {"type": "conversation", "actions": []}
-
-            plan = self._validate_and_normalize_plan(data, cleaned_text)
-            if not plan.get("actions"):
-                fallback_plan = self._fallback_extract_structural_actions(cleaned_text)
-                if fallback_plan and fallback_plan.get("actions"):
-                    plan = fallback_plan
-
-            if len(self._plan_cache) > 100:
-                self._plan_cache.clear()
-            self._plan_cache[cache_key] = plan
-            return plan
-
+            if response:
+                data = self._parse_json(response)
+                if isinstance(data, dict):
+                    plan = self._validate_and_normalize_plan(data, cleaned_text)
         except Exception as error:
             logger.error("Semantic command planning error: %s", error)
+            plan = None
+
+        if not plan or not plan.get("actions"):
             fallback_plan = self._fallback_extract_structural_actions(cleaned_text)
             if fallback_plan and fallback_plan.get("actions"):
-                return fallback_plan
-            return {"type": "conversation", "actions": []}
+                plan = fallback_plan
+
+        if not plan:
+            plan = {"type": "conversation", "actions": []}
+
+        plan["language"] = detected_lang
+        plan["original_command"] = cleaned_text
+
+        if len(self._plan_cache) > 100:
+            self._plan_cache.clear()
+        self._plan_cache[cache_key] = plan
+
+        self._log_plan_details(cleaned_text, detected_lang, plan)
+        return plan
+
+    @classmethod
+    def _log_plan_details(cls, input_text: str, language: str, plan: dict) -> None:
+        """Print required semantic debugging logs."""
+        print(f"[SEMANTIC] Input: {input_text}")
+        print(f"[SEMANTIC] Language: {language}")
+        if plan.get("type") == "command" and plan.get("actions"):
+            actions = plan["actions"]
+            intents = [a.get("intent", "") for a in actions]
+            intents_str = ", ".join(intents)
+            entities_str = ", ".join(str(a.get("entities", {})) for a in actions)
+            cmds_str = ", ".join(f"{i}. {a.get('intent')}({a.get('entities')})" for i, a in enumerate(actions, 1))
+            print(f"[SEMANTIC] Intent: {intents_str}")
+            print(f"[SEMANTIC] Entities: {entities_str}")
+            print(f"[SEMANTIC] Commands: {cmds_str}")
+            for a in actions:
+                print(f"[SEMANTIC] Dispatch: {a.get('intent')} -> {a.get('entities')}")
+        else:
+            print("[SEMANTIC] Type: CONVERSATION (OS automation bypassed)")
 
     # ==========================================================
     # Helpers
@@ -444,8 +611,11 @@ Return ONLY valid JSON matching this schema:
             if not isinstance(entities, dict):
                 entities = {"entity": entities}
 
-            # Normalize entities per intent
+            # Normalize and validate entities per intent
             normalized_entities = self._normalize_entities_for_intent(intent, entities, original_text)
+            if normalized_entities is None:
+                logger.warning("Discarding intent %s due to missing or invalid required entities", intent)
+                continue
 
             validated_actions.append({
                 "intent": intent,
@@ -461,19 +631,22 @@ Return ONLY valid JSON matching this schema:
             "original_command": original_text,
         }
 
-    @staticmethod
+    @classmethod
     def _normalize_entities_for_intent(
+        cls,
         intent: str,
         entities: Dict[str, Any],
         original_text: str,
-    ) -> Dict[str, Any]:
-        """Ensure entity keys match what CommandDispatcher expects."""
+    ) -> Optional[Dict[str, Any]]:
+        """Ensure entity keys match what CommandDispatcher expects, and validate required entities."""
         norm = dict(entities)
 
         if intent in {"launch_application", "close_application"}:
-            app = norm.get("application") or norm.get("app") or norm.get("target") or norm.get("name")
-            if app:
-                norm["application"] = str(app).strip()
+            app = norm.get("application") or norm.get("app") or norm.get("target") or norm.get("name") or norm.get("entity")
+            if not app:
+                return None
+            app_clean = str(app).strip()
+            norm["application"] = cls.APP_NAME_MAP.get(app_clean.lower(), app_clean)
 
         elif intent == "play_youtube":
             query = (
@@ -485,111 +658,226 @@ Return ONLY valid JSON matching this schema:
                 or norm.get("target")
                 or norm.get("entity")
             )
-            if query:
-                norm["search_query"] = str(query).strip()
+            query_str = str(query or "").strip()
+            if not query_str:
+                query_str = "song"
+            # Strip trailing/leading quotes
+            query_str = re.sub(r"^['\"]|['\"]$", "", query_str).strip()
+            norm["search_query"] = query_str
+            norm["query"] = query_str
 
         elif intent in {"youtube_search", "google_search"}:
             query = norm.get("search_query") or norm.get("query") or norm.get("target") or norm.get("entity")
-            if query:
-                norm["search_query"] = str(query).strip()
+            if not query:
+                return None
+            norm["search_query"] = str(query).strip()
 
-        elif intent in {"copy_file", "move_file", "rename_file", "copy_folder", "move_folder", "rename_folder"}:
-            source = norm.get("source") or norm.get("file") or norm.get("folder") or norm.get("target") or norm.get("from")
+        elif intent in {"copy_file", "move_file", "rename_file"}:
+            source = norm.get("source") or norm.get("file") or norm.get("filename") or norm.get("target") or norm.get("from")
             dest = norm.get("destination") or norm.get("to") or norm.get("dest")
-            if source:
-                norm["source"] = str(source).strip()
-            if dest:
-                norm["destination"] = str(dest).strip()
+            # Safety: reject incomplete commands instead of guessing or hallucinating missing entities!
+            if not source or not dest:
+                return None
+            src_str = str(source).strip()
+            dest_str = str(dest).strip()
+            dest_norm = cls.FOLDER_NAME_MAP.get(dest_str.lower(), dest_str)
+            norm["source"] = src_str
+            norm["file"] = src_str
+            norm["destination"] = dest_norm
+
+        elif intent in {"copy_folder", "move_folder", "rename_folder"}:
+            source = norm.get("source") or norm.get("folder") or norm.get("from")
+            dest = norm.get("destination") or norm.get("to") or norm.get("dest")
+            if not source or not dest:
+                return None
+            norm["source"] = cls.FOLDER_NAME_MAP.get(str(source).strip().lower(), str(source).strip())
+            norm["destination"] = cls.FOLDER_NAME_MAP.get(str(dest).strip().lower(), str(dest).strip())
 
         elif intent in {"open_folder", "create_folder", "delete_folder"}:
             folder = norm.get("folder") or norm.get("target") or norm.get("name") or norm.get("entity")
-            if folder:
-                norm["folder"] = str(folder).strip()
-                norm["entity"] = str(folder).strip()
+            if not folder:
+                return None
+            f_clean = str(folder).strip()
+            norm_folder = cls.FOLDER_NAME_MAP.get(f_clean.lower(), f_clean)
+            norm["folder"] = norm_folder
+            norm["entity"] = norm_folder
 
         elif intent in {"open_file", "create_file", "delete_file"}:
-            file_val = norm.get("file") or norm.get("filename") or norm.get("target") or norm.get("name")
-            if file_val:
-                norm["file"] = str(file_val).strip()
-                norm["entity"] = str(file_val).strip()
+            file_val = norm.get("file") or norm.get("filename") or norm.get("target") or norm.get("name") or norm.get("entity")
+            if not file_val:
+                return None
+            norm["file"] = str(file_val).strip()
+            norm["entity"] = str(file_val).strip()
 
         elif intent == "code_agent":
             lang = norm.get("language") or ("python" if "python" in original_text.lower() else "java")
-            task = norm.get("task") or norm.get("program") or norm.get("query") or norm.get("code") or ""
+            task = norm.get("task") or norm.get("program") or norm.get("query") or norm.get("code") or norm.get("description") or ""
             norm["language"] = str(lang).strip()
             norm["task"] = str(task).strip()
+            norm["description"] = str(task).strip()
 
         elif intent == "type_text":
             txt = norm.get("text") or norm.get("typed_text") or norm.get("content") or ""
+            if not txt:
+                return None
             norm["text"] = str(txt).strip()
             norm["typed_text"] = str(txt).strip()
 
         return norm
 
-    @staticmethod
-    def _fallback_extract_structural_actions(text: str) -> Optional[dict]:
-        """
-        Deterministic fallback to parse multi-action commands when cloud LLMs
-        are temporarily quota-exhausted or unreachable.
-        """
-        lower = text.lower().strip()
-        actions = []
+    @classmethod
+    def _fallback_parse_single_clause(cls, clause: str) -> Optional[dict]:
+        """Parse a single atomic clause generically into intent and entities."""
+        c = clause.strip()
+        if not c:
+            return None
+        lower = c.lower()
 
-        # Application + YouTube song (e.g. "Chrome open pannu jailer song podu", "Chrome open panni Pavalamalli song play pannu")
-        has_chrome = "chrome" in lower
-        has_edge = "edge" in lower
-        has_song = any(k in lower for k in ("song", "play", "podu", "paattu", "music", "youtube", "paatu"))
+        # 1. Media play (YouTube / song)
+        if any(k in lower for k in ["play", "podu", "paattu", "paatu", "song", "music", "youtube"]) and not any(k in lower for k in ["type", "copy", "move", "code", "create"]):
+            q = c
+            q = re.sub(r"\b(?:on\s+youtube|in\s+youtube|youtube\s+la|youtube|song|songs|paattu|paatu|track|music|play\s+pannu|play\s+pannunga|play|podu|podunga|pannu|la|ah|nu)\b", "", q, flags=re.I)
+            q = re.sub(r"\s+", " ", q).strip()
+            if not q or len(q) < 2:
+                q = "song"
+            return {"intent": "play_youtube", "entities": {"search_query": q, "query": q}}
 
-        if (has_chrome or has_edge) and has_song:
-            app = "Chrome" if has_chrome else "Edge"
-            actions.append({"intent": "launch_application", "entities": {"application": app}})
-
-            song_query = ""
-            for candidate in ("jailer", "pavalamalli", "anbe anbe", "anirudh", "karuppu"):
-                if candidate in lower:
-                    song_query = candidate.title()
-                    break
-
-            if not song_query:
-                m = re.search(r"(\b[a-zA-Z0-9_\s]+?)\s+(?:song|paattu|paatu)\s*(?:podu|play|pannu|podunga)?", lower)
-                if m:
-                    extracted = m.group(1).replace("open", "").replace("chrome", "").replace("edge", "").replace("panni", "").replace("pannu", "").replace("la", "").replace("youtube", "").strip()
-                    if extracted and len(extracted) > 1:
-                        song_query = extracted.title()
-
-            if not song_query:
-                song_query = "song"
-
-            actions.append({"intent": "play_youtube", "entities": {"search_query": song_query}})
-            return {"type": "command", "actions": actions, "original_command": text}
-
-        # Notepad + type text (e.g. "Notepad open panni hello world type pannu")
-        if "notepad" in lower and any(k in lower for k in ("type", "write", "ezhudhu", "type pannu")):
-            actions.append({"intent": "launch_application", "entities": {"application": "Notepad"}})
-            m = re.search(r"['\"]([^'\"]+)['\"]", text)
-            if m:
-                typed = m.group(1).strip()
+        # 2. Type text
+        if any(k in lower for k in ["type", "ezhudhu", "write"]) and not any(k in lower for k in ["code", "program", "script"]):
+            m_q = re.search(r"['\"]([^'\"]+)['\"]", c)
+            if m_q:
+                txt = m_q.group(1).strip()
             else:
-                m = re.search(r"(?:open\s+(?:panni|pannu|and)\s+)?([a-zA-Z0-9\s]+?)\s+(?:type|write|type\s+pannu)", lower)
-                if m:
-                    typed = m.group(1).replace("notepad", "").replace("open", "").replace("panni", "").replace("pannu", "").strip()
+                m_nu = re.search(r"(.+?)\s+nu\s+(?:type|write|ezhudhu)", c, flags=re.I)
+                if m_nu:
+                    txt = m_nu.group(1).strip()
                 else:
-                    typed = "hello world" if "hello world" in lower else ""
-            actions.append({"intent": "type_text", "entities": {"text": typed, "typed_text": typed}})
-            return {"type": "command", "actions": actions, "original_command": text}
+                    txt = re.sub(r"\b(?:type\s+pannu|type\s+pannitu|type\s+pannunga|type|write|ezhudhu|pannu|nu|da|pa)\b", "", c, flags=re.I).strip()
+            if txt:
+                return {"intent": "type_text", "entities": {"text": txt, "typed_text": txt}}
+            return None
 
-        # VS Code + Python code agent (e.g. "VS Code open panni Python la calculator program create pannu")
-        if ("vs code" in lower or "vscode" in lower) and ("python" in lower or "code" in lower or "calculator" in lower):
-            actions.append({"intent": "launch_application", "entities": {"application": "VS Code"}})
-            actions.append({"intent": "code_agent", "entities": {"language": "python", "task": "calculator program", "prompt": text}})
-            return {"type": "command", "actions": actions, "original_command": text}
+        # 3. Code agent / programming
+        if any(k in lower for k in ["program", "code", "calculator", "coding"]) and any(k in lower for k in ["create", "write", "generate", "make", "panni", "pannu"]):
+            lang = "python"
+            for candidate_lang in ["python", "java", "c++", "cpp", "javascript", "c", "c#", "html"]:
+                if candidate_lang in lower:
+                    lang = candidate_lang
+                    break
+            task = c
+            task = re.sub(r"\b(?:create\s+pannu|create|write|generate|pannu|la|nu)\b", "", task, flags=re.I)
+            task = re.sub(r"\b" + lang + r"\b", "", task, flags=re.I)
+            task = re.sub(r"\s+", " ", task).strip()
+            if "program" not in task.lower() and "code" not in task.lower():
+                task = f"{task} program".strip()
+            return {"intent": "code_agent", "entities": {"language": lang, "task": task, "description": task}}
 
-        # Downloads folder + copy file (e.g. "Downloads folder open panni report.pdf ah Desktop ku copy pannu")
-        if "downloads" in lower and any(k in lower for k in ("copy", "move")) and ("desktop" in lower or ".pdf" in lower):
-            actions.append({"intent": "open_folder", "entities": {"folder": "Downloads"}})
-            file_name = "report.pdf" if "report.pdf" in lower else "report.pdf"
-            dest = "Desktop" if "desktop" in lower else "Desktop"
-            actions.append({"intent": "copy_file", "entities": {"source": file_name, "file": file_name, "destination": dest}})
-            return {"type": "command", "actions": actions, "original_command": text}
+        # 4. Copy / Move / Delete file
+        if any(k in lower for k in ["copy", "move", "transfer"]):
+            act = "copy_file" if any(k in lower for k in ["copy", "transfer"]) else "move_file"
+            m_file = re.search(r"([a-zA-Z0-9_\-\.]+\.[a-zA-Z0-9]+)\s*(?:ah|ai|-a)?\s+(?:to\s+)?([a-zA-Z0-9_\-\s]+?)\s*(?:ku|kku|to|\s+folder)?\s*(?:copy|move|transfer|$)", c, flags=re.I)
+            if m_file:
+                src = m_file.group(1).strip()
+                dst = cls.FOLDER_NAME_MAP.get(m_file.group(2).strip().lower().replace("folder", "").strip(), m_file.group(2).strip())
+                return {"intent": act, "entities": {"source": src, "file": src, "destination": dst}}
+            m_en = re.search(r"(?:copy|move|transfer)\s+([a-zA-Z0-9_\-\.]+\.[a-zA-Z0-9]+)\s+to\s+([a-zA-Z0-9_\-\s]+)", c, flags=re.I)
+            if m_en:
+                src = m_en.group(1).strip()
+                dst_raw = m_en.group(2).strip().replace("folder", "").strip()
+                dst = cls.FOLDER_NAME_MAP.get(dst_raw.lower(), dst_raw)
+                return {"intent": act, "entities": {"source": src, "file": src, "destination": dst}}
+            return None
+
+        if any(k in lower for k in ["delete", "remove", "azhichu", "azhi"]):
+            m_del = re.search(r"([a-zA-Z0-9_\-\.]+\.[a-zA-Z0-9]+)", c)
+            if m_del:
+                return {"intent": "delete_file", "entities": {"file": m_del.group(1).strip()}}
+            return None
+
+        # 5. Open folder
+        if any(f in lower for f in ["downloads", "desktop", "documents", "pictures", "videos", "music"]) and any(k in lower for k in ["open", "thira", "thoraku"]):
+            m_fol = re.search(r"\b(downloads|desktop|documents|pictures|videos|music)\b", lower)
+            if m_fol:
+                folder = cls.FOLDER_NAME_MAP.get(m_fol.group(1).lower(), m_fol.group(1).title())
+                return {"intent": "open_folder", "entities": {"folder": folder, "entity": folder}}
+
+        # 6. Web / Google search
+        if any(k in lower for k in ["search", "thedu"]) and not any(k in lower for k in ["play", "song"]):
+            q = c
+            q = re.sub(r"\b(?:google\s+la|google|search\s+pannu|search\s+pannunga|search|thedu|pannu|la|nu)\b", "", q, flags=re.I)
+            q = re.sub(r"\s+", " ", q).strip()
+            if q:
+                return {"intent": "google_search", "entities": {"search_query": q}}
+
+        # 7. Screenshot
+        if any(k in lower for k in ["screenshot", "screen shot"]):
+            return {"intent": "take_screenshot", "entities": {}}
+
+        # 8. Launch / Close application
+        apps = [
+            ("visual studio code", "VS Code"),
+            ("vs code", "VS Code"),
+            ("vscode", "VS Code"),
+            ("google chrome", "Chrome"),
+            ("chrome", "Chrome"),
+            ("microsoft edge", "Edge"),
+            ("ms edge", "Edge"),
+            ("edge", "Edge"),
+            ("notepad", "Notepad"),
+            ("calculator", "Calculator"),
+            ("calc", "Calculator"),
+            ("word", "Word"),
+            ("excel", "Excel"),
+            ("paint", "Paint"),
+            ("firefox", "Firefox"),
+            ("terminal", "Terminal"),
+            ("cmd", "Command Prompt"),
+            ("powershell", "PowerShell"),
+            ("file explorer", "File Explorer"),
+        ]
+        for pattern_name, canonical_name in apps:
+            if pattern_name in lower:
+                if any(k in lower for k in ["close", "exit", "quit", "moodu"]):
+                    return {"intent": "close_application", "entities": {"application": canonical_name}}
+                if any(k in lower for k in ["open", "launch", "start", "run", "thira", "thiranthu"]):
+                    return {"intent": "launch_application", "entities": {"application": canonical_name}}
 
         return None
+
+    @classmethod
+    def _fallback_extract_structural_actions(cls, text: str) -> Optional[dict]:
+        """
+        Generic, deterministic fallback to decompose and parse multi-action commands
+        across English, Tamil, Tanglish, and mixed languages.
+        """
+        if cls._is_obviously_conversational(text):
+            return {"type": "conversation", "actions": []}
+
+        cleaned = re.sub(r"^(?:hey|hi|hello|dheepthi(?:\s+ai)?|ai|dei|da|pa|thala|bro|friend)\s*[,]?\s*", "", text.strip(), flags=re.I).strip()
+        connectors = r"(?:\s+panni\s+|\s+pannitu\s+|\s+pannittu\s+|\s+seythu\s+|\s+seithu\s+|\s+and\s+then\s+|\s+after\s+that\s+|\s+apram\s+|\s+appuram\s+|\s+aduthu\s+|\s+and\s+(?=(?:play|type|copy|move|create|open|close|search|run|start))\b|,\s*)"
+        raw_clauses = re.split(connectors, cleaned, flags=re.I)
+
+        if len(raw_clauses) == 1:
+            m_dual = re.match(r"^(.+?\b(?:open|close|launch))\s+(?:pannu|pannunga|panra)?\s+(.+)$", cleaned, flags=re.I)
+            if m_dual:
+                raw_clauses = [m_dual.group(1), m_dual.group(2)]
+
+        actions = []
+        for clause in raw_clauses:
+            clause_str = clause.strip()
+            if not clause_str:
+                continue
+            if any(clause_str.lower().startswith(app) for app in ["chrome", "edge", "notepad", "vs code", "vscode"]) and "open" not in clause_str.lower():
+                clause_str = clause_str + " open"
+            act = cls._fallback_parse_single_clause(clause_str)
+            if act:
+                actions.append(act)
+
+        if actions:
+            return {"type": "command", "actions": actions, "original_command": text}
+        return {"type": "conversation", "actions": []}
+
+
+extract_action_command = SemanticCommandPlanner.extract_action_command
+has_action_command = SemanticCommandPlanner.has_action_command
+

@@ -552,6 +552,17 @@ class GeminiLiveSession:
                         f"rx_cnt={self.receive_event_count} tx_cnt={self.send_packet_count} "
                         f"last_rx={dt_rx:.1f}s_ago last_tx={dt_tx:.1f}s_ago qdepth={qsize}"
                     )
+                    try:
+                        await session.send_realtime_input(
+                            audio=types.Blob(
+                                data=b"\x00\x00" * 512,
+                                mime_type="audio/pcm;rate=16000",
+                            )
+                        )
+                        self.send_packet_count += 1
+                        self.last_send_time = time.time()
+                    except Exception:
+                        pass
                     continue
 
                 if audio_data is None:
@@ -560,7 +571,7 @@ class GeminiLiveSession:
                 await session.send_realtime_input(
                     audio=types.Blob(
                         data=audio_data,
-                        mime_type="audio/pcm",
+                        mime_type="audio/pcm;rate=16000",
                     )
                 )
                 self.send_packet_count += 1
@@ -1720,6 +1731,122 @@ Always distinguish between:
 and
 • starting a genuinely new topic.
 """
+
+    def live_system_prompt(self) -> str:
+        """
+        Dedicated system instruction for Gemini Live audio conversation session.
+        Preserves DHEEPTHI identity & Tanglish conversation rules, and adds the
+        semantic command understanding layer for desktop automation with <ACTION> tags.
+        """
+        base_prompt = self.system_prompt()
+        semantic_instruction = """
+==================================================
+12. SEMANTIC COMMAND UNDERSTANDING & ACTION TAGS
+==================================================
+
+You are DHEEPTHI-AI's semantic command understanding layer.
+
+Understand the user's intended meaning across English, Tamil, Tanglish,
+Tamil-English mixed speech, and Tamil written in Tamil script.
+
+DHEEPTHI-AI is a local desktop voice assistant.
+
+When the user requests an action on the local computer, translate the
+INTENDED ACTION into a concise standardized English desktop command.
+
+Wrap ONLY desktop automation commands in:
+
+<ACTION>...</ACTION>
+
+The user will never provide the ACTION tag themselves.
+
+You must generate the ACTION tag when the user's intent is clearly a
+desktop automation request.
+
+Do not use ACTION for normal conversation, questions, explanations,
+opinions, or general knowledge.
+
+Do not respond by saying that you cannot control the computer when the
+user has clearly requested a supported desktop automation action.
+
+Do not execute the action yourself.
+
+Do not claim that an action was executed.
+
+Do not invent execution results.
+
+Preserve important entities exactly, including:
+
+- application names
+- file names
+- folder names
+- song names
+- website names
+- search queries
+- text to type
+- source locations
+- destination locations
+
+For multi-step requests, preserve the order of operations.
+
+Examples:
+
+User:
+"Chrome open panni Pavalamalli song play pannu"
+
+Output:
+<ACTION>Open Chrome and play Pavalamalli song on YouTube</ACTION>
+
+User:
+"Notepad open panni hello world type pannu"
+
+Output:
+<ACTION>Open Notepad and type "hello world"</ACTION>
+
+User:
+"Downloads folder open panni report.pdf ah Desktop ku copy pannu"
+
+Output:
+<ACTION>Open Downloads folder and copy report.pdf to Desktop</ACTION>
+
+User:
+"Edge open panni YouTube la Anbe Anbe play pannu"
+
+Output:
+<ACTION>Open Edge and play Anbe Anbe on YouTube</ACTION>
+
+Tamil/Tanglish example:
+
+User:
+"குரோம் ஓபன் பண்ணி பவளமல்லி சாங் ப்ளே பண்ணு"
+
+Output:
+<ACTION>Open Chrome and play Pavalamalli song on YouTube</ACTION>
+
+Normal conversation:
+
+User:
+"Human body la evlo bones irukum?"
+
+Output:
+Normal conversational answer. Do not use ACTION.
+
+User:
+"Chrome pathi sollu"
+
+Output:
+Normal conversational answer. Do not use ACTION.
+
+User:
+"Why should I open Chrome?"
+
+Output:
+Normal conversational answer. Do not use ACTION.
+
+The ACTION wrapper is an internal routing signal for DHEEPTHI-AI.
+"""
+        return base_prompt + "\n" + semantic_instruction
+
 
     # ------------------------------------------------------
     # Add User Message
@@ -3085,6 +3212,7 @@ and
 
     def create_live_session(
         self,
+        system_instruction=None,
         on_connected=None,
         on_audio=None,
         on_input_transcript=None,
@@ -3124,10 +3252,12 @@ and
             if self._closing:
                 return None
 
+            live_sys_instruction = system_instruction if system_instruction is not None else self.live_system_prompt()
+
             session = GeminiLiveSession(
                 api_key=self.current_api_key(),
                 model=self.live_model,
-                system_instruction=self.system_prompt(),
+                system_instruction=live_sys_instruction,
                 on_connected=on_connected,
                 on_audio=on_audio,
                 on_input_transcript=on_input_transcript,
