@@ -47,6 +47,7 @@ class StatusTileWidget(QFrame):
 
         "Inactive": "#EF4444",
         "Error": "#EF4444",
+        "Not Ready": "#EF4444",
 
         "Thinking": "#F59E0B",
 

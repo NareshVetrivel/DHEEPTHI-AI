@@ -236,11 +236,14 @@ class LeftPanelWidget(QWidget):
             icon="🔊"
         )
 
-        self.whisper = StatusTileWidget(
-            title="Whisper",
-            status="Loaded",
-            icon="⚡"
+        self.live_voice = StatusTileWidget(
+            title="Live Voice",
+            status="Not Ready",
+            icon="🎙"
         )
+
+        # Backward compatibility alias
+        self.whisper = self.live_voice
 
         self.automation = StatusTileWidget(
             title="Automation",
@@ -289,7 +292,7 @@ class LeftPanelWidget(QWidget):
         )
 
         self.grid.addWidget(
-            self.whisper,
+            self.live_voice,
             1,
             1
         )
@@ -383,16 +386,27 @@ class LeftPanelWidget(QWidget):
 
     # ---------------------------------------------------------
 
-    def set_whisper(
+    def set_live_voice(
         self,
         status
     ):
 
-        if self.whisper.status != status:
+        if self.live_voice.status != status:
 
-            self.whisper.update_status(
+            self.live_voice.update_status(
                 status
             )
+
+    # ---------------------------------------------------------
+
+    def set_whisper(
+        self,
+        status
+    ):
+        """Backward compatibility helper."""
+        self.set_live_voice(
+            status
+        )
 
     # ---------------------------------------------------------
 
@@ -471,8 +485,17 @@ class LeftPanelWidget(QWidget):
             "speaking":
                 self.speaking,
 
+            "live voice":
+                self.live_voice,
+
+            "live_voice":
+                self.live_voice,
+
+            "livevoice":
+                self.live_voice,
+
             "whisper":
-                self.whisper,
+                self.live_voice,
 
             "automation":
                 self.automation,
@@ -518,7 +541,7 @@ class LeftPanelWidget(QWidget):
 
             self.speaking,
 
-            self.whisper,
+            self.live_voice,
 
             self.automation,
 
@@ -552,8 +575,8 @@ class LeftPanelWidget(QWidget):
             "Silent"
         )
 
-        self.set_whisper(
-            "Loaded"
+        self.set_live_voice(
+            "Not Ready"
         )
 
         self.set_automation(

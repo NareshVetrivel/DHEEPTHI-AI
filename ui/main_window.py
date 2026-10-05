@@ -119,6 +119,7 @@ from ui.widgets.mic_widget import MicWidget
 from ui.widgets.user_speech_panel import UserSpeechPanel
 from ui.widgets.file_selection_panel import FileSelectionPanel
 from ui.widgets.system_osd import SystemOSD
+from ui.splash_screen import SplashOverlay
 
 from voice.text_to_speech import TextToSpeech
 from voice.streaming_tts_manager import StreamingTTSManager
@@ -1857,197 +1858,20 @@ class MainWindow(QMainWindow):
         self._speech_level_timer.start()
 
         # --------------------------------------------------
-        # Loading Overlay
+        # Loading Overlay (Futuristic Glassmorphic Splash)
         # --------------------------------------------------
 
-        self.loading_overlay = QWidget(self)
-
-        self.loading_overlay.setStyleSheet("""
-
-        QWidget{
-
-            background-color: rgb(247,242,255);
-
-        }
-
-        """)
-
+        self.loading_overlay = SplashOverlay(self)
         self.loading_overlay.setGeometry(self.rect())
-
         self.loading_overlay.raise_()
-
         self.loading_overlay.show()
 
-        # --------------------------------------------------
-        # Overlay Layout
-        # --------------------------------------------------
-
-        overlay_layout = QVBoxLayout(
-            self.loading_overlay
-        )
-
-        overlay_layout.setAlignment(
-            Qt.AlignCenter
-        )
-
-        overlay_layout.setSpacing(18)
-
-        # --------------------------------------------------
-        # Logo
-        # --------------------------------------------------
-
-        self.loading_logo = QLabel()
-
-        icon = QApplication.windowIcon()
-
-        pixmap = icon.pixmap(420, 420)
-
-        self.loading_logo.setPixmap(pixmap)
-
-        self.loading_logo.setAlignment(
-            Qt.AlignCenter
-        )
-
-        glow = QGraphicsDropShadowEffect()
-
-        glow.setBlurRadius(80)
-
-        glow.setOffset(0)
-
-        glow.setColor(
-            QColor(124,58,237,180)
-        )
-
-        self.loading_logo.setGraphicsEffect(
-            glow
-        )
-
-        overlay_layout.addWidget(
-            self.loading_logo,
-            alignment=Qt.AlignCenter
-        )
-
-        # --------------------------------------------------
-        # Percentage
-        # --------------------------------------------------
-
-        self.loading_percent = QLabel(
-            "0%"
-        )
-
-        self.loading_percent.setAlignment(
-            Qt.AlignCenter
-        )
-
-        self.loading_percent.setFont(
-            QFont(
-                "Segoe UI",
-                32,
-                QFont.Bold
-            )
-        )
-
-        self.loading_percent.setStyleSheet("""
-
-        color:#6A40FF;
-
-        background:transparent;
-
-        """)
-
-        overlay_layout.addWidget(
-            self.loading_percent
-        )
-
-        # --------------------------------------------------
-        # Progress Bar
-        # --------------------------------------------------
-
-        self.loading_bar = QProgressBar()
-
-        self.loading_bar.setRange(
-            0,
-            100
-        )
-
-        self.loading_bar.setValue(0)
-
-        self.loading_bar.setFixedWidth(420)
-
-        self.loading_bar.setFixedHeight(10)
-
-        self.loading_bar.setTextVisible(False)
-
-        self.loading_bar.setStyleSheet("""
-
-        QProgressBar{
-
-            border:none;
-
-            border-radius:5px;
-
-            background:#E5E7EB;
-
-        }
-
-        QProgressBar::chunk{
-
-            border-radius:5px;
-
-            background:#7C3AED;
-
-        }
-
-        """)
-
-        overlay_layout.addWidget(
-            self.loading_bar,
-            alignment=Qt.AlignCenter
-        )
-
-        # --------------------------------------------------
-        # Status
-        # --------------------------------------------------
-
-        self.loading_status = QLabel(
-            "Starting DHEEPTHI..."
-        )
-
-        self.loading_status.setAlignment(
-            Qt.AlignCenter
-        )
-
-        self.loading_status.setFont(
-            QFont(
-                "Segoe UI",
-                14
-            )
-        )
-
-        self.loading_status.setStyleSheet("""
-
-        color:#666;
-
-        background:transparent;
-
-        """)
-
-        overlay_layout.addWidget(
-            self.loading_status
-        )
-
-        # --------------------------------------------------
-        # Overlay Opacity
-        # (Used only while closing overlay)
-        # --------------------------------------------------
-
-        self.overlay_opacity = QGraphicsOpacityEffect()
-
-        self.loading_overlay.setGraphicsEffect(
-            self.overlay_opacity
-        )
-
-        self.overlay_opacity.setOpacity(1.0)
+        # Connect overlay component references for MainWindow lifecycle
+        self.loading_logo = self.loading_overlay.loading_logo
+        self.loading_percent = self.loading_overlay.loading_percent
+        self.loading_bar = self.loading_overlay.loading_bar
+        self.loading_status = self.loading_overlay.loading_status
+        self.overlay_opacity = self.loading_overlay.overlay_opacity
 
         # --------------------------------------------------
         # Disable Mic Until Initialization Completes
@@ -2221,6 +2045,9 @@ class MainWindow(QMainWindow):
 
         self.browser_controller = BrowserController()
 
+        # Pump Qt event loop so splash animations remain fluid
+        QApplication.processEvents()
+
         # ------------------------------------------
         # Cloud Vision + OCR Engines
         # ------------------------------------------
@@ -2260,6 +2087,9 @@ class MainWindow(QMainWindow):
             print(
                 f"Cloud Vision/OCR Initialization Error : {error}"
             )
+
+        # Pump Qt event loop so splash animations remain fluid
+        QApplication.processEvents()
 
         # ------------------------------------------
         # Gemini AI
@@ -8253,8 +8083,16 @@ class MainWindow(QMainWindow):
             self.enable_main_ui()
             return
 
+        if hasattr(overlay, "enable_fade_effect"):
+            fade_target = overlay.enable_fade_effect()
+        else:
+            if getattr(self, "overlay_opacity", None) is None:
+                self.overlay_opacity = QGraphicsOpacityEffect(overlay)
+                overlay.setGraphicsEffect(self.overlay_opacity)
+            fade_target = self.overlay_opacity
+
         fade = QPropertyAnimation(
-            self.overlay_opacity,
+            fade_target,
             b"opacity"
         )
 
@@ -10321,6 +10159,11 @@ class MainWindow(QMainWindow):
             print("[LIVE LIFECYCLE] Replacement worker is authoritative")
 
         try:
+            if hasattr(self, "left_panel") and self.left_panel is not None:
+                try:
+                    self.left_panel.set_live_voice("Ready")
+                except Exception:
+                    pass
             input_enabled = not self.physical_microphone_muted
             if self.gemini_live_audio_worker is not None:
                 self.gemini_live_audio_worker.set_input_enabled(input_enabled)
@@ -11699,6 +11542,12 @@ class MainWindow(QMainWindow):
         self.gemini_live_active = False
         self.gemini_live_audio_worker = None
         self.gemini_live_session = None
+
+        if hasattr(self, "left_panel") and self.left_panel is not None:
+            try:
+                self.left_panel.set_live_voice("Not Ready")
+            except Exception:
+                pass
 
         if worker is not None:
             try:
@@ -15366,8 +15215,10 @@ class MainWindow(QMainWindow):
 
         # Chain backend creation -> InitializationWorker startup so the two
         # independent startup timers can never race each other.
+        # Allow 150ms for Qt event loop to complete first paint cycle
+        # of the splash screen before synchronous backend creation runs.
         QTimer.singleShot(
-            50,
+            150,
             self._create_backend_then_initialize
         )
 
@@ -15552,6 +15403,12 @@ class MainWindow(QMainWindow):
         self._gemini_live_pending_start = False
         self.gemini_live_command_handoff = True
         self._gemini_live_output_suppressed = True
+
+        if hasattr(self, "left_panel") and self.left_panel is not None:
+            try:
+                self.left_panel.set_live_voice("Not Ready")
+            except Exception:
+                pass
 
         if hasattr(self, "_speech_level_timer"):
             try:
