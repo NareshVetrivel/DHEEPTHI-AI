@@ -4,62 +4,12 @@ Groq Speech Recognition Module
 
 Online Speech-to-Text using Groq Whisper.
 
-ASTRA-AI / DHEEPTHI Voice Lifecycle
-------------------------------------
-
-Wake stage:
-
-    5-second recorded WAV
-            ↓
-       Groq Whisper
-            ↓
-      DHEEPTHI detected?
-       ├── NO  → next 5-second window
-       └── YES
-              ↓
-       Fresh command recording
-              ↓
-          Groq Whisper
-              ↓
-       Command Dispatcher
-
-IMPORTANT
----------
-This module DOES NOT record from the microphone.
-
-Microphone recording remains outside this module.
-
 This module is responsible for:
-
-    - Groq STT HTTP transport
+    - Groq STT HTTP transport (direct httpx multipart)
     - Audio-file transcription
-    - Wake-window transcription
-    - Fresh-command transcription
-    - DHEEPTHI wake-word detection
-    - Wake-word removal compatibility helper
-    - Error handling
-    - Transcript cleanup
-    - Cloudflare/403 handling without retry loops
-
-The local Faster-Whisper recognizer remains available
-independently for the local wake-word stage.
-
-IMPORTANT HTTP TRANSPORT NOTE
------------------------------
-The Groq Python SDK audio transcription request was
-returning Cloudflare HTTP 403 / Error 1010:
-
-    browser_signature_banned
-
-A direct httpx multipart request to the same Groq endpoint
-was tested successfully with HTTP 200.
-
-Therefore this module intentionally uses direct httpx
-multipart HTTP for audio transcription instead of the
-Groq Python SDK audio endpoint.
-
-This changes ONLY the transport layer.
-ASTRA wake-word and command logic remains unchanged.
+    - Audio bytes transcription
+    - Command transcription
+    - Error handling and transcript cleanup
 """
 
 from __future__ import annotations
@@ -190,110 +140,6 @@ class GroqRecognizer:
         "AppleWebKit/537.36 (KHTML, like Gecko) "
         "Chrome/131.0.0.0 Safari/537.36"
     )
-
-    # ==================================================
-    # DHEEPTHI Wake Words
-    # ==================================================
-
-    WAKE_WORDS = (
-        "dheepthi",
-        "deepthi",
-        "deepti",
-        "deepthee",
-        "deepthy",
-        "deeptee",
-        "dhepti",
-        "dhepthi",
-        "dheethi",
-        "dhethi",
-
-        "deep the",
-        "deep thee",
-        "deep tea",
-        "deep thi",
-        "deep tee",
-        "deep ti",
-
-        "dheep the",
-        "dheep thee",
-        "dheep tea",
-        "dheep thi",
-        "dheep tee",
-        "dheep ti",
-
-        "beep the",
-        "weep the",
-
-        "hey dheepthi",
-        "hey deepthi",
-        "hey deepti",
-        "hey deepthee",
-
-        "okay dheepthi",
-        "okay deepthi",
-        "okay deepti",
-
-        "ok dheepthi",
-        "ok deepthi",
-        "ok deepti",
-    )
-
-    # ==================================================
-    # Common Groq / Whisper Interpretations
-    # ==================================================
-
-    WAKE_PHRASE_VARIATIONS = (
-        "deeply",
-        "deep please",
-        "deep t",
-        "deep ti",
-        "deep thi",
-        "deep thee",
-        "deep tee",
-        "deep d",
-        "deep deep",
-        "deepdeep",
-        "deep deep wake up",
-        "deepdeep wake up",
-        "deep deep make up",
-        "deepdeep make up",
-    )
-
-    # ==================================================
-    # Reject Obvious Normal English
-    # ==================================================
-
-    WAKE_REJECT_PHRASES = (
-        "deep sleep",
-        "sleep deeply",
-        "deep thought",
-        "deep thoughts",
-        "deep water",
-        "deep voice",
-        "deep breath",
-        "deep breathing",
-    )
-
-    # ==================================================
-    # Fuzzy Wake Candidates
-    # ==================================================
-
-    WAKE_CANDIDATES = (
-        "dheepthi",
-        "deepthi",
-        "deepti",
-        "deepthee",
-        "deepthy",
-        "deeptee",
-        "dhepti",
-        "dhepthi",
-        "dheethi",
-        "dhethi",
-    )
-
-    WAKE_SINGLE_WORD_THRESHOLD = 0.76
-
-    WAKE_FUZZY_THRESHOLD = 0.72
 
     # ==================================================
     # Initialization
@@ -460,40 +306,6 @@ class GroqRecognizer:
 
         return text.strip()
 
-    # ======================================================
-    # Wake Text Normalization
-    # ======================================================
-
-    @staticmethod
-    def normalize_wake_text(
-        text: str | None,
-    ) -> str:
-
-        if not text:
-            return ""
-
-        text = str(
-            text
-        ).lower().strip()
-
-        text = re.sub(
-            r"[^a-z0-9\s_-]+",
-            " ",
-            text,
-        )
-
-        text = text.replace(
-            "_",
-            " ",
-        )
-
-        text = re.sub(
-            r"\s+",
-            " ",
-            text,
-        )
-
-        return text.strip()
 
     # ======================================================
     # Garbage Detection
@@ -837,63 +649,6 @@ class GroqRecognizer:
 
         return ""
 
-    # ======================================================
-    # Wake Window Transcription
-    # ======================================================
-
-    def transcribe_wake_window(
-        self,
-        audio_file: str | Path,
-    ) -> str:
-
-        print(
-            "\n========== GROQ WAKE WINDOW =========="
-        )
-
-        print(
-            "Groq STT: processing wake window..."
-        )
-
-        try:
-
-            text = self.transcribe(
-                audio_file
-            )
-
-        except GroqSTTAccessError as error:
-
-            print(
-                f"Groq Wake Access Error : {error}"
-            )
-
-            return ""
-
-        except GroqSTTRateLimitError as error:
-
-            print(
-                f"Groq Wake Rate Limit : {error}"
-            )
-
-            return ""
-
-        except GroqSTTError as error:
-
-            print(
-                f"Groq Wake STT Error : {error}"
-            )
-
-            return ""
-
-        print(
-            f"DHEEPTHI Standby Input : "
-            f"{text or '<empty>'}"
-        )
-
-        print(
-            "======================================\n"
-        )
-
-        return text
 
     # ======================================================
     # Fresh Command Transcription

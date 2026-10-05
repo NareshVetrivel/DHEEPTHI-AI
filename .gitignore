@@ -104,6 +104,8 @@ dist/
 
 tmp/
 temp/
+scratch/
+*_diagnostic.json
 
 database/astra.db-shm
 database/astra.db-wal

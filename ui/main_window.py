@@ -116,10 +116,10 @@ from ui.widgets.conversation_panel import ConversationPanel
 
 from ui.widgets.background_widget import BackgroundWidget
 from ui.widgets.mic_widget import MicWidget
+from ui.widgets.user_speech_panel import UserSpeechPanel
 from ui.widgets.file_selection_panel import FileSelectionPanel
 from ui.widgets.system_osd import SystemOSD
 
-from voice.speech_recognition import SpeechRecognizer
 from voice.text_to_speech import TextToSpeech
 from voice.streaming_tts_manager import StreamingTTSManager
 
@@ -196,20 +196,18 @@ class VoiceWorker(QThread):
     finished = Signal()
     audio_level = Signal(float)
 
-    def __init__(self, recognizer, tts, wake_word_mode=False):
+    def __init__(self, recognizer=None, tts=None):
         super().__init__()
         self.recognizer = recognizer
         self.tts = tts
-        # Kept only for backward compatibility with old callers.
-        # No wake-word runtime is started or consulted.
-        self.wake_word_mode = False
         self._stop = False
         self._command_emitted = False
         self.timed_out = False
         self.command_captured = False
 
         try:
-            self.recognizer.level_callback = self.audio_level.emit
+            if self.recognizer is not None:
+                self.recognizer.level_callback = self.audio_level.emit
         except Exception as error:
             print(f"VoiceWorker Audio Callback Error : {error}")
 
@@ -754,9 +752,11 @@ class GeminiLiveAudioWorker(QThread):
         super().__init__(parent)
         self.live_session = live_session
         self.worker_id = hex(id(self))
+        self.generation = 0
         self._stop_requested = False
         self._input_enabled = True
         self._packets_sent = 0
+        self._current_audio_level = 0.0
 
         # Diagnostics & counters for 1011 investigation
         self.captured_packets = 0
@@ -783,6 +783,7 @@ class GeminiLiveAudioWorker(QThread):
         self._output_stream = None
         self._is_speaker_playing = False
         self._active_response_id = 0
+        self._speaking_response_id = 0
         self._invalidated_response_ids = set()
         self._suppress_upcoming_response = False
         print(f"[LIVE DEBUG] worker_id={self.worker_id} worker created")
@@ -817,7 +818,7 @@ class GeminiLiveAudioWorker(QThread):
 
             self._output_stream = sd.RawOutputStream(
                 samplerate=self.OUTPUT_RATE,
-                blocksize=0,
+                blocksize=768,  # 768 samples = 32ms @ 24kHz mono (eliminates OS playback buffer lag)
                 channels=self.CHANNELS,
                 dtype=self.DTYPE,
                 callback=self._output_callback,
@@ -874,6 +875,11 @@ class GeminiLiveAudioWorker(QThread):
                         sum_sq = sum(s * s for s in samples)
                         rms = math.sqrt(sum_sq / 512.0)
                         self.valid_pcm_packets += 1
+
+                        # Realtime amplitude calculation for UserSpeechPanel waveform
+                        # Speech RMS typically ~500 to ~8000; silence < 200.
+                        raw_level = max(0.0, (rms - 120.0) / 4500.0)
+                        self._current_audio_level = min(1.0, raw_level)
                     except Exception as val_err:
                         self.dropped_packets += 1
                         print(f"[LIVE ERROR STAGE 2: PCM validation] {val_err}")
@@ -936,11 +942,13 @@ class GeminiLiveAudioWorker(QThread):
                         else:
                             resp_id, chunk = 0, item
 
-                        if resp_id in self._invalidated_response_ids or (resp_id != 0 and resp_id < self._active_response_id):
+                        if (resp_id > 0 and resp_id in self._invalidated_response_ids) or (resp_id > 0 and resp_id < self._active_response_id):
                             print(f"[LIVE] STALE AUDIO DROPPED: {resp_id}")
                             continue
 
                         self._output_buffer.extend(chunk)
+                        if resp_id > 0:
+                            self._speaking_response_id = resp_id
 
                 available = min(len(self._output_buffer), needed)
 
@@ -953,6 +961,7 @@ class GeminiLiveAudioWorker(QThread):
                     outdata[available:needed] = b"\x00" * (needed - available)
                     if available == 0 and self._output_queue.empty():
                         self._is_speaker_playing = False
+                        self._speaking_response_id = 0
 
         except Exception as error:
             print(f"[LIVE AUDIO] Output callback error: {error}")
@@ -978,6 +987,7 @@ class GeminiLiveAudioWorker(QThread):
         prev = self._input_enabled
         self._input_enabled = bool(enabled)
         if not self._input_enabled:
+            self._current_audio_level = 0.0
             self.clear_input_meter = True
             with self._input_lock:
                 self._input_byte_buffer.clear()
@@ -996,14 +1006,23 @@ class GeminiLiveAudioWorker(QThread):
     def input_enabled(self) -> bool:
         return bool(self._input_enabled)
 
+    def get_audio_level(self) -> float:
+        """Return current normalized microphone amplitude (0.0 to 1.0)."""
+        if not self._input_enabled or self._stop_requested:
+            return 0.0
+        return float(getattr(self, "_current_audio_level", 0.0))
+
     def enqueue_output(self, audio_data: bytes, response_id: int = 0):
         if self._stop_requested or not audio_data:
             return
 
+        session_id = getattr(self.live_session, "session_id", "unknown") if self.live_session else "unknown"
         with self._output_lock:
             if getattr(self, "_suppress_upcoming_response", False):
-                self._invalidated_response_ids.add(response_id)
-            if response_id in self._invalidated_response_ids or (response_id != 0 and response_id < self._active_response_id):
+                if response_id > 0:
+                    self._invalidated_response_ids.add(response_id)
+            if response_id > 0 and (response_id in self._invalidated_response_ids or response_id < self._active_response_id):
+                print(f"[LIVE STALE] session={session_id} response={response_id} action=enqueue_rejected")
                 print(f"[LIVE] STALE AUDIO DROPPED: {response_id}")
                 return
             if response_id > self._active_response_id:
@@ -1013,6 +1032,8 @@ class GeminiLiveAudioWorker(QThread):
         item = (response_id, data)
         try:
             self._output_queue.put_nowait(item)
+            q_cnt = self._output_queue.qsize()
+            print(f"[LIVE PLAYBACK] session={session_id} response={response_id} queued={q_cnt}")
         except queue.Full:
             try:
                 self._output_queue.get_nowait()
@@ -1020,19 +1041,27 @@ class GeminiLiveAudioWorker(QThread):
                 pass
             try:
                 self._output_queue.put_nowait(item)
+                q_cnt = self._output_queue.qsize()
+                print(f"[LIVE PLAYBACK] session={session_id} response={response_id} queued={q_cnt}")
             except queue.Full:
                 pass
 
     def interrupt_and_flush(self, response_id: int = 0):
         """Immediately discard buffered model audio, stop speaker, and invalidate response."""
+        t_detect = time.time()
         with self._output_lock:
-            target_id = response_id or self._active_response_id
-            if target_id:
+            target_id = response_id or self._speaking_response_id
+            if target_id > 0:
                 self._invalidated_response_ids.add(target_id)
+            if target_id > 0 and self._active_response_id <= target_id:
+                self._active_response_id = target_id + 1
+            while self._active_response_id in self._invalidated_response_ids:
+                self._active_response_id += 1
             print(f"[LIVE] STOPPING PLAYBACK")
-            print(f"[LIVE] FLUSHING PLAYBACK QUEUE")
+            print(f"[LIVE] FLUSHING PLAYBACK QUEUE (target_id={target_id})")
             self._output_buffer.clear()
             self._is_speaker_playing = False
+            self._speaking_response_id = 0
 
             while True:
                 try:
@@ -1041,14 +1070,21 @@ class GeminiLiveAudioWorker(QThread):
                     break
 
             print(f"[LIVE] PLAYBACK QUEUE CLEARED")
+            t_stop = time.time()
+            lat_ms = (t_stop - t_detect) * 1000.0
+            print(f"[LIVE INTERRUPT] response={target_id} detected_ms={t_detect*1000:.1f} playback_stop_ms={t_stop*1000:.1f} stop_latency_ms={lat_ms:.2f}")
 
     def suppress_active_and_next_response(self):
         """Immediately discard buffered model audio, stop speaker, and invalidate upcoming response."""
         with self._output_lock:
             self._suppress_upcoming_response = True
             target_id = self._active_response_id
-            self._invalidated_response_ids.add(target_id)
-            self._invalidated_response_ids.add(target_id + 1)
+            if target_id > 0:
+                self._invalidated_response_ids.add(target_id)
+            if self._active_response_id <= target_id:
+                self._active_response_id = target_id + 1
+            while self._active_response_id in self._invalidated_response_ids:
+                self._active_response_id += 1
             self.interrupt_and_flush(target_id)
         if self.live_session is not None:
             try:
@@ -1057,23 +1093,38 @@ class GeminiLiveAudioWorker(QThread):
                 pass
 
     def reset_suppression(self):
-        """Clear output suppression and invalidated response IDs for future turns."""
+        """Clear output suppression for future turns without un-invalidating past responses."""
         with self._output_lock:
             self._suppress_upcoming_response = False
-            self._invalidated_response_ids.clear()
             print(f"[LIVE] Suppression state reset on worker {self.worker_id}")
 
+    def set_active_response_id(self, resp_id: int):
+        """Set the active response ID and ensure it is not an invalidated response."""
+        with self._output_lock:
+            target = int(resp_id)
+            self._invalidated_response_ids.discard(target)
+            self._active_response_id = max(self._active_response_id, target)
+            self._suppress_upcoming_response = False
+
     def clear_output(self):
-        """Immediately discard buffered model audio for barge-in."""
-        self.interrupt_and_flush(self._active_response_id)
+        """Immediately discard buffered model audio for barge-in without invalidating response IDs."""
+        with self._output_lock:
+            self._output_buffer.clear()
+            self._is_speaker_playing = False
+            self._speaking_response_id = 0
+            while True:
+                try:
+                    self._output_queue.get_nowait()
+                except queue.Empty:
+                    break
 
     def stop_playback(self):
-        """Immediately stop speaker and flush output queue."""
-        self.interrupt_and_flush(self._active_response_id)
+        """Immediately stop speaker and flush output queue without invalidating response IDs."""
+        self.clear_output()
 
     def clear_pending_audio(self):
-        """Alias for clearing pending model audio queue."""
-        self.interrupt_and_flush(self._active_response_id)
+        """Alias for clearing pending model audio queue without invalidating response IDs."""
+        self.clear_output()
 
     def stop(self):
         self._stop_requested = True
@@ -1090,6 +1141,7 @@ class GeminiLiveAudioWorker(QThread):
         # _stop_requested and cleanly exits the `with stream:` context managers.
 
     def _close_streams(self):
+        self._current_audio_level = 0.0
         for stream_name in ("_input_stream", "_output_stream"):
             stream = getattr(self, stream_name, None)
             if stream is None:
@@ -1132,6 +1184,14 @@ class MainWindow(QMainWindow):
 
         self._closing = False
         self.shutdown_started = False
+        self.gemini_live_audio_worker = None
+        self.gemini_live_session = None
+        self.gemini_live_active = False
+        self.gemini_live_command_handoff = False
+        self.gemini_live_mic_enabled = False
+        self.gemini_live_output_transcript = ""
+        self.gemini_live_user_transcript = ""
+        self.gemini_live_last_command = ""
 
         # ----------------------------------
         # Graceful Okii, byee! See youu soon 🫶 Shutdown
@@ -1169,8 +1229,6 @@ class MainWindow(QMainWindow):
         # ----------------------------------
         # Backend
         # ----------------------------------
-
-        self.recognizer = None
 
         self.tts = None
 
@@ -1309,12 +1367,19 @@ class MainWindow(QMainWindow):
         # ----------------------------------
         # Physical Laptop Microphone Mute
         # ----------------------------------
-        # These attributes must exist before the monitor is created below.
-        # The monitor itself is created during MainWindow construction and
-        # started later after the startup greeting.
         self.physical_microphone_muted = False
         self.microphone_mute_monitor = None
         self._physical_microphone_monitor_started = False
+        self.gemini_live_session = None
+        self.gemini_live_audio_worker = None
+        self.gemini_live_active = False
+        self._gemini_live_pending_start = False
+        self.gemini_live_command_handoff = False
+        self._gemini_live_output_suppressed = False
+        self._live_generation = 0
+        self._goaway_replacement_in_progress = False
+        self._live_recovery_timer = None
+        self._live_reconnect_attempts = 0
 
         # Prevent duplicate command/voice transitions.
         self.processing_voice = False
@@ -1682,22 +1747,23 @@ class MainWindow(QMainWindow):
         )
 
         # --------------------------------------------------
-        # Microphone
+        # Center User Speech Panel (Replaces Old Center Microphone)
         # --------------------------------------------------
 
-        self.mic_widget = MicWidget()
+        self.user_speech_panel = UserSpeechPanel(parent=self.center_container)
+        self.mic_widget = self.user_speech_panel
 
         self.center_layout.addWidget(
-            self.mic_widget,
+            self.user_speech_panel,
             alignment=Qt.AlignBottom | Qt.AlignHCenter
         )
 
-        # The microphone must remain visually in front of the
+        # The speech panel must remain visually in front of the
         # avatar layer whenever their paint areas overlap.
-        self.mic_widget.raise_()
+        self.user_speech_panel.raise_()
 
         self.center_layout.addSpacing(
-            12
+            16
         )
 
         self.body_layout.addWidget(
@@ -1780,13 +1846,15 @@ class MainWindow(QMainWindow):
 
         self.conversation_label = QLabel()
 
-        self.microphone_button = self.mic_widget.button()
+        # Old center microphone button is removed from the dashboard presentation.
+        # self.microphone_button retains a dummy hidden reference for compatibility.
+        self.microphone_button = self.user_speech_panel.button()
 
-        self.microphone_button.clicked.connect(
-
-            self.start_listening
-
-        )
+        # Realtime audio amplitude polling timer (30ms / ~33 FPS) to animate speech waveform
+        self._speech_level_timer = QTimer(self)
+        self._speech_level_timer.setInterval(30)
+        self._speech_level_timer.timeout.connect(self._poll_live_audio_level)
+        self._speech_level_timer.start()
 
         # --------------------------------------------------
         # Loading Overlay
@@ -2073,15 +2141,6 @@ class MainWindow(QMainWindow):
                 "Set GROQ_API_KEY in the project .env file."
             )
 
-        # ------------------------------------------
-        # Speech Recognition
-        # ------------------------------------------
-
-        # In the normal Gemini Live runtime, local Faster-Whisper wake-word
-        # detection is NOT initialized on startup so it never competes for
-        # or consumes the physical microphone.
-        self.recognizer = None
-
         print("Realtime microphone : Gemini Live (persistent)")
 
         # ------------------------------------------
@@ -2112,6 +2171,10 @@ class MainWindow(QMainWindow):
         self.gemini_live_last_command = ""
         self.gemini_live_user_transcript = ""
         self.gemini_live_output_transcript = ""
+        self._live_generation = 0
+        self._goaway_replacement_in_progress = False
+        self._live_recovery_timer = None
+        self._live_reconnect_attempts = 0
         # ------------------------------------------
         # NLP
         # ------------------------------------------
@@ -2153,7 +2216,7 @@ class MainWindow(QMainWindow):
         self.folder_manager = FolderManager()
 
         self.file_manager = FileManager(
-            whisper=self.recognizer
+            whisper=None
         )
 
         self.browser_controller = BrowserController()
@@ -2244,7 +2307,7 @@ class MainWindow(QMainWindow):
 
             browser_controller=self.browser_controller,
 
-            whisper=self.recognizer,
+            whisper=None,
 
             gemini_client=self.gemini
 
@@ -7575,7 +7638,11 @@ class MainWindow(QMainWindow):
             # Instead use the real microphone button.
             # --------------------------------------------------
 
-            mic_top_left = mic_button.mapTo(
+            anchor_widget = getattr(self, "user_speech_panel", None)
+            if anchor_widget is None or not anchor_widget.isVisible():
+                anchor_widget = mic_button
+
+            mic_top_left = anchor_widget.mapTo(
                 center,
                 QPoint(0, 0)
             )
@@ -7584,7 +7651,7 @@ class MainWindow(QMainWindow):
 
             mic_y = mic_top_left.y()
 
-            mic_width = mic_button.width()
+            mic_width = anchor_widget.width()
 
             # --------------------------------------------------
             # Center panel relative to ACTUAL microphone.
@@ -7995,9 +8062,7 @@ class MainWindow(QMainWindow):
             "Starting DHEEPTHI-AI..."
         )
 
-        self.worker = InitializationWorker(
-            recognizer=self.recognizer
-        )
+        self.worker = InitializationWorker()
 
         self.worker.status_changed.connect(
             self.update_initialization_status
@@ -9863,7 +9928,7 @@ class MainWindow(QMainWindow):
         enabled = bool(enabled) and not self.physical_microphone_muted
         self.gemini_live_mic_enabled = enabled
 
-        worker = self.gemini_live_audio_worker
+        worker = getattr(self, "gemini_live_audio_worker", None)
         if worker is not None:
             try:
                 worker.set_input_enabled(enabled)
@@ -9876,7 +9941,7 @@ class MainWindow(QMainWindow):
             # Also discard/suppress already-generated speaker audio so the
             # UI remains genuinely idle while the hardware key is muted.
             self._gemini_live_output_suppressed = True
-            session = self.gemini_live_session
+            session = getattr(self, "gemini_live_session", None)
             if session is not None:
                 try:
                     session.clear_pending_audio()
@@ -9900,6 +9965,8 @@ class MainWindow(QMainWindow):
                 self._set_thinking_state("Inactive")
                 self._set_avatar_state("idle")
                 self.mic_widget.update_audio_level(0.0)
+                if hasattr(self, "user_speech_panel"):
+                    self.user_speech_panel.set_state("muted")
             except Exception:
                 pass
 
@@ -9955,6 +10022,8 @@ class MainWindow(QMainWindow):
                 self.left_panel.set_speaking("Silent")
                 self._set_thinking_state("Inactive")
                 self._set_avatar_state("listening")
+                if hasattr(self, "user_speech_panel"):
+                    self.user_speech_panel.set_state("listening")
             except Exception:
                 pass
 
@@ -10155,12 +10224,20 @@ class MainWindow(QMainWindow):
             print(f"[LIVE] Continuous input watchdog error: {error}")
 
     def _start_gemini_live_conversation(self):
-        if getattr(self, "shutdown_started", False) or self._closing:
+        if getattr(self, "shutdown_started", False) or getattr(self, "_closing", False):
             print("[LIVE LIFECYCLE] Reconnect suppressed because shutdown_started=True")
             return
 
         if not self._gemini_live_pending_start:
             return
+
+        # Cancel any pending recovery timer
+        if getattr(self, "_live_recovery_timer", None) is not None:
+            try:
+                self._live_recovery_timer.stop()
+            except Exception:
+                pass
+            self._live_recovery_timer = None
 
         self._gemini_live_pending_start = False
         self.gemini_live_mic_enabled = not self.physical_microphone_muted
@@ -10174,29 +10251,36 @@ class MainWindow(QMainWindow):
         self._stop_gemini_live_conversation(clear_audio=True, restart_live=False)
 
         try:
+            self._live_generation += 1
+            gen = self._live_generation
+            print(f"[LIVE SESSION] generation={gen} state=starting")
+
             session = self.gemini.create_live_session(
-                on_connected=self._on_gemini_live_connected,
-                on_audio=self._on_gemini_live_audio,
-                on_input_transcript=self._on_gemini_live_input_transcript,
-                on_output_transcript=self._on_gemini_live_output_transcript,
-                on_interrupted=self._on_gemini_live_interrupted,
-                on_turn_complete=self._on_gemini_live_turn_complete,
-                on_error=self._on_gemini_live_error,
-                on_closed=self._on_gemini_live_closed,
-                on_go_away=self._on_gemini_live_go_away,
+                voice=getattr(settings, "GEMINI_LIVE_VOICE", "Aoede"),
+                on_connected=lambda: self._on_gemini_live_connected(gen),
+                on_audio=lambda data, resp_id=0: self._on_gemini_live_audio(data, resp_id, gen),
+                on_input_transcript=lambda text: self._on_gemini_live_input_transcript(text, gen),
+                on_output_transcript=lambda text, resp_id=0: self._on_gemini_live_output_transcript(text, resp_id, gen),
+                on_interrupted=lambda resp_id=0: self._on_gemini_live_interrupted(resp_id, gen),
+                on_turn_complete=lambda u, a: self._on_gemini_live_turn_complete(u, a, gen),
+                on_error=lambda err: self._on_gemini_live_error(err, gen),
+                on_closed=lambda: self._on_gemini_live_closed(gen),
+                on_go_away=lambda tl="": self._on_gemini_live_go_away(tl, gen),
                 auto_start=False,
             )
 
             if session is None:
                 raise RuntimeError("Gemini Live session could not be created.")
 
+            session.generation = gen
             self.gemini_live_session = session
             self.gemini_live_active = True
 
             worker = GeminiLiveAudioWorker(session, self)
-            worker.connected.connect(self._on_gemini_live_audio_worker_connected)
-            worker.failed.connect(self._on_gemini_live_audio_worker_failed)
-            worker.finished_audio.connect(self._on_gemini_live_audio_worker_finished)
+            worker.generation = gen
+            worker.connected.connect(lambda w=worker: self._on_gemini_live_audio_worker_connected(w))
+            worker.failed.connect(lambda msg, w=worker: self._on_gemini_live_audio_worker_failed(msg, w))
+            worker.finished_audio.connect(lambda w=worker: self._on_gemini_live_audio_worker_finished(w))
             self.gemini_live_audio_worker = worker
             worker.start()
             self._start_gemini_live_input_watchdog()
@@ -10209,14 +10293,33 @@ class MainWindow(QMainWindow):
 
         except Exception as error:
             print(f"[LIVE] Start error: {error}")
+            self._goaway_replacement_in_progress = False
             self._handle_gemini_live_error(str(error))
 
-    def _on_gemini_live_audio_worker_connected(self):
-        if getattr(self, "shutdown_started", False) or self._closing or not self.gemini_live_active:
-            if getattr(self, "shutdown_started", False) or self._closing:
+    def _on_gemini_live_audio_worker_connected(self, worker=None):
+        if getattr(self, "shutdown_started", False) or getattr(self, "_closing", False) or not self.gemini_live_active:
+            if getattr(self, "shutdown_started", False) or getattr(self, "_closing", False):
                 print("[LIVE LIFECYCLE] Reconnect suppressed because shutdown_started=True")
             return
-        print("[LIVE LIFECYCLE] Replacement Live session connected")
+        if worker is not None and worker is not self.gemini_live_audio_worker:
+            print("[LIVE LIFECYCLE] Ignoring stale worker callback")
+            return
+        if worker is not None and hasattr(worker, "generation") and worker.generation != self._live_generation:
+            print("[LIVE LIFECYCLE] Ignoring stale worker callback")
+            return
+
+        self._cancel_live_recovery_timer()
+        self._live_reconnect_attempts = 0
+        gen = getattr(worker, "generation", self._live_generation)
+        print(f"[LIVE SESSION] generation={gen} state=connected")
+        if getattr(self, "_goaway_replacement_in_progress", False):
+            print("[LIVE LIFECYCLE] Replacement Live session connected")
+            print("[LIVE LIFECYCLE] Replacement worker is authoritative")
+            self._goaway_replacement_in_progress = False
+            print("[LIVE LIFECYCLE] Replacement complete")
+        else:
+            print("[LIVE LIFECYCLE] Replacement worker is authoritative")
+
         try:
             input_enabled = not self.physical_microphone_muted
             if self.gemini_live_audio_worker is not None:
@@ -10233,22 +10336,44 @@ class MainWindow(QMainWindow):
                 self.left_panel.set_listening("Listening")
                 self.left_panel.set_speaking("Silent")
                 self._set_thinking_state("Inactive")
+                self.mic_widget.show_listening()
+                self.mic_widget.set_listening(True)
+                if hasattr(self, "user_speech_panel"):
+                    self.user_speech_panel.set_state("listening")
             else:
                 self.status_label.setText("Status : Microphone Muted")
                 self._set_avatar_state("idle")
                 self.left_panel.set_listening("Mic Muted")
                 self.left_panel.set_speaking("Silent")
                 self._set_thinking_state("Inactive")
+                self.microphone_button.setEnabled(False)
+                self.mic_widget.setEnabled(True)
                 self.mic_widget.set_listening(False)
+                if hasattr(self, "user_speech_panel"):
+                    self.user_speech_panel.set_state("muted")
         except Exception:
             pass
 
-    def _on_gemini_live_audio_worker_failed(self, message):
-        if not self._closing:
-            self.gemini_live_error_signal.emit(str(message or "Gemini Live audio failed."))
+    def _on_gemini_live_audio_worker_failed(self, message, worker=None):
+        if getattr(self, "_closing", False) or getattr(self, "shutdown_started", False):
+            return
+        if worker is not None and worker is not self.gemini_live_audio_worker:
+            print("[LIVE LIFECYCLE] Ignoring stale worker callback")
+            return
+        if worker is not None and hasattr(worker, "generation") and worker.generation != self._live_generation:
+            print("[LIVE LIFECYCLE] Ignoring stale worker callback")
+            return
+        self._goaway_replacement_in_progress = False
+        self.gemini_live_error_signal.emit(str(message or "Gemini Live audio failed."))
 
-    def _on_gemini_live_audio_worker_finished(self):
-        if self._closing:
+    def _on_gemini_live_audio_worker_finished(self, worker=None):
+        if getattr(self, "_closing", False) or getattr(self, "shutdown_started", False):
+            return
+        if worker is not None and worker is not self.gemini_live_audio_worker:
+            print("[LIVE LIFECYCLE] Ignoring stale worker callback")
+            return
+        if worker is not None and hasattr(worker, "generation") and worker.generation != self._live_generation:
+            print("[LIVE LIFECYCLE] Ignoring stale worker callback")
             return
         print("[LIVE] Audio bridge finished.")
         # Do not tear down a healthy Live session merely because the Qt audio
@@ -10258,13 +10383,29 @@ class MainWindow(QMainWindow):
     INTERRUPTION_PHRASES = {
         "stop",
         "wait",
+        "wait wait",
+        "wait pannu",
+        "wait pannuda",
+        "wait pannunga",
+        "wait pa",
+        "iru",
+        "irunga",
+        "konjam iru",
+        "konjam irunga",
+        "one minute",
+        "one min",
+        "oru nimisham",
+        "oru nimisham iru",
+        "oru minute",
+        "hold on",
         "pothum",
         "podhum",
         "enough",
         "stop talking",
         "pesadha",
+        "pesatha",
         "pesama iru",
-        "wait wait",
+        "pesama irunga",
         "niruthu",
         "niruthunga",
         "shut up",
@@ -10278,11 +10419,19 @@ class MainWindow(QMainWindow):
         if not text:
             return False
         clean = re.sub(r"[^\w\s]", "", text.strip().lower()).strip()
+        if not clean:
+            return False
         if clean in cls.INTERRUPTION_PHRASES:
             return True
         words = clean.split()
         if words and all(w in cls.INTERRUPTION_PHRASES for w in words):
             return True
+        # Check prefix/short phrase matching (e.g., "dheepthi wait", "hey wait pannu", "stop please")
+        if len(words) <= 4:
+            trimmed = re.sub(r"^(?:hey|hi|hello|dheepthi|deepti|deepthi)\s+", "", clean).strip()
+            trimmed = re.sub(r"\s+(?:please|pa|da|ma)$", "", trimmed).strip()
+            if trimmed in cls.INTERRUPTION_PHRASES:
+                return True
         return False
 
     def _is_semantic_command_candidate(self, text: str) -> bool:
@@ -10371,14 +10520,22 @@ class MainWindow(QMainWindow):
 
         return False
 
-    def _on_gemini_live_connected(self):
+    def _on_gemini_live_connected(self, gen=None):
         if getattr(self, "shutdown_started", False) or getattr(self, "_closing", False):
+            return
+        if gen is not None and gen != self._live_generation:
+            print("[LIVE LIFECYCLE] Ignoring stale worker callback")
             return
         print("[LIVE] Gemini Live API connected.")
 
-    def _on_gemini_live_audio(self, audio_data, response_id=0):
+    def _on_gemini_live_audio(self, audio_data, response_id=0, gen=None):
         try:
             if getattr(self, "shutdown_started", False) or getattr(self, "_closing", False):
+                print("[LIVE TURN] Blocked because shutdown_started=True")
+                return
+            if gen is not None and gen != self._live_generation:
+                print(f"[LIVE STALE] session=gen{gen} response={response_id} action=callback_rejected_stale_generation")
+                print("[LIVE TURN] Ignoring stale response callback")
                 return
             session = self.gemini_live_session
             worker = self.gemini_live_audio_worker
@@ -10387,9 +10544,12 @@ class MainWindow(QMainWindow):
                 getattr(self, "_gemini_live_output_suppressed", False)
                 or getattr(self, "gemini_live_command_handoff", False)
                 or getattr(self, "processing_voice", False)
-                or (session and response_id in getattr(session, "_invalidated_response_ids", set()))
-                or (worker and response_id in getattr(worker, "_invalidated_response_ids", set()))
+                or (session and response_id > 0 and response_id in getattr(session, "_invalidated_response_ids", set()))
+                or (worker and response_id > 0 and response_id in getattr(worker, "_invalidated_response_ids", set()))
+                or (worker and response_id > 0 and response_id < getattr(worker, "_active_response_id", 0))
             ):
+                print(f"[LIVE STALE] session=gen{gen} response={response_id} action=callback_rejected_suppressed")
+                print("[LIVE TURN] Ignoring stale response callback")
                 return
 
             now = time.time()
@@ -10404,9 +10564,11 @@ class MainWindow(QMainWindow):
             print(f"[CRITICAL LIVE ERROR] In _on_gemini_live_audio: {error}")
             print(f"[CRITICAL LIVE TRACEBACK]\n{traceback.format_exc()}")
 
-    def _on_gemini_live_input_transcript(self, text):
+    def _on_gemini_live_input_transcript(self, text, gen=None):
         try:
             if getattr(self, "shutdown_started", False) or getattr(self, "_closing", False):
+                return
+            if gen is not None and gen != self._live_generation:
                 return
             now = time.time()
             text_str = str(text or "").strip()
@@ -10420,7 +10582,7 @@ class MainWindow(QMainWindow):
             session = self.gemini_live_session
 
             # BARGE-IN INTERRUPTION CHECK:
-            # If user speaks an interruption phrase while model is speaking or audio is playing:
+            # If user speaks an interruption phrase or speaks while model is speaking:
             is_interrupt = self._is_interruption_phrase(text_str)
             is_speaking = False
             if worker and worker.is_output_playing():
@@ -10428,14 +10590,33 @@ class MainWindow(QMainWindow):
             if session and getattr(session, "_is_model_speaking", False):
                 is_speaking = True
 
-            if is_interrupt and is_speaking:
+            if is_interrupt:
+                t_detect = time.time()
                 print(f"[LIVE] USER INTERRUPTION DETECTED VIA VOICE COMMAND: '{text_str}'")
+                interrupted_id = 0
                 if session is not None:
-                    session.interrupt_current_response()
-                elif worker is not None:
-                    worker.interrupt_and_flush()
+                    interrupted_id = session.interrupt_current_response()
+                if worker is not None:
+                    worker.interrupt_and_flush(response_id=interrupted_id)
+                t_stop = time.time()
+                lat_ms = (t_stop - t_detect) * 1000.0
+                print(f"[LIVE INTERRUPT] response={interrupted_id} detected_ms={t_detect*1000:.1f} playback_stop_ms={t_stop*1000:.1f} stop_latency_ms={lat_ms:.2f}")
                 self.gemini_live_interrupted_signal.emit()
+                self.gemini_live_input_signal.emit(text_str)
                 return
+
+            if is_speaking:
+                t_detect = time.time()
+                print(f"[LIVE] BARGE-IN DETECTED: User spoke '{text_str}' while model was speaking")
+                interrupted_id = 0
+                if session is not None:
+                    interrupted_id = session.interrupt_current_response()
+                if worker is not None:
+                    worker.interrupt_and_flush(response_id=interrupted_id)
+                t_stop = time.time()
+                lat_ms = (t_stop - t_detect) * 1000.0
+                print(f"[LIVE INTERRUPT] response={interrupted_id} detected_ms={t_detect*1000:.1f} playback_stop_ms={t_stop*1000:.1f} stop_latency_ms={lat_ms:.2f}")
+                self.gemini_live_interrupted_signal.emit()
 
             # FAST LOCAL DETERMINISTIC COMMAND SUPPRESSION:
             # Only exact single English commands (e.g., "Open Chrome", "Close Notepad")
@@ -10477,9 +10658,14 @@ class MainWindow(QMainWindow):
             print(f"[CRITICAL LIVE ERROR] In _on_gemini_live_input_transcript: {error}")
             print(f"[CRITICAL LIVE TRACEBACK]\n{traceback.format_exc()}")
 
-    def _on_gemini_live_output_transcript(self, text, response_id=0):
+    def _on_gemini_live_output_transcript(self, text, response_id=0, gen=None):
         try:
             if getattr(self, "shutdown_started", False) or getattr(self, "_closing", False):
+                print("[LIVE TURN] Blocked because shutdown_started=True")
+                return
+            if gen is not None and gen != self._live_generation:
+                print(f"[LIVE STALE] session=gen{gen} response={response_id} action=callback_rejected_stale_generation")
+                print("[LIVE TURN] Ignoring stale response callback")
                 return
             session = self.gemini_live_session
             worker = self.gemini_live_audio_worker
@@ -10487,9 +10673,12 @@ class MainWindow(QMainWindow):
                 getattr(self, "_gemini_live_output_suppressed", False)
                 or getattr(self, "gemini_live_command_handoff", False)
                 or getattr(self, "processing_voice", False)
-                or (session and response_id in getattr(session, "_invalidated_response_ids", set()))
-                or (worker and response_id in getattr(worker, "_invalidated_response_ids", set()))
+                or (session and response_id > 0 and response_id in getattr(session, "_invalidated_response_ids", set()))
+                or (worker and response_id > 0 and response_id in getattr(worker, "_invalidated_response_ids", set()))
+                or (worker and response_id > 0 and response_id < getattr(worker, "_active_response_id", 0))
             ):
+                print(f"[LIVE STALE] session=gen{gen} response={response_id} action=callback_rejected_suppressed")
+                print("[LIVE TURN] Ignoring stale response callback")
                 print(f"[LIVE] DROPPED SUPPRESSED OUTPUT TRANSCRIPT: '{text}' resp_id={response_id}")
                 return
 
@@ -10501,9 +10690,11 @@ class MainWindow(QMainWindow):
             print(f"[CRITICAL LIVE ERROR] In _on_gemini_live_output_transcript: {error}")
             print(f"[CRITICAL LIVE TRACEBACK]\n{traceback.format_exc()}")
 
-    def _on_gemini_live_interrupted(self, response_id=0):
+    def _on_gemini_live_interrupted(self, response_id=0, gen=None):
         try:
             if getattr(self, "shutdown_started", False) or getattr(self, "_closing", False):
+                return
+            if gen is not None and gen != self._live_generation:
                 return
             now = time.time()
             worker = self.gemini_live_audio_worker
@@ -10520,9 +10711,11 @@ class MainWindow(QMainWindow):
             print(f"[CRITICAL LIVE ERROR] In _on_gemini_live_interrupted: {error}")
             print(f"[CRITICAL LIVE TRACEBACK]\n{traceback.format_exc()}")
 
-    def _on_gemini_live_turn_complete(self, user_text, assistant_text):
+    def _on_gemini_live_turn_complete(self, user_text, assistant_text, gen=None):
         try:
             if getattr(self, "shutdown_started", False) or getattr(self, "_closing", False):
+                return
+            if gen is not None and gen != self._live_generation:
                 return
             now = time.time()
             print(f"[DIAG UI TURN_COMPLETE] t={now:.3f} user='{user_text}' assistant='{assistant_text}'")
@@ -10535,9 +10728,12 @@ class MainWindow(QMainWindow):
             print(f"[CRITICAL LIVE ERROR] In _on_gemini_live_turn_complete: {error}")
             print(f"[CRITICAL LIVE TRACEBACK]\n{traceback.format_exc()}")
 
-    def _on_gemini_live_error(self, error):
+    def _on_gemini_live_error(self, error, gen=None):
         try:
             if getattr(self, "shutdown_started", False) or getattr(self, "_closing", False):
+                return
+            if gen is not None and gen != self._live_generation:
+                print("[LIVE LIFECYCLE] Ignoring stale worker callback")
                 return
             self.gemini_live_error_signal.emit(str(error or "Gemini Live error."))
         except Exception as err:
@@ -10545,9 +10741,12 @@ class MainWindow(QMainWindow):
             print(f"[CRITICAL LIVE ERROR] In _on_gemini_live_error: {err}")
             print(f"[CRITICAL LIVE TRACEBACK]\n{traceback.format_exc()}")
 
-    def _on_gemini_live_closed(self):
+    def _on_gemini_live_closed(self, gen=None):
         try:
             if getattr(self, "shutdown_started", False) or getattr(self, "_closing", False):
+                return
+            if gen is not None and gen != self._live_generation:
+                print("[LIVE LIFECYCLE] Ignoring stale worker callback")
                 return
             self.gemini_live_closed_signal.emit()
         except Exception as err:
@@ -10555,10 +10754,13 @@ class MainWindow(QMainWindow):
             print(f"[CRITICAL LIVE ERROR] In _on_gemini_live_closed: {err}")
             print(f"[CRITICAL LIVE TRACEBACK]\n{traceback.format_exc()}")
 
-    def _on_gemini_live_go_away(self, time_left=None):
+    def _on_gemini_live_go_away(self, time_left=None, gen=None):
         try:
             if getattr(self, "shutdown_started", False) or getattr(self, "_closing", False):
-                print("[LIVE LIFECYCLE] GoAway recovery suppressed because shutdown_started=True")
+                print("[LIVE LIFECYCLE] Reconnect suppressed because shutdown_started=True")
+                return
+            if gen is not None and gen != self._live_generation:
+                print("[LIVE LIFECYCLE] Ignoring stale worker callback")
                 return
             self.gemini_live_go_away_signal.emit(str(time_left or ""))
         except Exception as err:
@@ -10566,12 +10768,28 @@ class MainWindow(QMainWindow):
             print(f"[CRITICAL LIVE ERROR] In _on_gemini_live_go_away: {err}")
             print(f"[CRITICAL LIVE TRACEBACK]\n{traceback.format_exc()}")
 
+    def _filter_user_speech_display_transcript(self, text: str) -> str:
+        """Filter transcript for visual display on UserSpeechPanel only (English, Tamil, Tanglish)."""
+        try:
+            from ui.widgets.user_speech_panel import filter_user_speech_display_transcript
+            return filter_user_speech_display_transcript(text)
+        except Exception:
+            return str(text or "")
+
     @Slot(str)
     def _handle_gemini_live_input_transcript(self, text):
         t_cmd_start = time.time()
         try:
             text = str(text or "").strip()
-            if not text or getattr(self, "shutdown_started", False) or self._closing or not self.gemini_live_active:
+            if not text:
+                return
+
+            if getattr(self, "shutdown_started", False) or getattr(self, "_closing", False):
+                print("[LIVE TURN] Blocked because shutdown_started=True")
+                return
+
+            if not self.gemini_live_active:
+                print("[LIVE TURN] Suppressed reason=live_inactive")
                 return
 
             print(f"[PERF] TRANSCRIPT_READY t={t_cmd_start:.3f} text='{text}'")
@@ -10580,11 +10798,15 @@ class MainWindow(QMainWindow):
             # Do NOT invoke SemanticCommandPlanner!
             if self._is_interruption_phrase(text):
                 print(f"[SEMANTIC] PLANNER SKIPPED: CONVERSATION (Interruption '{text}')")
+                if hasattr(self, "user_speech_panel"):
+                    display_text = self._filter_user_speech_display_transcript(text)
+                    self.user_speech_panel.set_transcript(display_text)
                 return
 
             # Gating: If a command is actively executing, ignore subsequent streaming transcript chunks
             if getattr(self, "gemini_live_command_handoff", False) or getattr(self, "processing_voice", False):
                 print(f"[LIVE] Gated transcript chunk '{text}' during active command execution.")
+                print("[LIVE TURN] Suppressed reason=command_in_progress")
                 return
 
             # Deduplicate identical consecutive transcripts
@@ -10594,7 +10816,11 @@ class MainWindow(QMainWindow):
             self.gemini_live_user_transcript = text
 
             try:
-                self.mic_widget.update_user_message(text)
+                display_text = self._filter_user_speech_display_transcript(text)
+                if hasattr(self, "user_speech_panel"):
+                    self.user_speech_panel.set_transcript(display_text)
+                elif hasattr(self, "mic_widget"):
+                    self.mic_widget.update_user_message(display_text)
             except Exception:
                 pass
 
@@ -10643,6 +10869,7 @@ class MainWindow(QMainWindow):
 
                 print(f"[PERF] ROUTING_END ROUTE=LOCAL_DETERMINISTIC INTENT={local_intent} ({t_route_end - t_route_start:.3f}s)")
                 print(f"[ROUTING] ROUTE=LOCAL_DETERMINISTIC")
+                print(f"[LIVE TURN] Suppressed reason=local_deterministic_action")
                 print(f"[SEMANTIC] Input: {text}")
                 print(f"[SEMANTIC] Language: {detected_lang}")
                 print(f"[SEMANTIC] Intent: {local_intent}")
@@ -10704,6 +10931,20 @@ class MainWindow(QMainWindow):
                 self.left_panel.set_listening("Listening")
             except Exception:
                 pass
+
+            # SUBMIT USER TURN TO ACTIVE LIVE SESSION
+            session_id = getattr(session, "session_id", "none") if session else "none"
+            print("[LIVE TURN] New user turn started")
+            print(f"[LIVE TURN] Active session={session_id}")
+
+            if session is not None and getattr(session, "_started", False) and not getattr(session, "_closing", threading.Event()).is_set():
+                new_resp_id = session.start_user_turn(text)
+                if worker is not None:
+                    worker.set_active_response_id(new_resp_id)
+                print(f"[LIVE TURN] User turn processed (audio-driven, resp_id={new_resp_id})")
+                print("[LIVE TURN] Awaiting model response")
+            else:
+                print("[LIVE TURN] Suppressed reason=no_active_session")
             return
 
 
@@ -11100,6 +11341,8 @@ class MainWindow(QMainWindow):
                 clean_display = re.sub(r"<ACTION\b[\s\S]*", "", self.gemini_live_output_transcript, flags=re.IGNORECASE).strip()
                 if clean_display:
                     self.mic_widget.update_ai_message(clean_display)
+                if hasattr(self, "user_speech_panel"):
+                    self.user_speech_panel.set_state("speaking")
                 self.status_label.setText("Status : DHEEPTHI Speaking")
                 self._set_avatar_state("speaking")
                 self.left_panel.set_speaking("Speaking")
@@ -11122,6 +11365,13 @@ class MainWindow(QMainWindow):
             print(f"[DIAG UI HANDLE INTERRUPTED] t={time.time():.3f} speaker_playing={playing} mic_enabled={self.gemini_live_mic_enabled}")
             if worker is not None:
                 worker.clear_output()
+                worker.reset_suppression()
+
+            session = self.gemini_live_session
+            if session is not None:
+                session.reset_suppression()
+
+            self._gemini_live_output_suppressed = False
 
             if not self.gemini_live_active:
                 return
@@ -11147,6 +11397,8 @@ class MainWindow(QMainWindow):
             self.microphone_button.setEnabled(True)
             self.mic_widget.setEnabled(True)
             self.mic_widget.set_listening(True)
+            if hasattr(self, "user_speech_panel"):
+                self.user_speech_panel.set_state("listening")
             print("[LIVE] LISTENING READY")
         except Exception as error:
             import traceback
@@ -11247,6 +11499,8 @@ class MainWindow(QMainWindow):
                     self.microphone_button.setEnabled(True)
                     self.mic_widget.setEnabled(True)
                     self.mic_widget.set_listening(True)
+                    if hasattr(self, "user_speech_panel"):
+                        self.user_speech_panel.set_state("listening")
                     print("[LIVE] LISTENING READY")
                 except Exception:
                     pass
@@ -11263,11 +11517,76 @@ class MainWindow(QMainWindow):
             except Exception:
                 pass
 
+    def _cancel_live_recovery_timer(self):
+        """Cancel and clean up any pending Live recovery timer."""
+        timer = getattr(self, "_live_recovery_timer", None)
+        if timer is not None:
+            try:
+                timer.stop()
+                timer.deleteLater()
+            except Exception:
+                pass
+            self._live_recovery_timer = None
+        self._recovery_timer_pending = False
+
+    def _schedule_live_recovery_timer(self):
+        """Schedule controlled retry with exponential backoff and max attempts."""
+        if getattr(self, "shutdown_started", False) or getattr(self, "_closing", False):
+            print("[LIVE LIFECYCLE] Reconnect suppressed because shutdown_started=True")
+            return
+        if getattr(self, "_goaway_replacement_in_progress", False):
+            print("[LIVE LIFECYCLE] Reconnect timer suppressed: GoAway replacement in progress")
+            return
+        if getattr(self, "_recovery_timer_pending", False) or getattr(self, "_live_recovery_timer", None) is not None:
+            print("[LIVE LIFECYCLE] Recovery timer already pending, ignoring duplicate request")
+            return
+
+        max_attempts = 5
+        if self._live_reconnect_attempts >= max_attempts:
+            print(f"[LIVE LIFECYCLE] Max recovery attempts ({max_attempts}) reached. Stopping reconnect loop.")
+            try:
+                self.mic_widget.update_ai_message("Gemini Live connection could not be restored. Please check your network.")
+                self._set_avatar_state("error")
+                self.status_label.setText("Status : Connection Failed")
+            except Exception:
+                pass
+            return
+
+        self._live_reconnect_attempts += 1
+        delays = [1500, 3000, 5000, 8000, 10000]
+        delay_ms = delays[min(self._live_reconnect_attempts - 1, len(delays) - 1)]
+
+        self._recovery_timer_pending = True
+        print(f"[LIVE DEBUG] Recovery timer scheduled ({delay_ms}ms, attempt {self._live_reconnect_attempts}/{max_attempts})...")
+
+        timer = QTimer(self)
+        timer.setSingleShot(True)
+
+        def _on_timeout():
+            self._live_recovery_timer = None
+            self._recovery_timer_pending = False
+            if getattr(self, "shutdown_started", False) or getattr(self, "_closing", False):
+                print("[LIVE LIFECYCLE] Reconnect suppressed because shutdown_started=True")
+                return
+            if getattr(self, "_goaway_replacement_in_progress", False):
+                print("[LIVE LIFECYCLE] Reconnect suppressed: GoAway replacement in progress")
+                return
+            self._gemini_live_pending_start = True
+            self._start_gemini_live_conversation()
+
+        timer.timeout.connect(_on_timeout)
+        self._live_recovery_timer = timer
+        timer.start(delay_ms)
+
     @Slot(str)
     def _handle_gemini_live_error(self, message):
         try:
             if getattr(self, "shutdown_started", False) or self._closing:
                 print("[LIVE LIFECYCLE] Reconnect suppressed because shutdown_started=True")
+                return
+
+            if getattr(self, "_goaway_replacement_in_progress", False):
+                print("[LIVE LIFECYCLE] Live error ignored: GoAway replacement in progress")
                 return
 
             print(f"[LIVE] Gemini Live error: {message}")
@@ -11299,9 +11618,7 @@ class MainWindow(QMainWindow):
                     self.gemini.rotate_api_key()
 
             if not self.physical_microphone_muted:
-                self._gemini_live_pending_start = True
-                print("[LIVE DEBUG] Recovery timer scheduled (1200ms)...")
-                QTimer.singleShot(1200, self._start_gemini_live_conversation)
+                self._schedule_live_recovery_timer()
         except Exception as error:
             import traceback
             print(f"[CRITICAL LIVE ERROR] In _handle_gemini_live_error: {error}")
@@ -11313,6 +11630,11 @@ class MainWindow(QMainWindow):
             if getattr(self, "shutdown_started", False) or self._closing:
                 print("[LIVE LIFECYCLE] Reconnect suppressed because shutdown_started=True")
                 return
+
+            if getattr(self, "_goaway_replacement_in_progress", False):
+                print("[LIVE LIFECYCLE] Live closed ignored: GoAway replacement in progress")
+                return
+
             if not self.gemini_live_command_handoff:
                 print("[LIVE] Gemini Live session closed.")
         except Exception as error:
@@ -11329,25 +11651,38 @@ class MainWindow(QMainWindow):
             print("[LIVE LIFECYCLE] Reconnect suppressed because shutdown_started=True")
             return
 
+        if getattr(self, "_goaway_replacement_in_progress", False):
+            return
+
         if not self._closing:
             self._gemini_live_output_suppressed = False
-            self._gemini_live_pending_start = True
-            print("[LIVE DEBUG] Recovery timer scheduled (1200ms)...")
-            QTimer.singleShot(1200, self._start_gemini_live_conversation)
+            self._schedule_live_recovery_timer()
 
     @Slot(str)
     def _handle_gemini_live_go_away(self, time_left=""):
         if getattr(self, "shutdown_started", False) or self._closing:
-            print("[LIVE LIFECYCLE] GoAway recovery suppressed because shutdown_started=True")
+            print("[LIVE LIFECYCLE] Reconnect suppressed because shutdown_started=True")
+            return
+
+        if getattr(self, "_goaway_replacement_in_progress", False):
+            print("[LIVE LIFECYCLE] Replacement already in progress")
             return
 
         print(f"[LIVE LIFECYCLE] GoAway detected (time_left={time_left})")
-        print("[LIVE LIFECYCLE] Closing old Live session")
+        print(f"[LIVE SESSION] generation={self._live_generation} state=replacing")
+        print("[LIVE LIFECYCLE] Starting controlled replacement")
+        self._goaway_replacement_in_progress = True
+
+        # Prevent recovery timers from racing
+        self._cancel_live_recovery_timer()
+
+        print("[LIVE LIFECYCLE] Waiting for old worker/session to stop")
         self._stop_gemini_live_conversation(clear_audio=True, restart_live=False)
-        print("[LIVE LIFECYCLE] Old worker stopped")
+        print("[LIVE LIFECYCLE] Old worker/session fully stopped")
 
         if getattr(self, "shutdown_started", False) or self._closing:
-            print("[LIVE LIFECYCLE] GoAway recovery suppressed because shutdown_started=True")
+            print("[LIVE LIFECYCLE] Reconnect suppressed because shutdown_started=True")
+            self._goaway_replacement_in_progress = False
             return
 
         print("[LIVE LIFECYCLE] Starting replacement Live session")
@@ -11357,25 +11692,22 @@ class MainWindow(QMainWindow):
     def _stop_gemini_live_conversation(self, clear_audio=True, restart_live=False):
         """Stop the current Live session; restart_live is kept for compatibility and ignored."""
         self._stop_gemini_live_input_watchdog()
+        self._live_generation += 1
+        print(f"[LIVE SESSION] generation={self._live_generation} state=stopped")
         worker = self.gemini_live_audio_worker
         session = self.gemini_live_session
         self.gemini_live_active = False
+        self.gemini_live_audio_worker = None
+        self.gemini_live_session = None
 
         if worker is not None:
             try:
                 # Disconnect signals to prevent stale callbacks from reaching MainWindow
-                try:
-                    worker.connected.disconnect()
-                except Exception:
-                    pass
-                try:
-                    worker.failed.disconnect()
-                except Exception:
-                    pass
-                try:
-                    worker.finished_audio.disconnect()
-                except Exception:
-                    pass
+                for sig in (worker.connected, worker.failed, worker.finished_audio):
+                    try:
+                        sig.disconnect()
+                    except Exception:
+                        pass
 
                 if clear_audio:
                     worker.clear_output()
@@ -11384,8 +11716,6 @@ class MainWindow(QMainWindow):
                     worker.wait(3000)
             except Exception as error:
                 print(f"[LIVE] Audio worker stop error: {error}")
-
-        self.gemini_live_audio_worker = None
 
         if session is not None:
             try:
@@ -11397,6 +11727,7 @@ class MainWindow(QMainWindow):
                 session.on_turn_complete = None
                 session.on_error = None
                 session.on_closed = None
+                session.on_go_away = None
                 session.stop(timeout=3.0)
             except Exception as error:
                 print(f"[LIVE] Session stop error: {error}")
@@ -11406,8 +11737,6 @@ class MainWindow(QMainWindow):
                 self.gemini.close_live_session()
         except Exception as error:
             print(f"[LIVE] Gemini client Live cleanup error: {error}")
-
-        self.gemini_live_session = None
 
     def _restart_gemini_live_after_command(self):
         """
@@ -11495,10 +11824,26 @@ class MainWindow(QMainWindow):
             self.mic_widget.update_audio_level(
                 level
             )
+            if hasattr(self, "user_speech_panel"):
+                self.user_speech_panel.update_audio_level(level)
 
         except Exception:
 
             pass
+
+    def _poll_live_audio_level(self):
+        """Thread-safe UI poll for Gemini Live microphone PCM audio level."""
+        if getattr(self, "_closing", False) or getattr(self, "shutdown_started", False):
+            return
+        worker = getattr(self, "gemini_live_audio_worker", None)
+        panel = getattr(self, "user_speech_panel", None)
+        if panel is None:
+            return
+        if worker is not None and getattr(worker, "_input_enabled", False):
+            level = worker.get_audio_level()
+            panel.update_audio_level(level)
+        else:
+            panel.update_audio_level(0.0)
 
     # --------------------------------------------------
     # Premium Background
@@ -15200,10 +15545,19 @@ class MainWindow(QMainWindow):
         """
         self.shutdown_started = True
         self._closing = True
+        self._live_generation = getattr(self, "_live_generation", 0) + 1
+        self._cancel_live_recovery_timer()
+        self._goaway_replacement_in_progress = False
         self.gemini_live_active = False
         self._gemini_live_pending_start = False
         self.gemini_live_command_handoff = True
         self._gemini_live_output_suppressed = True
+
+        if hasattr(self, "_speech_level_timer"):
+            try:
+                self._speech_level_timer.stop()
+            except Exception:
+                pass
 
         # 1. Input disabled
         worker = getattr(self, "gemini_live_audio_worker", None)
@@ -15365,29 +15719,6 @@ class MainWindow(QMainWindow):
         self.manual_listening_requested = False
         self.processing_voice = False
 
-        # ----------------------------------------------
-        # Stop active voice worker without blocking GUI.
-        # ----------------------------------------------
-
-        voice_worker = getattr(self, "voice_worker", None)
-
-        if voice_worker is not None:
-
-            try:
-
-                if voice_worker.isRunning():
-
-                    voice_worker.stop()
-
-                    print(
-                        "[DHEEPTHI SHUTDOWN] VoiceWorker stop requested."
-                    )
-
-            except Exception as error:
-
-                print(
-                    f"[DHEEPTHI SHUTDOWN] VoiceWorker stop error: {error}"
-                )
 
         # ----------------------------------------------
         # Show goodbye avatar.
@@ -15541,6 +15872,12 @@ class MainWindow(QMainWindow):
             self._closing = True
             print("[DHEEPTHI SHUTDOWN] shutdown_started=True")
 
+            if hasattr(self, "_speech_level_timer"):
+                try:
+                    self._speech_level_timer.stop()
+                except Exception:
+                    pass
+
             # Synchronously and sequentially tear down Gemini Live BEFORE goodbye TTS
             self._shutdown_gemini_live_synchronously()
 
@@ -15628,99 +15965,6 @@ class MainWindow(QMainWindow):
 
             self.chat_processing = False
 
-        # ==================================================
-        # VOICE WORKER
-        # ==================================================
-
-        voice_worker = getattr(
-            self,
-            "voice_worker",
-            None
-        )
-
-        if voice_worker is not None:
-
-            try:
-
-                if voice_worker.isRunning():
-
-                    print(
-                        "Stopping VoiceWorker..."
-                    )
-
-                    # --------------------------------------------------
-                    # Ask recognizer / worker to stop.
-                    # --------------------------------------------------
-
-                    voice_worker.stop()
-
-                    # --------------------------------------------------
-                    # Give it a short opportunity to finish.
-                    # --------------------------------------------------
-
-                    if voice_worker.wait(250):
-
-                        print(
-                            "VoiceWorker stopped successfully."
-                        )
-
-                        self.voice_worker = None
-
-                    else:
-
-                        # --------------------------------------------------
-                        # IMPORTANT:
-                        #
-                        # DO NOT destroy the QThread here.
-                        #
-                        # Legacy voice recording may still be stopping.
-                        # --------------------------------------------------
-
-                        print(
-                            "VoiceWorker is still stopping; "
-                            "waiting for finished signal."
-                        )
-
-                        try:
-
-                            voice_worker.finished.connect(
-                                self._on_voice_worker_shutdown_finished,
-                                Qt.QueuedConnection
-                            )
-
-                        except (
-                            TypeError,
-                            RuntimeError
-                        ):
-
-                            try:
-
-                                voice_worker.finished.connect(
-                                    self._on_voice_worker_shutdown_finished
-                                )
-
-                            except Exception:
-
-                                pass
-
-                        # --------------------------------------------------
-                        # Keep the close event alive.
-                        # Qt must NOT destroy the window/thread yet.
-                        # --------------------------------------------------
-
-                        event.ignore()
-
-                        return
-
-                else:
-
-                    self.voice_worker = None
-
-            except Exception as error:
-
-                print(
-                    f"VoiceWorker Cleanup Error : {error}"
-                )
 
         # ==================================================
         # ==================================================
@@ -16103,66 +16347,6 @@ class MainWindow(QMainWindow):
             "VisionWorker stopped asynchronously; "
             "continuing final shutdown."
         )
-
-        QTimer.singleShot(
-            0,
-            self.close
-        )
-
-    # VOICE WORKER SHUTDOWN CONTINUATION
-    # ==================================================
-
-    def _on_voice_worker_shutdown_finished(
-        self
-    ):
-        """
-        Continue final application shutdown after the
-        VoiceWorker QThread has completely finished.
-        """
-
-        if not getattr(
-            self,
-            "_shutdown_finalizing",
-            False
-        ):
-
-            return
-
-        voice_worker = getattr(
-            self,
-            "voice_worker",
-            None
-        )
-
-        if voice_worker is not None:
-
-            try:
-
-                if voice_worker.isRunning():
-
-                    return
-
-            except RuntimeError:
-
-                pass
-
-        # --------------------------------------------------
-        # QThread has finished.
-        # It is now safe to release our reference.
-        # --------------------------------------------------
-
-        self.voice_worker = None
-
-        print(
-            "VoiceWorker stopped asynchronously; "
-            "continuing final shutdown."
-        )
-
-        # --------------------------------------------------
-        # Re-enter closeEvent().
-        # This time _shutdown_finalizing is already True,
-        # so the FINAL CLOSE PASS will execute.
-        # --------------------------------------------------
 
         QTimer.singleShot(
             0,

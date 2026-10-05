@@ -164,6 +164,46 @@ GEMINI_PLANNER_FALLBACK_2 = os.getenv(
     "gemini-3.6-flash"
 ).strip()
 
+# ----------------------------------------------------------
+# Gemini Live API & Server-Side VAD Settings
+# ----------------------------------------------------------
+
+GEMINI_LIVE_MODEL = os.getenv(
+    "GEMINI_LIVE_MODEL",
+    "gemini-3.1-flash-live-preview"
+).strip()
+
+GEMINI_LIVE_START_SENSITIVITY = os.getenv(
+    "GEMINI_LIVE_START_SENSITIVITY",
+    "START_SENSITIVITY_HIGH"
+).strip()
+
+GEMINI_LIVE_END_SENSITIVITY = os.getenv(
+    "GEMINI_LIVE_END_SENSITIVITY",
+    "END_SENSITIVITY_HIGH"
+).strip()
+
+GEMINI_LIVE_SILENCE_DURATION_MS = int(os.getenv(
+    "GEMINI_LIVE_SILENCE_DURATION_MS",
+    "600"
+).strip())
+
+# ----------------------------------------------------------
+# Gemini Live Voice Configuration
+# ----------------------------------------------------------
+# Supported Gemini Live prebuilt voices:
+# - Aoede: Young, natural, conversational, friendly female assistant
+# - Kore: Calm, relaxed female
+# - Puck: Energetic male
+# - Charon: Deep male
+# - Fenrir: Strong male
+
+GEMINI_LIVE_VOICE = (os.getenv(
+    "GEMINI_LIVE_VOICE",
+    "Aoede"
+).strip() or "Aoede")
+
+
 
 # ==========================================================
 # Debug Configuration

@@ -574,6 +574,11 @@ def run_tests() -> None:
         sys.exit(1)
 
 
+def test_groq_recognizer_suite():
+    """Pytest entrypoint for the GroqRecognizer suite."""
+    run_tests()
+
+
 # ==================================================
 # Entry Point
 # ==================================================
