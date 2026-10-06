@@ -1,5 +1,5 @@
 # ============================================================
-# ASTRA-AI - Git Ignore
+# DHEEPTHI-AI - Git Ignore
 # ============================================================
 
 
@@ -36,7 +36,6 @@ env/
 
 .env
 *.env
-.env.example
 
 
 # ------------------------------------------------------------
@@ -81,12 +80,13 @@ Thumbs.db
 
 
 # ------------------------------------------------------------
-# Python Test / Coverage Cache
+# Python Test / Coverage Cache & Diagnostic Artifacts
 # ------------------------------------------------------------
 
 .pytest_cache/
 .coverage
 htmlcov/
+tests/artifacts/
 
 
 # ------------------------------------------------------------
@@ -99,7 +99,7 @@ dist/
 
 
 # ------------------------------------------------------------
-# Local Runtime / Temporary Files
+# Local Runtime / Temporary Files / Database
 # ------------------------------------------------------------
 
 tmp/
@@ -107,8 +107,11 @@ temp/
 scratch/
 *_diagnostic.json
 
+database/astra.db
 database/astra.db-shm
 database/astra.db-wal
+*.db
+*.db-journal
 
 terminal_output.txt
 

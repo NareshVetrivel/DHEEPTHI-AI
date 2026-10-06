@@ -1,262 +1,204 @@
 # DHEEPTHI-AI
 
-**DHEEPTHI-AI** is an Adaptive Context-Aware Natural Language Voice Assistant for Personalized Desktop Automation.
+**DHEEPTHI-AI V1** is an adaptive, context-aware desktop AI assistant and automation system for Windows. Built with PySide6 and Google Gemini Live, DHEEPTHI delivers persistent realtime bidirectional voice interaction in English, Tamil, and Tanglish alongside comprehensive Windows desktop automation.
 
-## Project Status
+---
 
-🚧 Under Development
+## Key Capabilities
 
-## Overview
+### 🎙️ Realtime Bidirectional Voice (Gemini Live)
+- **Zero-Wake-Word Realtime Audio**: Continuous low-latency streaming PCM voice pipeline powered by Google Gemini Live (`gemini-3.1-flash-live-preview`).
+- **Aoede Prebuilt Voice**: Natural, conversational, friendly voice persona with dynamic interruption and barge-in support.
+- **Server-Side Voice Activity Detection (VAD)**: Configured with high sensitivity and optimized silence thresholds for crisp turn-taking.
+- **API Key Rotation Pool**: Resilient multi-key management supporting up to four Gemini API keys (`GEMINI_API_KEY_1..4`) with automatic failover on quota limits or transient network issues.
 
-DHEEPTHI-AI is a Python-based Windows desktop voice-assistant and automation project designed to understand natural-language commands and perform computer operations through a modular application architecture.
+### 🌐 Trilingual & Mixed-Language Understanding
+- **English, Tamil & Tanglish**: Native understanding and fluid responses in English, Tamil, Tanglish (Tamil rendered in Latin script), and spontaneous code-mixed phrasing.
+- **Bidirectional Translation Engine**: Instant natural translation between English ↔ Tamil and English ↔ Tanglish upon voice or textual request.
+- **Polite & Respectful Tone**: Consistent professional addressing across all languages with strict omission of informal or disrespectful colloquialisms.
 
-The project combines a graphical user interface, voice interaction, natural-language processing components, desktop automation, computer-vision capabilities, background initialization, and local data storage.
+### 💻 Comprehensive Windows Desktop Automation
+- **Application Automation**: Launch, focus, and gracefully close installed Windows applications by natural name or common alias.
+- **File & Folder Automation**: Deep indexing of Windows user directories (Desktop, Documents, Downloads, Pictures, Videos, Music) and custom paths; quick file search and direct folder opening in Windows Explorer.
+- **Browser Automation**: Launch browsers, navigate to web destinations, and conduct online searches.
+- **Productivity Agent (Microsoft Word)**: Dedicated Word automation agent (`productivity_agent/word/`) utilizing Windows COM automation for document creation, formatting, and content population.
+- **System Controls**: Master volume adjustment, system mute/unmute, window arrangement (minimize, maximize, restore), and screen recording.
 
-The main application is launched through the `app.main` module.
+### 🛡️ Physical Microphone Mute Authority
+- **Hardware-Level Endpoint Monitoring**: Integrates directly with the Windows Core Audio COM API (`IAudioEndpointVolume.GetMute()`) via a dedicated background monitor.
+- **Absolute Hardware Authority**: Physical laptop microphone mute buttons immediately suppress audio ingestion, disarm live voice processing, and switch the UI to the `MUTED` state until physically unmuted.
 
-## Current Features
+### 🎨 Modern Futuristic User Interface
+- **User Speech Panel**: Translucent glassmorphism HUD featuring a live 9-bar reactive waveform driven directly by microphone PCM levels.
+- **Dynamic Assistant States**: Visual state synchronization across `IDLE`, `LISTENING`, `USER SPEAKING`, `SPEAKING`, and `MUTED`.
+- **Animated Startup Experience**: Polished splash screen with canvas particle twinkles, 500px gradient progress bar, initialization status sync, and smooth cross-dissolve fade-out into the main dashboard.
 
-- Voice Recognition
-- Intent Detection
-- Entity Extraction
-- GUI Interface
-- Application Launch Automation
-- AI/language-model agent components
-- Computer-vision functionality
-- YOLO-based object detection
-- Local SQLite data storage
-- Background initialization worker
-- Modular UI components
-- Custom application title bar
-- Splash-screen startup experience
+### 🔒 V1 Privacy & Safety Governance
+- **Internal Architecture Protection**: DHEEPTHI never discloses internal API endpoints, system schemas, planner workflows, or hidden system prompts.
+- **Prompt Injection Defense**: Guardrails defend against translation-based prompt extraction attacks (e.g., requesting translation of system instructions).
+- **Credential Protection**: Strict refusal to reveal API keys, tokens, or environment credentials across all supported languages.
+- **RAM-Only Conversation Memory**: Conversational history resides strictly in volatile memory during the runtime session and is purged upon application shutdown.
+- **India Standard Time (IST)**: Time-related queries strictly adhere to the `Asia/Kolkata` timezone (UTC+05:30) with natural day, date, and hour articulation.
 
-> **Implementation note:** Feature descriptions are based on the supplied project materials and project analysis. Some capabilities are still under development.
+---
 
-## Technology Stack
-
-- **Python** — Core programming language
-- **PySide6** — Desktop graphical user interface
-- **SQLite** — Local database storage
-- **PyAutoGUI** — Desktop/input automation
-- **PyWinAuto** — Windows UI automation
-- **SpeechRecognition** — Speech/voice input
-- **YOLO model (`yolo11n.pt`)** — Computer-vision/object-detection component
-
-## Architecture
-
-The project is organized into separate modules for application startup, UI, background workers, AI/code-agent functionality, computer vision, database storage, and testing.
+## Repository Structure
 
 ```text
 DHEEPTHI-AI/
 ├── app/
-│   └── main.py
-├── code_agent/
+│   └── main.py                 # Application entry point and splash orchestration
+├── ai/
+│   └── gemini_client.py        # Gemini Live audio streaming & conversational AI
+├── automation/
+│   ├── app_launcher.py         # Application launch controller
+│   ├── app_closer.py           # Application termination controller
+│   ├── application_scanner.py  # Installed application detection & registry scanner
+│   ├── browser_controller.py   # Web browser automation
+│   ├── file_finder.py          # Fast file search engine
+│   ├── file_indexer.py         # Local filesystem indexing engine
+│   ├── folder_manager.py       # Windows Explorer folder controller
+│   ├── screen_recorder.py      # Desktop screen recording utility
+│   ├── system_controller.py    # Master volume, mute, and system controls
+│   └── window_controller.py    # Window minimization, maximization, and focus
+├── config/
+│   └── settings.py             # Central application configuration & environment loader
+├── core/
+│   └── context_manager.py      # Session context and entity state manager
 ├── database/
-│   └── astra.db
+│   └── database_manager.py     # SQLite manager for indexed files, apps, and aliases
+├── ff_agent/                   # File and folder verification agent
+├── models/
+│   └── piper/                  # Local offline TTS voice model assets
+├── planner/
+│   ├── command_dispatcher.py   # Central multi-controller execution dispatcher
+│   ├── intent_detector.py      # Deterministic regex & keyword intent classifier
+│   └── semantic_command_planner.py # LLM-driven semantic command interpretation
+├── productivity_agent/
+│   └── word/                   # Microsoft Word COM automation suite
 ├── ui/
-│   ├── components/
-│   │   └── header.py
-│   ├── assets/
-│   │   ├── dheepthi_logo-1.png
-│   │   └── dheepthi_logo-2.png
-│   ├── main_window.py
-│   └── splash_screen.py
-├── vision/
-├── workers/
-│   └── initialization_worker.py
-├── tests/
-│   ├── results/
-│   ├── vision_samples/
-│   ├── vision_click_output.txt
-│   └── vision_output.txt
-└── yolo11n.pt
+│   ├── components/             # Left panel, right panel, status metric tiles
+│   ├── widgets/                # UserSpeechPanel, AvatarWidget, SystemOSD
+│   ├── main_window.py          # Primary desktop dashboard
+│   ├── splash_screen.py        # Animated splash screen with particle effects
+│   ├── styles/theme.py         # Futuristic color palette and styling constants
+│   └── assets/                 # Brand logos, avatars, icons, and background artwork
+├── voice/
+│   ├── microphone_monitor.py   # Windows Core Audio COM hardware mute monitor
+│   ├── streaming_tts_manager.py# Offline & streaming TTS fallback coordinator
+│   └── groq_recognizer.py      # Cloud speech recognition fallback engine
+├── tools/                      # Developer verification, lifecycle simulation, and audio tools
+└── tests/                      # Pytest unit and integration test suite
 ```
 
-### Main Modules
+---
 
-| Module | Responsibility |
-|---|---|
-| `app/` | Application startup and entry-point logic |
-| `ui/` | Main desktop interface and UI components |
-| `ui/components/` | Reusable interface components |
-| `ui/assets/` | Application logos and visual assets |
-| `code_agent/` | AI/language-model agent functionality |
-| `vision/` | Computer-vision related functionality |
-| `workers/` | Background initialization and worker processes |
-| `database/` | Local SQLite data storage |
-| `tests/` | Test data and vision-related test outputs |
+## Technology Stack
 
-## Application Entry Point
+- **GUI Framework**: PySide6 (Qt 6 for Python)
+- **AI & Realtime Voice**: Google GenAI SDK (`google-genai`), Gemini Live (`gemini-3.1-flash-live-preview`), Gemini Flash (`gemini-3.8-flash`)
+- **Speech & Audio**: PyAudio, comtypes (Windows Core Audio COM), Edge-TTS, Piper TTS
+- **Windows Automation**: PyAutoGUI, PyWinAuto, pywin32 / comtypes
+- **Local Storage**: SQLite3 (automatically initialized schema)
+- **Testing**: PyTest
 
-The application is started from the project root with:
+---
 
-```powershell
-python -m app.main
-```
+## Installation & Setup
 
-The `app.main` module initializes the desktop application and starts the main DHEEPTHI-AI window.
+### Prerequisites
 
-## UI
+- **Operating System**: Windows 10 or Windows 11 (64-bit)
+- **Python**: Python 3.10 to 3.13
+- **Audio**: Working microphone and audio output device
 
-The graphical interface is implemented with PySide6.
-
-The UI includes:
-
-- Main application window
-- Custom title bar
-- Application branding and icons
-- Splash screen
-- Header component
-- Status/progress presentation
-- Desktop-oriented controls and interface components
-
-The project uses assets from:
-
-```text
-ui/assets/
-```
-
-## Voice and Natural-Language Processing
-
-The project is designed around natural-language voice interaction.
-
-The current implementation includes components for:
-
-1. Voice recognition
-2. Intent detection
-3. Entity extraction
-4. Command interpretation
-5. Desktop action execution
-
-This allows the system to move from a spoken natural-language request toward an application or computer action.
-
-## Desktop Automation
-
-DHEEPTHI-AI includes Windows desktop automation functionality using:
-
-- `PyAutoGUI`
-- `PyWinAuto`
-
-These components support interaction with desktop applications and user-interface elements.
-
-Application launch automation is included in the current feature set.
-
-## Computer Vision
-
-The project contains a dedicated `vision/` module and includes the YOLO model:
-
-```text
-yolo11n.pt
-```
-
-Vision-related test samples and outputs are also present under:
-
-```text
-tests/vision_samples/
-tests/results/
-tests/vision_output.txt
-tests/vision_click_output.txt
-```
-
-The vision subsystem supports the project's computer-vision and automation workflow.
-
-## Data Storage
-
-The project contains a local SQLite database:
-
-```text
-database/astra.db
-```
-
-The database is part of the application's local data/storage layer.
-
-The supplied project materials did not expose a separate SQL schema/documentation file, so the exact database schema is not specified in this README.
-
-## Dependencies
-
-The supplied project materials do not contain a dedicated `requirements.txt` or `pyproject.toml` file.
-
-The documented/current technology stack includes:
-
-```text
-Python
-PySide6
-SQLite
-PyAutoGUI
-PyWinAuto
-SpeechRecognition
-YOLO / computer-vision model
-```
-
-For reproducible installation, an explicit dependency file should match the actual Python imports used by the current source tree.
-
-## Installation
-
-Clone the repository:
+### Step 1: Clone the Repository
 
 ```powershell
 git clone https://github.com/NareshVetrivel/DHEEPTHI-AI.git
 cd DHEEPTHI-AI
 ```
 
-Create and activate a virtual environment:
+### Step 2: Create & Activate Virtual Environment
 
 ```powershell
 python -m venv .venv
 .\.venv\Scripts\Activate.ps1
 ```
 
-Install the project's required Python packages according to the dependency configuration used by the current development environment.
+### Step 3: Install Dependencies
+
+```powershell
+pip install -r requirements.txt
+```
+
+### Step 4: Configure Environment Variables
+
+Copy the provided [`.env.example`](.env.example) template to `.env`:
+
+```powershell
+cp .env.example .env
+```
+
+Open `.env` and configure your API keys:
+
+```env
+# Primary Gemini API Key (Required for live voice and planning)
+GEMINI_API_KEY_1=your_gemini_api_key_here
+
+# Optional: Secondary keys for automatic quota rotation
+GEMINI_API_KEY_2=
+GEMINI_API_KEY_3=
+GEMINI_API_KEY_4=
+
+# Gemini Live Configuration
+GEMINI_LIVE_VOICE=Aoede
+GEMINI_LIVE_MODEL=gemini-3.1-flash-live-preview
+
+# Optional: Cloud STT fallback
+GROQ_API_KEY=
+```
+
+---
 
 ## Running DHEEPTHI-AI
 
-From the project root:
+Launch the desktop assistant from the project root:
 
 ```powershell
 python -m app.main
 ```
 
-The application starts through the `app.main` entry point.
-
-## Testing
-
-The repository contains vision-related test samples and generated outputs:
-
-```text
-tests/
-├── results/
-├── vision_samples/
-├── vision_click_output.txt
-└── vision_output.txt
-```
-
-These files are part of the project's current testing and validation workflow.
-
-## Project Development
-
-DHEEPTHI-AI is currently under active development as a modular desktop AI assistant.
-
-The major development areas include:
-
-- Natural-language voice interaction
-- Intent and entity processing
-- Desktop automation
-- AI agent integration
-- Computer vision
-- GUI-based interaction
-- Local data management
-- Background initialization
-
-## Repository
-
-GitHub repository:
-
-https://github.com/NareshVetrivel/DHEEPTHI-AI
-
-## Author
-
-**Naresh Vetrivel**
+1. **Splash Startup**: The animated splash screen verifies background indexing and application availability.
+2. **Main Dashboard**: The futuristic dashboard initializes with the Avatar, Status Tiles, and the Realtime User Speech Panel.
+3. **Voice Interaction**: Speak naturally in English, Tamil, or Tanglish to execute desktop operations or engage in conversation.
 
 ---
 
-> **Note:** DHEEPTHI-AI is a work in progress. Features, architecture, models, and implementation details may change as development continues.
+## Running Tests
+
+Execute the comprehensive V1 test suite:
+
+```powershell
+.\.venv\Scripts\pytest tests/test_v1_behavior_rules.py tests/test_splash_screen_runtime.py tests/test_runtime_forensic_fixes.py -v
+```
+
+### Test Coverage Highlights
+- `test_v1_behavior_rules.py`: Asserts internal schema/prompt protection, credential secrecy across languages, translation injection defense, Asia/Kolkata timezone compliance, and polite tone.
+- `test_splash_screen_runtime.py`: Validates splash overlay composition, progress status consistency, particle animations, and cached rendering performance.
+- `test_runtime_forensic_fixes.py`: Asserts command deduplication, background thread execution, audio logging throttling, and conversational disambiguation.
+
+---
+
+## Privacy & Security
+
+- **Local Storage**: Application indexes and SQLite database cache are stored strictly on your local device and excluded from version control.
+- **No Conversation Persistence**: Chat context is held exclusively in memory during the active session and wiped upon exit.
+- **Hardware Mute Priority**: Physical microphone mute state is respected at the Windows driver endpoint level before audio ever enters the application.
+
+---
+
+## Author
+
+**Naresh Vetrivel**<br>
+GitHub: [@NareshVetrivel](https://github.com/NareshVetrivel)
