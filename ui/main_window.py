@@ -494,6 +494,59 @@ class CodeAgentWorker(QThread):
             self.error_occurred.emit(str(error))
 
 
+class CommandExecutionWorker(QThread):
+    """
+    Run CommandDispatcher automation and blocking file/browser/system operations
+    outside the Qt GUI thread.
+
+    The worker performs no direct UI operations. It sends the final
+    CommandDispatcher result or exception back to MainWindow through Qt signals.
+    """
+
+    result_ready = Signal(object, str, str, object)  # (result, text, intent, entity)
+    error_occurred = Signal(str, str, str, object)   # (error, text, intent, entity)
+
+    def __init__(self, target_fn, text, intent=None, entity=None, *args, **kwargs):
+        super().__init__()
+        self.target_fn = target_fn
+        self.text = str(text or "").strip()
+        self.intent = intent
+        self.entity = entity
+        self.args = args
+        self.kwargs = kwargs
+
+    def run(self):
+        try:
+            import threading
+            is_main = threading.current_thread() is threading.main_thread()
+            print(
+                f"\n========== COMMAND BACKGROUND WORKER ==========\n"
+                f"Command            : {self.text}\n"
+                f"Intent             : {self.intent}\n"
+                f"GUI thread blocked : {'YES' if is_main else 'NO'}\n"
+                f"===============================================\n",
+                flush=True,
+            )
+            if self.intent is not None and "intent" not in self.kwargs:
+                result = self.target_fn(intent=self.intent, entity=self.entity, *self.args, **self.kwargs)
+            else:
+                result = self.target_fn(*self.args, **self.kwargs)
+            self.result_ready.emit(result, self.text, self.intent, self.entity)
+        except Exception as error:
+            import traceback
+            err_str = str(error)
+            print(
+                f"\n========== COMMAND WORKER ERROR ==========\n"
+                f"Command : {self.text}\n"
+                f"Intent  : {self.intent}\n"
+                f"Error   : {err_str}\n"
+                f"Traceback:\n{traceback.format_exc()}"
+                f"==========================================\n",
+                flush=True,
+            )
+            self.error_occurred.emit(err_str, self.text, self.intent, self.entity)
+
+
 class VisionWorker(QThread):
     """Run cloud Gemini Vision analysis outside the Qt GUI thread."""
 
@@ -898,8 +951,8 @@ class GeminiLiveAudioWorker(QThread):
                             self.bytes_sent += len(send_chunk)
                             dt_queue = time.monotonic() - q_start
 
-                            # Diagnostic logging for representative chunks
-                            if self.captured_packets in (1, 10, 50) or self.captured_packets % 100 == 0:
+                            # Diagnostic logging for representative chunks (throttled by default)
+                            if getattr(settings, "DEBUG_AUDIO_VERBOSE", False) and (self.captured_packets in (1, 10, 50) or self.captured_packets % 100 == 0):
                                 queue_depth = getattr(getattr(self.live_session, "_audio_queue", None), "qsize", lambda: 0)()
                                 session_send_cnt = getattr(self.live_session, "send_packet_count", 0)
                                 session_rx_cnt = getattr(self.live_session, "receive_event_count", 0)
@@ -1172,6 +1225,7 @@ class MainWindow(QMainWindow):
     """
 
     gemini_live_input_signal = Signal(str)
+    gemini_live_interim_signal = Signal(str)
     gemini_live_output_signal = Signal(str)
     gemini_live_interrupted_signal = Signal()
     gemini_live_turn_complete_signal = Signal(str, str)
@@ -1193,6 +1247,10 @@ class MainWindow(QMainWindow):
         self.gemini_live_output_transcript = ""
         self.gemini_live_user_transcript = ""
         self.gemini_live_last_command = ""
+        self._last_command_time = 0.0
+        self._command_worker = None
+        self._last_routed_action_cmd = ""
+        self._last_routed_action_time = 0.0
 
         # ----------------------------------
         # Graceful Okii, byee! See youu soon 🫶 Shutdown
@@ -1500,6 +1558,9 @@ class MainWindow(QMainWindow):
         self.system_osd = SystemOSD(self)
         self.system_osd.hide_osd()
 
+        self.gemini_live_interim_signal.connect(
+            self._handle_gemini_live_interim_transcript
+        )
         self.gemini_live_input_signal.connect(
             self._handle_gemini_live_input_transcript
         )
@@ -7321,7 +7382,7 @@ class MainWindow(QMainWindow):
             pass
 
         # ---------------------------------
-        # Execute Command
+        # Execute Command Asynchronously (Non-blocking GUI)
         # ---------------------------------
 
         self._code_agent_processing = (
@@ -7332,35 +7393,52 @@ class MainWindow(QMainWindow):
             or intent == "programming"
         )
 
-        result = self.dispatcher.dispatch(
+        if getattr(self, "_command_worker", None) is not None and self._command_worker.isRunning():
+            print(f"[COMMAND WORKER] A command is already executing in background. Ignoring concurrent dispatch for '{text}'.")
+            return
 
+        worker = CommandExecutionWorker(
+            target_fn=self.dispatcher.dispatch,
+            text=text,
             intent=intent,
-
             entity=entity,
-
             typed_text=typed_text,
-
             browser=browser,
-
             website=website,
-
             search_query=search_query,
-
             profile=profile,
-
-            user_text=text
-
+            user_text=text,
         )
-        # ---------------------------------
-        # Handle Dispatcher Result
-        # ---------------------------------
+        self._command_worker = worker
 
-        self._handle_dispatch_result(
-            result,
-            text,
-            intent,
-            entity,
+        worker.result_ready.connect(
+            self._handle_dispatch_result
         )
+        worker.error_occurred.connect(
+            self._handle_command_worker_error
+        )
+        worker.finished.connect(
+            self._on_command_worker_finished
+        )
+        worker.finished.connect(
+            worker.deleteLater
+        )
+        worker.start()
+
+    @Slot()
+    def _on_command_worker_finished(self):
+        """Reset active command worker reference on thread exit."""
+        self._command_worker = None
+
+    @Slot(str, str, str, object)
+    def _handle_command_worker_error(self, error, text, intent, entity):
+        """Handle background command execution failure safely on GUI thread."""
+        print(f"[COMMAND ERROR] {error}")
+        self._command_worker = None
+        self.status_label.setText("Status : Command Error")
+        self._set_avatar_state("error")
+        self.tts.speak("Sorry, I encountered an error executing that command.")
+        self._unlock_after_speech(restart_live=True, terminal_avatar_state="error")
 
     # --------------------------------------------------
     # Position File Selection Panel
@@ -10097,7 +10175,7 @@ class MainWindow(QMainWindow):
                 voice=getattr(settings, "GEMINI_LIVE_VOICE", "Aoede"),
                 on_connected=lambda: self._on_gemini_live_connected(gen),
                 on_audio=lambda data, resp_id=0: self._on_gemini_live_audio(data, resp_id, gen),
-                on_input_transcript=lambda text: self._on_gemini_live_input_transcript(text, gen),
+                on_input_transcript=lambda text, is_interim=False: self._on_gemini_live_input_transcript(text, gen, is_interim=is_interim),
                 on_output_transcript=lambda text, resp_id=0: self._on_gemini_live_output_transcript(text, resp_id, gen),
                 on_interrupted=lambda resp_id=0: self._on_gemini_live_interrupted(resp_id, gen),
                 on_turn_complete=lambda u, a: self._on_gemini_live_turn_complete(u, a, gen),
@@ -10398,7 +10476,8 @@ class MainWindow(QMainWindow):
             now = time.time()
             chunk_len = len(audio_data) if audio_data else 0
             q_depth = worker._output_queue.qsize() if worker else 0
-            print(f"[DIAG UI AUDIO CHUNK] t={now:.3f} bytes={chunk_len} qdepth={q_depth} resp_id={response_id}")
+            if getattr(settings, "DEBUG_AUDIO_VERBOSE", False):
+                print(f"[DIAG UI AUDIO CHUNK] t={now:.3f} bytes={chunk_len} qdepth={q_depth} resp_id={response_id}")
 
             if worker is not None and self.gemini_live_active:
                 worker.enqueue_output(audio_data, response_id=response_id)
@@ -10407,7 +10486,7 @@ class MainWindow(QMainWindow):
             print(f"[CRITICAL LIVE ERROR] In _on_gemini_live_audio: {error}")
             print(f"[CRITICAL LIVE TRACEBACK]\n{traceback.format_exc()}")
 
-    def _on_gemini_live_input_transcript(self, text, gen=None):
+    def _on_gemini_live_input_transcript(self, text, gen=None, is_interim=False):
         try:
             if getattr(self, "shutdown_started", False) or getattr(self, "_closing", False):
                 return
@@ -10417,9 +10496,6 @@ class MainWindow(QMainWindow):
             text_str = str(text or "").strip()
             if not text_str:
                 return
-
-            print(f"[PERF] COMMAND_RECEIVED t={now:.3f} text='{text_str}'")
-            print(f"[DIAG UI INPUT_TRANSCRIPT] t={now:.3f} text='{text}'")
 
             worker = self.gemini_live_audio_worker
             session = self.gemini_live_session
@@ -10445,7 +10521,10 @@ class MainWindow(QMainWindow):
                 lat_ms = (t_stop - t_detect) * 1000.0
                 print(f"[LIVE INTERRUPT] response={interrupted_id} detected_ms={t_detect*1000:.1f} playback_stop_ms={t_stop*1000:.1f} stop_latency_ms={lat_ms:.2f}")
                 self.gemini_live_interrupted_signal.emit()
-                self.gemini_live_input_signal.emit(text_str)
+                if not is_interim:
+                    self.gemini_live_input_signal.emit(text_str)
+                else:
+                    self.gemini_live_interim_signal.emit(text_str)
                 return
 
             if is_speaking:
@@ -10461,8 +10540,21 @@ class MainWindow(QMainWindow):
                 print(f"[LIVE INTERRUPT] response={interrupted_id} detected_ms={t_detect*1000:.1f} playback_stop_ms={t_stop*1000:.1f} stop_latency_ms={lat_ms:.2f}")
                 self.gemini_live_interrupted_signal.emit()
 
+            # -----------------------------------------------------------------
+            # INTERIM TRANSCRIPT GATING (FIX 2):
+            # Interim transcripts only update user-facing display.
+            # MUST NEVER execute commands, suppress Gemini audio, or call process_command!
+            # -----------------------------------------------------------------
+            if is_interim:
+                self.gemini_live_interim_signal.emit(text_str)
+                return
+
+            # FINALIZED INPUT TRANSCRIPT:
+            print(f"[PERF] COMMAND_RECEIVED t={now:.3f} text='{text_str}'")
+            print(f"[DIAG UI INPUT_TRANSCRIPT] t={now:.3f} text='{text}'")
+
             # FAST LOCAL DETERMINISTIC COMMAND SUPPRESSION:
-            # Only exact single English commands (e.g., "Open Chrome", "Close Notepad")
+            # Only exact single English/local deterministic commands (e.g., "Open Chrome", "Close Notepad", "What is the time?")
             # execute locally and should be pre-suppressed. Tanglish, mixed language,
             # and natural requests MUST stream to Gemini Live so it can generate
             # semantic <ACTION> tags or normal conversation without audio interruption.
@@ -10500,6 +10592,7 @@ class MainWindow(QMainWindow):
             import traceback
             print(f"[CRITICAL LIVE ERROR] In _on_gemini_live_input_transcript: {error}")
             print(f"[CRITICAL LIVE TRACEBACK]\n{traceback.format_exc()}")
+
 
     def _on_gemini_live_output_transcript(self, text, response_id=0, gen=None):
         try:
@@ -10620,6 +10713,22 @@ class MainWindow(QMainWindow):
             return str(text or "")
 
     @Slot(str)
+    def _handle_gemini_live_interim_transcript(self, text):
+        """Update live speech panel display with interim user transcript without executing commands."""
+        try:
+            if getattr(self, "shutdown_started", False) or getattr(self, "_closing", False):
+                return
+            text_str = str(text or "").strip()
+            if not text_str:
+                return
+            display_text = self._filter_user_speech_display_transcript(text_str)
+            if hasattr(self, "user_speech_panel"):
+                self.user_speech_panel.set_transcript(display_text)
+            elif hasattr(self, "mic_widget"):
+                self.mic_widget.update_user_message(display_text)
+        except Exception:
+            pass
+
     def _handle_gemini_live_input_transcript(self, text):
         t_cmd_start = time.time()
         try:
@@ -10720,6 +10829,7 @@ class MainWindow(QMainWindow):
                 print(f"[SEMANTIC] Dispatch: {local_intent} [FAST LOCAL PATH]")
 
                 self.gemini_live_last_command = text
+                self._last_command_time = time.time()
                 self.gemini_live_command_handoff = True
                 self._gemini_live_output_suppressed = True
 
@@ -11117,6 +11227,25 @@ class MainWindow(QMainWindow):
         and execution pipeline:
         action_cmd -> semantic_command_planner.plan() -> _execute_semantic_plan() -> CommandDispatcher
         """
+        if not action_cmd:
+            return
+
+        now = time.time()
+        last_cmd = getattr(self, "_last_routed_action_cmd", "")
+        last_time = getattr(self, "_last_routed_action_time", 0.0)
+        if action_cmd.lower().strip() == last_cmd.lower().strip() and (now - last_time < 3.0):
+            print(f"[SEMANTIC DEDUP] Blocked duplicate action routing within 3s: '{action_cmd}'")
+            return
+
+        fast_cmd = getattr(self, "gemini_live_last_command", "")
+        fast_time = getattr(self, "_last_command_time", 0.0)
+        if fast_cmd and action_cmd.lower().strip() == fast_cmd.lower().strip() and (now - fast_time < 4.0):
+            print(f"[SEMANTIC DEDUP] Blocked action duplicate of fast local command: '{action_cmd}'")
+            return
+
+        self._last_routed_action_cmd = action_cmd
+        self._last_routed_action_time = now
+
         print(f"[SEMANTIC] Routing extracted command to semantic planner: '{action_cmd}'")
         semantic_plan = None
         if hasattr(self, "semantic_command_planner") and self.semantic_command_planner is not None:
@@ -11275,6 +11404,13 @@ class MainWindow(QMainWindow):
             # Application-side ACTION extraction check on completed turn
             action_cmd = self._extract_action_command(target_assistant_text)
             if action_cmd:
+                now = time.time()
+                last_cmd = getattr(self, "_last_routed_action_cmd", "")
+                last_time = getattr(self, "_last_routed_action_time", 0.0)
+                if action_cmd.lower().strip() == last_cmd.lower().strip() and (now - last_time < 3.0):
+                    print(f"[SEMANTIC DEDUP] Turn complete action already executed: '{action_cmd}'")
+                    return
+
                 print(f"[SEMANTIC] Gemini output: {target_assistant_text.strip()}")
                 print("[SEMANTIC] ACTION detected")
                 print(f"[SEMANTIC] Normalized command: {action_cmd}")
@@ -15962,6 +16098,19 @@ class MainWindow(QMainWindow):
                 print(
                     f"InitializationWorker Cleanup Error : {error}"
                 )
+
+        # ==================================================
+        # COMMAND EXECUTION WORKER
+        # ==================================================
+        cmd_worker = getattr(self, "_command_worker", None)
+        if cmd_worker is not None:
+            try:
+                if cmd_worker.isRunning():
+                    print("Waiting for CommandExecutionWorker to terminate...")
+                    cmd_worker.wait(1500)
+                self._command_worker = None
+            except Exception as error:
+                print(f"CommandExecutionWorker Cleanup Error : {error}")
 
         # ==================================================
         # LIVE FILE MONITOR

@@ -1226,6 +1226,55 @@ class IntentDetector:
         )
 
     # ==========================================================
+    # TIME INTENTS
+    # ==========================================================
+
+    def _detect_time_intent(
+        self,
+        text: str,
+    ) -> Optional[str]:
+        """
+        Detect deterministic current-time queries in English, Tamil, and Tanglish.
+
+        Supported Examples:
+            "What is the time?"
+            "What time is it?"
+            "Current time?"
+            "Indian time enna?"
+            "Ippa time enna?"
+            "Ippo current time sollu"
+            "India-la ippo enna time?"
+            "current time sollu"
+        """
+        if not text:
+            return None
+
+        cleaned = self._basic_normalize(text).lower().strip()
+        cleaned = re.sub(r"[?!.,]", "", cleaned)
+
+        time_patterns = (
+            # English standard & colloquial
+            r"^(?:please\s+)?(?:what(?:'s|\s+is)\s+(?:the\s+)?(?:current\s+)?time|what\s+time\s+is\s+it)\b",
+            r"^(?:please\s+)?(?:tell\s+me\s+)?(?:the\s+)?current\s+time(?:\s+please)?\b",
+            r"^(?:tell\s+me\s+the\s+time|time\s+please)\b",
+            r"^current\s+time\b",
+            r"\b(?:what(?:'s|\s+is)\s+(?:the\s+)?time|what\s+time\s+is\s+it)\b",
+            # Tamil / Tanglish / Mixed
+            r"\b(?:indian\s+time\s+enna|india(?:-|\s+)la\s+(?:ippo\s+|ippa\s+)?(?:enna\s+time|time\s+enna))\b",
+            r"\b(?:ippo|ippa|iniku|innikku)\s+(?:current\s+)?time\s+(?:enna|sollu|solunga|sol)\b",
+            r"\b(?:ippo|ippa)\s+(?:current\s+)?(?:mani|neram)\s+enna\b",
+            r"\btime\s+enna(?:\s+nu\s+sollu)?\b",
+            r"\b(?:current\s+)?time\s+(?:sollu|solunga)\b",
+            r"\b(?:current\s+)?time\s+enna\b",
+            r"\bindian\s+time\b",
+        )
+
+        if any(re.search(pat, cleaned) for pat in time_patterns):
+            return "current_time"
+
+        return None
+
+    # ==========================================================
     # FOLDER INTENTS
     # ==========================================================
 
@@ -1349,6 +1398,36 @@ class IntentDetector:
             return "empty_recycle_bin"
 
         # ------------------------------------------------------
+        # Conversational / Feature Exclusions
+        # ------------------------------------------------------
+        # Features or conversational queries that mention "desktop",
+        # "downloads", or folders MUST NOT be treated as open_folder.
+        #
+        # Negative Examples:
+        #   "Chrome Remote Desktop"
+        #   "What is Chrome Remote Desktop?"
+        #   "Explain desktop computers"
+        #   "Why should I use desktop mode?"
+        #   "Tell me about Downloads"
+        #   "What is the Music folder?"
+        #   "Chrome Remote Desktop pathi sollu"
+
+        if re.search(r"\b(?:chrome\s+)?remote\s+desktop\b", text):
+            return None
+
+        if re.search(r"\bdesktop\s+(?:mode|computer(?:s)?|screen)\b", text) and not re.search(r"\b(?:open|go\s+to|explore|browse|view|show|thira)\b", text):
+            return None
+
+        if re.search(r"^(?:what|why|who|how|when|where|which|whose|whom)\b", text):
+            return None
+
+        if re.search(r"^(?:explain|describe|tell\s+me\s+about|what\s+about|talk\s+about|discuss|summarize)\b", text):
+            return None
+
+        if re.search(r"\b(?:pathi|patri|patthi)\s+(?:sollu|pesu|solunga|vilakku)\b", text):
+            return None
+
+        # ------------------------------------------------------
         # Generic open folder
         # ------------------------------------------------------
 
@@ -1359,18 +1438,65 @@ class IntentDetector:
                 "open a folder",
                 "open the folder",
                 "open your folder",
+                "folder open",
+                "folder open pannu",
+                "folder open pannunga",
+                "folder ah open pannu",
+                "folder a open pannu",
             )
         ):
             return "open_folder"
 
         # ------------------------------------------------------
-        # Special folders
+        # Special folders (Strict Word Boundaries & Action Verbs)
         # ------------------------------------------------------
+        # Valid Commands:
+        #   "Open Desktop"
+        #   "Open the Desktop folder"
+        #   "Desktop folder open pannu"
+        #   "Downloads open pannu"
+        #   "Open Downloads"
+        #   "Go to Downloads"
+        #   "Open Music folder"
+        #   "Documents folder open pannu"
 
-        for folder in self.folder_open_keywords:
+        folder_pattern = "|".join(
+            re.escape(k)
+            for k in sorted(self.folder_open_keywords, key=len, reverse=True)
+        )
 
-            if folder in text:
-                return "open_folder"
+        # 1. English commands: leading action verb + folder
+        leading_action_pattern = (
+            rf"^(?:please\s+)?(?:can\s+you\s+|could\s+you\s+|would\s+you\s+)?"
+            rf"(?:open|go\s+to|explore|browse|view|show|access|navigate\s+to)\s+"
+            rf"(?:the\s+|a\s+|my\s+)?(?:folder\s+)?(?:{folder_pattern})(?:\s+folder)?\b"
+        )
+        if re.search(leading_action_pattern, text):
+            return "open_folder"
+
+        # 1b. Generic named folder: "open <name> folder" or "open the <name> folder"
+        if re.search(r"\bopen\s+(?:the\s+|a\s+|my\s+)?([a-z0-9_\-\s]+)\s+folder\b", text):
+            return "open_folder"
+
+        # 2. Normalized / Tamil / Tanglish commands: folder + action token
+        trailing_action_pattern = (
+            rf"\b(?:{folder_pattern})(?:\s+folder)?\s+"
+            rf"(?:ah\s+|a\s+|ai\s+|la\s+|ula\s+)?"
+            rf"(?:open|open\s+pannu|open\s+pannunga|open\s+panni|open\s+pannitu|open\s+sei|open\s+seiga|thira|thiranthu|thiravu|kaattu)\b"
+        )
+        if re.search(trailing_action_pattern, text):
+            return "open_folder"
+
+        # 2b. Mixed prefix + suffix: "open <folder> open pannu" / "open <folder> pannu"
+        mixed_tamil_pattern = (
+            rf"\bopen\s+(?:the\s+)?(?:{folder_pattern})(?:\s+folder)?\s+(?:open\s+)?(?:pannu|pannunga|panni|pannitu)\b"
+        )
+        if re.search(mixed_tamil_pattern, text):
+            return "open_folder"
+
+        # 2c. Generic named folder in Tamil: "<name> folder open"
+        if re.search(r"\b[a-z0-9_\-]+\s+folder\s+(?:ah\s+|a\s+|ai\s+)?(?:open|open\s+pannu|open\s+pannunga|open\s+panni|open\s+pannitu|thira)\b", text):
+            return "open_folder"
 
         return None
 
@@ -2876,6 +3002,11 @@ class IntentDetector:
 
         text = self._basic_normalize(text)
 
+        # 0. Deterministic local time query (before conversational checks)
+        time_intent = self._detect_time_intent(text)
+        if time_intent:
+            return time_intent
+
         if not self._is_explicit_automation_command(text):
             if self._is_conversational_message(text):
                 return "ai_chat"
@@ -3396,6 +3527,11 @@ Normalized speech:
         if not normalized_text:
             return None
 
+        # 0. Deterministic local time query
+        time_intent = self._detect_time_intent(normalized_text)
+        if time_intent:
+            return time_intent
+
         capture_intent = self._detect_capture_intent(normalized_text)
         if capture_intent:
             return capture_intent
@@ -3457,6 +3593,11 @@ Normalized speech:
 
         if not normalized_text:
             return None
+
+        # 0. Deterministic local time query
+        time_intent = self._detect_time_intent(normalized_text)
+        if time_intent:
+            return time_intent
 
         # ==================================================
         # STEP 1

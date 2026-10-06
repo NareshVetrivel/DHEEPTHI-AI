@@ -219,3 +219,14 @@ DEBUG = (
     == "true"
 
 )
+
+DEBUG_AUDIO_VERBOSE = (
+
+    os.getenv(
+        "DEBUG_AUDIO_VERBOSE",
+        "False"
+    ).strip().lower()
+
+    == "true"
+
+)

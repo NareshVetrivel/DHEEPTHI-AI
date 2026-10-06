@@ -3133,12 +3133,13 @@ class CommandDispatcher:
             # never falls through to Gemini conversation handling.
             code_command = user_text or typed_text or ""
 
-            print("\n========== CODE AGENT ROUTING ==========")
-            print(f"Incoming Intent : {incoming_intent}")
-            print(f"Resolved Intent : {intent}")
-            print(f"Code Request    : {code_command}")
-            print("Route           : CommandDispatcher -> CodeAgent")
-            print("========================================\n")
+            if self._looks_like_code_command(self._extract_code_request(code_command, entity), intent):
+                print("\n========== CODE AGENT ROUTING ==========")
+                print(f"Incoming Intent : {incoming_intent}")
+                print(f"Resolved Intent : {intent}")
+                print(f"Code Request    : {code_command}")
+                print("Route           : CommandDispatcher -> CodeAgent")
+                print("========================================\n")
 
             code_result = self.process_code_agent(
                 command=code_command,
@@ -5323,6 +5324,39 @@ class CommandDispatcher:
 
                     reply
 
+                )
+
+            # -------------------------
+            # Deterministic Local Time Query
+            # -------------------------
+            elif intent == "current_time":
+
+                import datetime
+                try:
+                    import zoneinfo
+                    ist = zoneinfo.ZoneInfo("Asia/Kolkata")
+                except Exception:
+                    ist = datetime.timezone(datetime.timedelta(hours=5, minutes=30), name="IST")
+
+                now = datetime.datetime.now(tz=ist)
+                time_str = now.strftime("%I:%M %p").lstrip("0")
+                date_str = f"{now.strftime('%B')} {now.day}, {now.year}"
+                day_str = now.strftime("%A")
+
+                tamil_markers = ("enna", "ippo", "ippa", "neram", "mani", "sol", "sollu", "solunga", "iniku", "innikku")
+                query_lower = (user_text or typed_text or "").lower()
+                is_tamil = any(marker in query_lower for marker in tamil_markers)
+
+                if is_tamil:
+                    reply = self.speak(f"Innaikku {day_str}, {date_str}. Ippo India time {time_str} IST.")
+                else:
+                    reply = self.speak(f"Today is {day_str}, {date_str}. The current India time is {time_str} IST.")
+
+                return self.response(
+                    True,
+                    f"Status : Current Time {time_str} IST",
+                    "Status : Time Check Failed",
+                    reply
                 )
             
             # ==================================================
