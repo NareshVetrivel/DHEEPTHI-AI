@@ -37,6 +37,9 @@ env/
 .env
 *.env
 
+# Public configuration template must remain trackable
+!.env.example
+
 
 # ------------------------------------------------------------
 # Temporary Audio / Runtime Files
@@ -80,13 +83,20 @@ Thumbs.db
 
 
 # ------------------------------------------------------------
+# Local-Only Development Tests & Diagnostic Tools
+# ------------------------------------------------------------
+
+tests/
+tools/
+
+
+# ------------------------------------------------------------
 # Python Test / Coverage Cache & Diagnostic Artifacts
 # ------------------------------------------------------------
 
 .pytest_cache/
 .coverage
 htmlcov/
-tests/artifacts/
 
 
 # ------------------------------------------------------------
