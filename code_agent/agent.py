@@ -898,7 +898,7 @@ Preserve the original requested functionality.
 
             return {
                 "success": result.returncode == 0,
-                "output": "",
+                "output": result.stdout.strip(),
                 "error": result.stderr.strip(),
                 "return_code": result.returncode,
                 "terminal_opened": False,
@@ -1016,7 +1016,7 @@ Preserve the original requested functionality.
 
             result = {
                 "success": run_result.returncode == 0,
-                "output": "",
+                "output": run_result.stdout.strip(),
                 "error": run_result.stderr.strip(),
                 "return_code": run_result.returncode,
                 "terminal_opened": False,

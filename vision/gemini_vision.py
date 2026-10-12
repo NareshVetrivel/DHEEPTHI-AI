@@ -190,7 +190,7 @@ class GeminiVision:
         self.model = getattr(
             settings,
             "GEMINI_MODEL",
-            "models/gemini-3.5-flash"
+            "gemini-3.8-flash"
         )
 
         # ------------------------------------------

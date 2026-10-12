@@ -52,7 +52,7 @@ class HeaderWidget(QFrame):
             "HeaderWidget"
         )
 
-        self.username = "Naresh"
+        self.username = None
 
         # Keep callback reference.
         # This avoids unsafe signal disconnect calls.
@@ -753,8 +753,14 @@ class HeaderWidget(QFrame):
 
             greeting = "Good Night"
 
-        self.greeting_label.setText(
+        greeting_text = (
             f"{greeting}, {self.username} 👋🏻"
+            if self.username
+            else f"{greeting} 👋🏻"
+        )
+
+        self.greeting_label.setText(
+            greeting_text
         )
 
         self.time_chip.setText(

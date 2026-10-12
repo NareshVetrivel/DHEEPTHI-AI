@@ -1,5 +1,5 @@
 """
-Application settings for ASTRA-AI.
+Application settings for DHEEPTHI-AI.
 """
 
 import os
@@ -18,9 +18,9 @@ load_dotenv()
 # Application Information
 # ==========================================================
 
-APP_NAME = "ASTRA-AI"
+APP_NAME = "DHEEPTHI-AI"
 
-APP_VERSION = "0.1.0"
+APP_VERSION = "1.0.0"
 
 APP_AUTHOR = "Naresh"
 
@@ -43,7 +43,7 @@ WINDOW_TITLE = APP_NAME
 DEFAULT_STATUS = "Ready"
 
 WELCOME_MESSAGE = (
-    "Welcome to ASTRA-AI"
+    "Welcome to DHEEPTHI-AI"
 )
 
 
@@ -142,7 +142,7 @@ GEMINI_API_KEY_4 = os.getenv(
 
 GEMINI_MODEL = os.getenv(
     "GEMINI_MODEL",
-    "models/gemini-3.5-flash"
+    "gemini-3.8-flash"
 ).strip()
 
 # ----------------------------------------------------------
@@ -156,12 +156,12 @@ GEMINI_PLANNER_PRIMARY_MODEL = os.getenv(
 
 GEMINI_PLANNER_FALLBACK_1 = os.getenv(
     "GEMINI_PLANNER_FALLBACK_1",
-    "gemini-3.7-flash"
+    "gemini-3.6-flash"
 ).strip()
 
 GEMINI_PLANNER_FALLBACK_2 = os.getenv(
     "GEMINI_PLANNER_FALLBACK_2",
-    "gemini-3.6-flash"
+    "gemini-3.5-flash"
 ).strip()
 
 # ----------------------------------------------------------

@@ -1266,23 +1266,13 @@ class ConversationPanel(QWidget):
     MAX_WORDS = 1000
 
     GREETINGS = (
-
-        "Welcome, Naresh!",
-
-        "Hey Naresh! Ready when you are.",
-
-        "Welcome back, Naresh!",
-
-        "Good to see you, Naresh!",
-
-        "Hi Naresh! What can I help you with today?",
-
-        "Hello Naresh! DHEEPTHI is ready.",
-
-        "Hey Naresh! Let's get things done.",
-
-        "Welcome, Naresh!",
-
+        "Welcome!",
+        "Ready when you are.",
+        "Welcome back!",
+        "Good to see you!",
+        "What can I help you with today?",
+        "DHEEPTHI is ready.",
+        "Let's get things done.",
     )
 
     # ==========================================================
@@ -1292,7 +1282,7 @@ class ConversationPanel(QWidget):
     def __init__(
         self,
         parent: Optional[QWidget] = None,
-        user_name: str = "Naresh",
+        user_name: Optional[str] = None,
     ):
 
         super().__init__(
@@ -2027,16 +2017,23 @@ class ConversationPanel(QWidget):
             # Select a different greeting from the previous one.
             # --------------------------------------------------
 
+            greeting_pool = list(self.GREETINGS)
+            if self.user_name:
+                greeting_pool = [
+                    f"{g.rstrip('!')}, {self.user_name}!" if g.endswith("!") else f"{g} {self.user_name}!"
+                    for g in self.GREETINGS
+                ]
+
             choices = [
                 item
-                for item in self.GREETINGS
+                for item in greeting_pool
                 if item != self._last_greeting
             ]
 
             if not choices:
 
                 choices = list(
-                    self.GREETINGS
+                    greeting_pool
                 )
 
             greeting = random.choice(
@@ -3208,9 +3205,12 @@ class ConversationPanel(QWidget):
         self._scroll_to_bottom()
 
 
-# ==============================================================
-# INPUT ENABLE
-# ==============================================================
+    def set_user_name(
+        self,
+        user_name: Optional[str]
+    ):
+        """Update active user name for greetings."""
+        self.user_name = user_name
 
     def set_input_enabled(
         self,

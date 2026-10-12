@@ -7,6 +7,8 @@ import threading
 import math
 import struct
 import time
+import uuid
+from datetime import datetime
 from pathlib import Path
 
 from dotenv import load_dotenv
@@ -934,6 +936,24 @@ class GeminiLiveAudioWorker(QThread):
                         # Speech RMS typically ~500 to ~8000; silence < 200.
                         raw_level = max(0.0, (rms - 120.0) / 4500.0)
                         self._current_audio_level = min(1.0, raw_level)
+
+                        # Real-time Barge-In check on microphone energy during speaker playback:
+                        if self.is_output_playing():
+                            if rms > 750.0:
+                                self._consecutive_speech_chunks = getattr(self, "_consecutive_speech_chunks", 0) + 1
+                                if self._consecutive_speech_chunks >= 3:
+                                    print(f"[LIVE BARGE-IN] Vocal speech energy detected during playback (RMS={rms:.1f}). Stopping audio immediately.")
+                                    self.interrupt_and_flush()
+                                    if self.live_session is not None:
+                                        try:
+                                            self.live_session.interrupt_current_response()
+                                        except Exception:
+                                            pass
+                                    self._consecutive_speech_chunks = 0
+                            else:
+                                self._consecutive_speech_chunks = 0
+                        else:
+                            self._consecutive_speech_chunks = 0
                     except Exception as val_err:
                         self.dropped_packets += 1
                         print(f"[LIVE ERROR STAGE 2: PCM validation] {val_err}")
@@ -1232,6 +1252,8 @@ class MainWindow(QMainWindow):
     gemini_live_error_signal = Signal(str)
     gemini_live_closed_signal = Signal()
     gemini_live_go_away_signal = Signal(str)
+    sig_refresh_live_context = Signal()
+    sig_sync_user_identity = Signal()
 
     def __init__(self):
 
@@ -1581,6 +1603,12 @@ class MainWindow(QMainWindow):
         )
         self.gemini_live_go_away_signal.connect(
             self._handle_gemini_live_go_away
+        )
+        self.sig_refresh_live_context.connect(
+            self._maybe_refresh_live_context
+        )
+        self.sig_sync_user_identity.connect(
+            self._sync_user_identity_display
         )
 
         # Prepare the physical laptop microphone monitor. It starts only
@@ -2057,6 +2085,9 @@ class MainWindow(QMainWindow):
         self.gemini_live_user_transcript = ""
         self.gemini_live_output_transcript = ""
         self._live_generation = 0
+        self._current_live_turn_id = 1
+        self._last_processed_live_transcript_key = None
+        self._action_executed_in_current_turn = False
         self._goaway_replacement_in_progress = False
         self._live_recovery_timer = None
         self._live_reconnect_attempts = 0
@@ -2159,6 +2190,48 @@ class MainWindow(QMainWindow):
         self.gemini = GeminiClient()
 
         # ------------------------------------------
+        # Emotion Engine & Persistent Memory Manager
+        # ------------------------------------------
+        self.emotion_engine = getattr(self.gemini, "emotion_engine", None)
+        self.memory_manager = getattr(self.gemini, "memory_manager", None)
+        if self.emotion_engine is None:
+            try:
+                from ai.emotion_engine import EmotionEngine
+                self.emotion_engine = EmotionEngine()
+            except Exception as e:
+                print(f"[MAIN WINDOW] EmotionEngine fallback init error: {e}")
+                self.emotion_engine = None
+        if self.memory_manager is None:
+            try:
+                from ai.memory_manager import MemoryManager
+                self.memory_manager = MemoryManager()
+            except Exception as e:
+                print(f"[MAIN WINDOW] MemoryManager fallback init error: {e}")
+                self.memory_manager = None
+
+        self.db = getattr(self.memory_manager, "db", None) if self.memory_manager is not None else None
+
+        if self.memory_manager is not None:
+            try:
+                self.memory_manager.ensure_canonical_identity()
+                self._sync_user_identity_display()
+            except Exception as e:
+                print(f"[MAIN WINDOW] Ensure canonical identity error: {e}")
+
+        # ------------------------------------------
+        # Session and History Tracking
+        # ------------------------------------------
+        import uuid
+        self._session_id = f"session_{datetime.now().strftime('%Y%m%d_%H%M%S')}_{uuid.uuid4().hex[:6]}"
+        self._persisted_turn_ids = set()
+        self._active_live_turn_str_id = None
+        if hasattr(self, "gemini") and self.gemini:
+            try:
+                self.gemini.restore_history_from_storage()
+            except Exception as e:
+                print(f"[MAIN WINDOW] Restore history error: {e}")
+
+        # ------------------------------------------
         # Multi-Command Planning
         # ------------------------------------------
 
@@ -2218,6 +2291,19 @@ class MainWindow(QMainWindow):
 
         self._backend_ready = True
         return True
+
+    def _sync_user_identity_display(self):
+        """Update header and conversation panel with verified active user name."""
+        try:
+            if hasattr(self, "memory_manager") and self.memory_manager:
+                pref_name, use_name = self.memory_manager.get_user_name_preference()
+                effective_name = pref_name if (pref_name and use_name) else None
+                if hasattr(self, "header") and self.header:
+                    self.header.set_username(effective_name)
+                if hasattr(self, "conversation_panel") and self.conversation_panel:
+                    self.conversation_panel.set_user_name(effective_name)
+        except Exception as error:
+            print(f"[IDENTITY UI SYNC] Error: {error}")
 
     # --------------------------------------------------
     # Speech Completion / Non-Blocking UI Helpers
@@ -9504,6 +9590,10 @@ class MainWindow(QMainWindow):
         """
         Called when initialization fails.
         """
+        self._initialization_failed = True
+        print(f"[DHEEPTHI STARTUP FAILED] Stage: Initialization | Reason: {error}")
+        import traceback
+        traceback.print_stack()
 
         self.status_label.setText(
             "Status : Initialization Failed"
@@ -10087,9 +10177,9 @@ class MainWindow(QMainWindow):
 
     def _start_gemini_live_input_watchdog(self):
         """Keep the existing Gemini Live microphone bridge armed between turns."""
-        if self._closing:
+        if getattr(self, "_closing", False):
             return
-        timer = self._gemini_live_input_watchdog
+        timer = getattr(self, "_gemini_live_input_watchdog", None)
         if timer is None:
             timer = QTimer(self)
             timer.setInterval(750)
@@ -10099,7 +10189,7 @@ class MainWindow(QMainWindow):
             timer.start()
 
     def _stop_gemini_live_input_watchdog(self):
-        timer = self._gemini_live_input_watchdog
+        timer = getattr(self, "_gemini_live_input_watchdog", None)
         if timer is not None:
             try:
                 timer.stop()
@@ -10169,6 +10259,9 @@ class MainWindow(QMainWindow):
         try:
             self._live_generation += 1
             gen = self._live_generation
+            self._current_live_turn_id = 1
+            self._last_processed_live_transcript_key = None
+            self._action_executed_in_current_turn = False
             print(f"[LIVE SESSION] generation={gen} state=starting")
 
             session = self.gemini.create_live_session(
@@ -10191,6 +10284,9 @@ class MainWindow(QMainWindow):
             session.generation = gen
             self.gemini_live_session = session
             self.gemini_live_active = True
+            p_id = getattr(getattr(self, "memory_manager", None), "profile_id", "default")
+            sys_len = len(getattr(session, "system_instruction", "") or "")
+            print(f"[LIVE SESSION INIT] profile_id={p_id} generation={gen} system_instruction_len={sys_len}")
 
             worker = GeminiLiveAudioWorker(session, self)
             worker.generation = gen
@@ -10221,6 +10317,7 @@ class MainWindow(QMainWindow):
             print("[LIVE LIFECYCLE] Ignoring stale worker callback")
             return
         if worker is not None and hasattr(worker, "generation") and worker.generation != self._live_generation:
+            print(f"[LIVE STALE CALLBACK] generation={worker.generation} authoritative_generation={self._live_generation}")
             print("[LIVE LIFECYCLE] Ignoring stale worker callback")
             return
 
@@ -10282,6 +10379,7 @@ class MainWindow(QMainWindow):
             print("[LIVE LIFECYCLE] Ignoring stale worker callback")
             return
         if worker is not None and hasattr(worker, "generation") and worker.generation != self._live_generation:
+            print(f"[LIVE STALE CALLBACK] generation={worker.generation} authoritative_generation={self._live_generation}")
             print("[LIVE LIFECYCLE] Ignoring stale worker callback")
             return
         self._goaway_replacement_in_progress = False
@@ -10294,6 +10392,7 @@ class MainWindow(QMainWindow):
             print("[LIVE LIFECYCLE] Ignoring stale worker callback")
             return
         if worker is not None and hasattr(worker, "generation") and worker.generation != self._live_generation:
+            print(f"[LIVE STALE CALLBACK] generation={worker.generation} authoritative_generation={self._live_generation}")
             print("[LIVE LIFECYCLE] Ignoring stale worker callback")
             return
         print("[LIVE] Audio bridge finished.")
@@ -10445,6 +10544,7 @@ class MainWindow(QMainWindow):
         if getattr(self, "shutdown_started", False) or getattr(self, "_closing", False):
             return
         if gen is not None and gen != self._live_generation:
+            print(f"[LIVE STALE CALLBACK] generation={gen} authoritative_generation={self._live_generation}")
             print("[LIVE LIFECYCLE] Ignoring stale worker callback")
             return
         print("[LIVE] Gemini Live API connected.")
@@ -10491,6 +10591,7 @@ class MainWindow(QMainWindow):
             if getattr(self, "shutdown_started", False) or getattr(self, "_closing", False):
                 return
             if gen is not None and gen != self._live_generation:
+                print(f"[LIVE STALE CALLBACK] generation={gen} authoritative_generation={self._live_generation}")
                 return
             now = time.time()
             text_str = str(text or "").strip()
@@ -10535,13 +10636,23 @@ class MainWindow(QMainWindow):
                     interrupted_id = session.interrupt_current_response()
                 if worker is not None:
                     worker.interrupt_and_flush(response_id=interrupted_id)
+                if hasattr(self, "tts") and self.tts and self.tts.speaking():
+                    try:
+                        self.tts.stop()
+                    except Exception:
+                        pass
+                if hasattr(self, "_active_live_turn_str_id") and self._active_live_turn_str_id and hasattr(self, "memory_manager") and self.memory_manager:
+                    try:
+                        self.memory_manager.mark_turn_interrupted(self._active_live_turn_str_id)
+                    except Exception:
+                        pass
                 t_stop = time.time()
                 lat_ms = (t_stop - t_detect) * 1000.0
                 print(f"[LIVE INTERRUPT] response={interrupted_id} detected_ms={t_detect*1000:.1f} playback_stop_ms={t_stop*1000:.1f} stop_latency_ms={lat_ms:.2f}")
                 self.gemini_live_interrupted_signal.emit()
 
             # -----------------------------------------------------------------
-            # INTERIM TRANSCRIPT GATING (FIX 2):
+            # INTERIM TRANSCRIPT GATING:
             # Interim transcripts only update user-facing display.
             # MUST NEVER execute commands, suppress Gemini audio, or call process_command!
             # -----------------------------------------------------------------
@@ -10552,39 +10663,6 @@ class MainWindow(QMainWindow):
             # FINALIZED INPUT TRANSCRIPT:
             print(f"[PERF] COMMAND_RECEIVED t={now:.3f} text='{text_str}'")
             print(f"[DIAG UI INPUT_TRANSCRIPT] t={now:.3f} text='{text}'")
-
-            # FAST LOCAL DETERMINISTIC COMMAND SUPPRESSION:
-            # Only exact single English/local deterministic commands (e.g., "Open Chrome", "Close Notepad", "What is the time?")
-            # execute locally and should be pre-suppressed. Tanglish, mixed language,
-            # and natural requests MUST stream to Gemini Live so it can generate
-            # semantic <ACTION> tags or normal conversation without audio interruption.
-            is_fast_local_command = False
-            if hasattr(self, "intent_detector") and self.intent_detector is not None:
-                try:
-                    local_intent = self.intent_detector.detect_local_intent_only(text_str)
-                    if local_intent not in (None, "ai_chat"):
-                        is_multi = False
-                        has_tanglish = bool(re.search(r"\b(?:panni|pannu|pannidu|kooda|serthu|apparam|apram|nu|la\b|ah\b|ku\b)\b", text_str, re.I))
-                        if hasattr(self, "semantic_command_planner") and self.semantic_command_planner is not None:
-                            is_multi = self.semantic_command_planner._is_multi_command(text_str)
-                        if not is_multi and not has_tanglish:
-                            is_fast_local_command = True
-                except Exception as error:
-                    print(f"[LIVE RACESAFE] Intent check error: {error}")
-
-            if is_fast_local_command:
-                self._gemini_live_output_suppressed = True
-                if session is not None:
-                    try:
-                        session.suppress_active_and_next_response()
-                    except Exception as err:
-                        print(f"[LIVE] Error suppressing session response: {err}")
-                if worker is not None:
-                    try:
-                        worker.suppress_active_and_next_response()
-                    except Exception as err:
-                        print(f"[LIVE] Error suppressing worker response: {err}")
-                print(f"[LIVE RACESAFE] Deterministic local command detected: '{text_str}' -> Gemini model output suppressed.")
 
             self.gemini_live_input_signal.emit(text_str)
 
@@ -10600,6 +10678,7 @@ class MainWindow(QMainWindow):
                 print("[LIVE TURN] Blocked because shutdown_started=True")
                 return
             if gen is not None and gen != self._live_generation:
+                print(f"[LIVE STALE CALLBACK] generation={gen} authoritative_generation={self._live_generation}")
                 print(f"[LIVE STALE] session=gen{gen} response={response_id} action=callback_rejected_stale_generation")
                 print("[LIVE TURN] Ignoring stale response callback")
                 return
@@ -10631,6 +10710,7 @@ class MainWindow(QMainWindow):
             if getattr(self, "shutdown_started", False) or getattr(self, "_closing", False):
                 return
             if gen is not None and gen != self._live_generation:
+                print(f"[LIVE STALE CALLBACK] generation={gen} authoritative_generation={self._live_generation}")
                 return
             now = time.time()
             worker = self.gemini_live_audio_worker
@@ -10640,6 +10720,18 @@ class MainWindow(QMainWindow):
             # IMMEDIATE SYNCHRONOUS CANCELLATION ON CALLBACK THREAD
             if worker is not None:
                 worker.interrupt_and_flush(response_id=response_id or 0)
+
+            if hasattr(self, "tts") and self.tts and self.tts.speaking():
+                try:
+                    self.tts.stop()
+                except Exception:
+                    pass
+
+            if hasattr(self, "_active_live_turn_str_id") and self._active_live_turn_str_id and hasattr(self, "memory_manager") and self.memory_manager:
+                try:
+                    self.memory_manager.mark_turn_interrupted(self._active_live_turn_str_id)
+                except Exception:
+                    pass
 
             self.gemini_live_interrupted_signal.emit()
         except Exception as error:
@@ -10652,6 +10744,7 @@ class MainWindow(QMainWindow):
             if getattr(self, "shutdown_started", False) or getattr(self, "_closing", False):
                 return
             if gen is not None and gen != self._live_generation:
+                print(f"[LIVE STALE CALLBACK] generation={gen} authoritative_generation={self._live_generation}")
                 return
             now = time.time()
             print(f"[DIAG UI TURN_COMPLETE] t={now:.3f} user='{user_text}' assistant='{assistant_text}'")
@@ -10669,6 +10762,7 @@ class MainWindow(QMainWindow):
             if getattr(self, "shutdown_started", False) or getattr(self, "_closing", False):
                 return
             if gen is not None and gen != self._live_generation:
+                print(f"[LIVE STALE CALLBACK] generation={gen} authoritative_generation={self._live_generation}")
                 print("[LIVE LIFECYCLE] Ignoring stale worker callback")
                 return
             self.gemini_live_error_signal.emit(str(error or "Gemini Live error."))
@@ -10682,6 +10776,7 @@ class MainWindow(QMainWindow):
             if getattr(self, "shutdown_started", False) or getattr(self, "_closing", False):
                 return
             if gen is not None and gen != self._live_generation:
+                print(f"[LIVE STALE CALLBACK] generation={gen} authoritative_generation={self._live_generation}")
                 print("[LIVE LIFECYCLE] Ignoring stale worker callback")
                 return
             self.gemini_live_closed_signal.emit()
@@ -10696,6 +10791,7 @@ class MainWindow(QMainWindow):
                 print("[LIVE LIFECYCLE] Reconnect suppressed because shutdown_started=True")
                 return
             if gen is not None and gen != self._live_generation:
+                print(f"[LIVE STALE CALLBACK] generation={gen} authoritative_generation={self._live_generation}")
                 print("[LIVE LIFECYCLE] Ignoring stale worker callback")
                 return
             self.gemini_live_go_away_signal.emit(str(time_left or ""))
@@ -10761,11 +10857,29 @@ class MainWindow(QMainWindow):
                 print("[LIVE TURN] Suppressed reason=command_in_progress")
                 return
 
-            # Deduplicate identical consecutive transcripts
-            if text == getattr(self, "gemini_live_last_command", ""):
+            # Deduplicate identical consecutive finalized transcripts for the current turn
+            current_turn = getattr(self, "_current_live_turn_id", 1)
+            current_live_gen = getattr(self, "_live_generation", 0)
+            turn_key = (current_live_gen, current_turn, text)
+            if getattr(self, "_last_processed_live_transcript_key", None) == turn_key:
+                print(f"[LIVE DUPLICATE TRANSCRIPT] session_generation={current_live_gen} turn_id={current_turn} transcript='{text}'")
                 return
+            self._last_processed_live_transcript_key = turn_key
 
             self.gemini_live_user_transcript = text
+            session_id = getattr(self, "_session_id", "default_session")
+            turn_str_id = f"live_turn_{session_id}_{current_turn}"
+            self._active_live_turn_str_id = turn_str_id
+            if hasattr(self, "memory_manager") and self.memory_manager:
+                try:
+                    self.memory_manager.save_user_turn(
+                        user_text=text,
+                        turn_id=turn_str_id,
+                        session_id=session_id,
+                        input_source="gemini_live"
+                    )
+                except Exception as mm_err:
+                    print(f"[MEMORY] Error persisting raw user turn: {mm_err}")
 
             try:
                 display_text = self._filter_user_speech_display_transcript(text)
@@ -10838,16 +10952,23 @@ class MainWindow(QMainWindow):
                 print(f"Local intent       : {local_intent}")
                 print("=======================================================\n")
 
-
                 self.processing_voice = True
 
                 worker = self.gemini_live_audio_worker
                 if worker is not None:
                     try:
                         worker.clear_output()
+                        worker.suppress_active_and_next_response()
                         worker.set_input_enabled(False)
                     except Exception as error:
                         print(f"[LIVE -> COMMAND] Failed to gate Live audio input: {error}")
+
+                session = self.gemini_live_session
+                if session is not None:
+                    try:
+                        session.suppress_active_and_next_response()
+                    except Exception as error:
+                        print(f"[LIVE -> COMMAND] Failed to suppress Live session: {error}")
 
                 self.gemini_live_mic_enabled = False
 
@@ -10885,16 +11006,18 @@ class MainWindow(QMainWindow):
             except Exception:
                 pass
 
-            # SUBMIT USER TURN TO ACTIVE LIVE SESSION
+            # GEMINI LIVE REALTIME CONVERSATION (Audio-driven)
             session_id = getattr(session, "session_id", "none") if session else "none"
-            print("[LIVE TURN] New user turn started")
-            print(f"[LIVE TURN] Active session={session_id}")
+            turn_id = getattr(self, "_current_live_turn_id", 1)
+            resp_id = getattr(session, "_active_response_id", 1) if session else 1
 
             if session is not None and getattr(session, "_started", False) and not getattr(session, "_closing", threading.Event()).is_set():
                 new_resp_id = session.start_user_turn(text)
                 if worker is not None:
                     worker.set_active_response_id(new_resp_id)
+                current_live_gen = getattr(self, "_live_generation", 0)
                 print(f"[LIVE TURN] User turn processed (audio-driven, resp_id={new_resp_id})")
+                print(f"[LIVE TURN TRACE] session_generation={current_live_gen} turn_id={turn_id} transcript_id=final response_id={new_resp_id} state=awaiting_model_response")
                 print("[LIVE TURN] Awaiting model response")
             else:
                 print("[LIVE TURN] Suppressed reason=no_active_session")
@@ -11127,6 +11250,24 @@ class MainWindow(QMainWindow):
                 intent, entities, raw_text, is_multi
             )
 
+            t_cmd_exec_start = time.time()
+            cmd_id = 0
+            if hasattr(self, "db") and self.db:
+                try:
+                    target_str = str(entities.get("target") or entities.get("app") or entities.get("query") or "") if isinstance(entities, dict) else ""
+                    ent_str = json.dumps(entities) if isinstance(entities, dict) else str(entities)
+                    cmd_id = self.db.log_command_execution(
+                        command=raw_text or str(intent),
+                        intent=intent,
+                        target=target_str,
+                        status="started",
+                        session_id=getattr(self, "_session_id", None),
+                        turn_id=getattr(self, "_active_live_turn_str_id", None),
+                        entities=ent_str,
+                    )
+                except Exception as log_err:
+                    print(f"[MEMORY] Log command start error: {log_err}")
+
             try:
                 result = self.dispatcher.dispatch(
                     intent=intent,
@@ -11139,12 +11280,23 @@ class MainWindow(QMainWindow):
                 print(f"[SEMANTIC] INTENT: {intent}")
                 print(f"[SEMANTIC] ENTITIES: {entities}")
                 print(f"[SEMANTIC] ERROR: {exc}")
+                if cmd_id and hasattr(self, "db") and self.db:
+                    try:
+                        self.db.update_command_execution(
+                            command_id=cmd_id,
+                            status="failed",
+                            error_summary=str(exc),
+                            execution_time_ms=int((time.time() - t_cmd_exec_start) * 1000)
+                        )
+                    except Exception:
+                        pass
                 all_success = False
                 failed_info = (intent, entities, str(exc))
                 break
 
             last_result = result
             success = bool(result.get("success", False)) if isinstance(result, dict) else bool(result)
+            exec_ms = int((time.time() - t_cmd_exec_start) * 1000)
             if not success:
                 err_msg = (
                     result.get("message")
@@ -11157,9 +11309,31 @@ class MainWindow(QMainWindow):
                 print(f"[SEMANTIC] INTENT: {intent}")
                 print(f"[SEMANTIC] ENTITIES: {entities}")
                 print(f"[SEMANTIC] ERROR: {err_msg}")
+                if cmd_id and hasattr(self, "db") and self.db:
+                    try:
+                        self.db.update_command_execution(
+                            command_id=cmd_id,
+                            status="failed",
+                            error_summary=str(err_msg),
+                            execution_time_ms=exec_ms
+                        )
+                    except Exception:
+                        pass
                 all_success = False
                 failed_info = (intent, entities, err_msg)
                 break
+            else:
+                if cmd_id and hasattr(self, "db") and self.db:
+                    try:
+                        res_summary = result.get("message") or "Command completed successfully" if isinstance(result, dict) else "SUCCESS"
+                        self.db.update_command_execution(
+                            command_id=cmd_id,
+                            status="completed",
+                            result_summary=str(res_summary),
+                            execution_time_ms=exec_ms
+                        )
+                    except Exception:
+                        pass
 
             print(f"[EXECUTION] ACTION {idx} SUCCESS")
 
@@ -11263,7 +11437,7 @@ class MainWindow(QMainWindow):
     @Slot(str)
     def _handle_gemini_live_output_transcript(self, text):
         try:
-            if getattr(self, "shutdown_started", False) or self._closing or not text:
+            if getattr(self, "shutdown_started", False) or getattr(self, "_closing", False) or not text:
                 return
 
             if (
@@ -11278,6 +11452,10 @@ class MainWindow(QMainWindow):
             # Application-side ACTION extraction layer
             action_cmd = self._extract_action_command(self.gemini_live_output_transcript)
             if action_cmd:
+                if getattr(self, "_action_executed_in_current_turn", False):
+                    print(f"[SEMANTIC DEDUP] Action already executed in current turn: '{action_cmd}'")
+                    return
+                self._action_executed_in_current_turn = True
                 print(f"[SEMANTIC] Gemini output: {self.gemini_live_output_transcript.strip()}")
                 print("[SEMANTIC] ACTION detected")
                 print(f"[SEMANTIC] Normalized command: {action_cmd}")
@@ -11361,6 +11539,9 @@ class MainWindow(QMainWindow):
                 return
 
             print("[LIVE] Model response interrupted by user speech.")
+            self._current_live_turn_id = getattr(self, "_current_live_turn_id", 1) + 1
+            self._action_executed_in_current_turn = False
+            self._last_processed_live_transcript_key = None
             self.gemini_live_output_transcript = ""
             self.status_label.setText("Status : Listening")
             self._set_avatar_state("listening")
@@ -11385,7 +11566,7 @@ class MainWindow(QMainWindow):
     @Slot(str, str)
     def _handle_gemini_live_turn_complete(self, user_text, assistant_text):
         try:
-            if getattr(self, "shutdown_started", False) or self._closing:
+            if getattr(self, "shutdown_started", False) or getattr(self, "_closing", False):
                 return
 
             # Do not disrupt an active desktop automation flow
@@ -11404,13 +11585,18 @@ class MainWindow(QMainWindow):
             # Application-side ACTION extraction check on completed turn
             action_cmd = self._extract_action_command(target_assistant_text)
             if action_cmd:
-                now = time.time()
-                last_cmd = getattr(self, "_last_routed_action_cmd", "")
-                last_time = getattr(self, "_last_routed_action_time", 0.0)
-                if action_cmd.lower().strip() == last_cmd.lower().strip() and (now - last_time < 3.0):
+                if getattr(self, "_action_executed_in_current_turn", False):
                     print(f"[SEMANTIC DEDUP] Turn complete action already executed: '{action_cmd}'")
+                    self.gemini_live_output_transcript = ""
+                    turn_completed_id = getattr(self, "_current_live_turn_id", 1)
+                    current_live_gen = getattr(self, "_live_generation", 0)
+                    print(f"[LIVE TURN TRACE] session_generation={current_live_gen} turn_id={turn_completed_id} transcript_id=final response_id=completed state=turn_complete")
+                    self._current_live_turn_id = turn_completed_id + 1
+                    self._action_executed_in_current_turn = False
+                    self._last_processed_live_transcript_key = None
                     return
 
+                self._action_executed_in_current_turn = True
                 print(f"[SEMANTIC] Gemini output: {target_assistant_text.strip()}")
                 print("[SEMANTIC] ACTION detected")
                 print(f"[SEMANTIC] Normalized command: {action_cmd}")
@@ -11433,6 +11619,12 @@ class MainWindow(QMainWindow):
                     pass
 
                 self.gemini_live_output_transcript = ""
+                turn_completed_id = getattr(self, "_current_live_turn_id", 1)
+                current_live_gen = getattr(self, "_live_generation", 0)
+                print(f"[LIVE TURN TRACE] session_generation={current_live_gen} turn_id={turn_completed_id} transcript_id=final response_id=completed state=turn_complete")
+                self._current_live_turn_id = turn_completed_id + 1
+                self._last_processed_live_transcript_key = None
+                self._async_persist_turn(user_text, target_assistant_text, intent="desktop_action", target=action_cmd)
                 self._route_action_command_to_semantic_pipeline(action_cmd)
                 return
 
@@ -11484,6 +11676,22 @@ class MainWindow(QMainWindow):
                 except Exception:
                     pass
 
+            turn_completed_id = getattr(self, "_current_live_turn_id", 1)
+            session_id = getattr(self, "_session_id", "default_session")
+            turn_str_id = getattr(self, "_active_live_turn_str_id", f"live_turn_{session_id}_{turn_completed_id}")
+            current_live_gen = getattr(self, "_live_generation", 0)
+            print(f"[LIVE TURN TRACE] session_generation={current_live_gen} turn_id={turn_completed_id} transcript_id=final response_id=completed state=turn_complete")
+            self._current_live_turn_id = turn_completed_id + 1
+            self._action_executed_in_current_turn = False
+            self._last_processed_live_transcript_key = None
+            self._async_persist_turn(
+                user_text,
+                target_assistant_text,
+                intent="conversation",
+                turn_id=turn_str_id,
+                session_id=session_id,
+                input_source="gemini_live"
+            )
             self.gemini_live_output_transcript = ""
 
         except Exception as error:
@@ -11495,6 +11703,102 @@ class MainWindow(QMainWindow):
                 self._set_avatar_state("listening")
             except Exception:
                 pass
+
+    def _async_persist_turn(
+        self,
+        user_text,
+        assistant_text,
+        intent="conversation",
+        target="",
+        turn_id=None,
+        session_id=None,
+        input_source="voice",
+        turn_status="completed"
+    ):
+        """
+        Asynchronously persists a completed conversation or action turn,
+        updates the emotional state machine, and extracts episodic/profile memories.
+        Runs on a daemon thread to guarantee zero latency on active audio or command execution.
+        """
+        user_clean = str(user_text or "").strip()
+        assistant_clean = str(assistant_text or "").strip()
+
+        if not user_clean and not assistant_clean:
+            return
+
+        effective_session_id = session_id or getattr(self, "_session_id", "default_session")
+        effective_turn_id = turn_id or getattr(self, "_active_live_turn_str_id", None)
+        if not effective_turn_id:
+            effective_turn_id = f"turn_{effective_session_id}_{int(time.time() * 1000)}"
+
+        # Deduplication check for repeated callbacks
+        persisted_set = getattr(self, "_persisted_turn_ids", None)
+        if persisted_set is not None:
+            if effective_turn_id in persisted_set and not target and turn_status == "completed":
+                print(f"[MEMORY] Turn {effective_turn_id} already persisted. Skipping duplicate persistence.")
+                return
+            persisted_set.add(effective_turn_id)
+
+        def _worker():
+            try:
+                # 1. Update emotional state if user spoke
+                if user_clean and hasattr(self, "emotion_engine") and self.emotion_engine:
+                    transition = self.emotion_engine.process_turn(user_clean)
+                    stimulus = transition.get("stimulus", "neutral")
+                    new_mood = transition.get("new_mood", "neutral")
+                    val = transition.get("valence", 0.55)
+                    print(f"[EMOTION ASYNC] Turn evaluated: stimulus={stimulus} -> mood={new_mood} valence={val:.2f}")
+
+                # 2. Persist turn and extract episodic / profile memories
+                if hasattr(self, "memory_manager") and self.memory_manager:
+                    self.memory_manager.save_turn(
+                        user_text=user_clean,
+                        assistant_text=assistant_clean,
+                        intent=intent,
+                        target=target,
+                        session_id=effective_session_id,
+                        turn_id=effective_turn_id,
+                        input_source=input_source,
+                        turn_status=turn_status,
+                    )
+                    try:
+                        self.sig_sync_user_identity.emit()
+                    except Exception:
+                        pass
+                    # If new facts were learned, schedule safe Live session context refresh
+                    new_mems = getattr(self.memory_manager, "last_extracted_memory_ids", [])
+                    if new_mems and getattr(self, "gemini_live_active", False):
+                        print(f"[LIVE CONTEXT REFRESH] New memories extracted ({len(new_mems)} facts: {new_mems}). Scheduling Live context refresh.")
+                        try:
+                            self.sig_refresh_live_context.emit()
+                        except Exception:
+                            pass
+            except Exception as error:
+                print(f"[MEMORY/EMOTION ASYNC] Error in turn persistence: {error}")
+
+        threading.Thread(target=_worker, name="MemoryEmotionSyncWorker", daemon=True).start()
+
+    def _maybe_refresh_live_context(self):
+        """
+        Safely refreshes the running Gemini Live session when new persistent memories
+        were extracted, ensuring updated system instructions take effect without
+        disrupting active speech or command execution.
+        """
+        if getattr(self, "shutdown_started", False) or getattr(self, "_closing", False):
+            return
+        if getattr(self, "gemini_live_command_handoff", False) or getattr(self, "processing_voice", False):
+            return
+        worker = getattr(self, "gemini_live_audio_worker", None)
+        if worker is not None and worker.is_output_playing():
+            try:
+                QTimer.singleShot(1500, self._maybe_refresh_live_context)
+            except Exception:
+                pass
+            return
+
+        if getattr(self, "gemini_live_active", False) and not self.physical_microphone_muted:
+            print("[LIVE CONTEXT] Seamlessly refreshing Live session to inject updated memory context into system instruction...")
+            self._start_gemini_live_conversation()
 
     def _cancel_live_recovery_timer(self):
         """Cancel and clean up any pending Live recovery timer."""
@@ -11671,8 +11975,8 @@ class MainWindow(QMainWindow):
     def _stop_gemini_live_conversation(self, clear_audio=True, restart_live=False):
         """Stop the current Live session; restart_live is kept for compatibility and ignored."""
         self._stop_gemini_live_input_watchdog()
-        self._live_generation += 1
-        print(f"[LIVE SESSION] generation={self._live_generation} state=stopped")
+        current_gen = getattr(self, "_live_generation", 0)
+        print(f"[LIVE SESSION] generation={current_gen} state=stopped")
         worker = self.gemini_live_audio_worker
         session = self.gemini_live_session
         self.gemini_live_active = False
@@ -11729,7 +12033,7 @@ class MainWindow(QMainWindow):
         flow completes.  A healthy Gemini Live session is NEVER recreated
         here; only its microphone input gate is re-enabled.
         """
-        if getattr(self, "shutdown_started", False) or self._closing or getattr(self, "_startup_greeting_active", False):
+        if getattr(self, "shutdown_started", False) or getattr(self, "_closing", False) or getattr(self, "_startup_greeting_active", False):
             return
 
         self.processing_voice = False
@@ -12524,18 +12828,43 @@ class MainWindow(QMainWindow):
             text or ""
         ).strip()
 
+        self._current_text_chat_user_message = text
+
         if not text:
-
             try:
-
                 self.conversation_panel.show_error(
                     "Please enter a message."
                 )
+            except Exception:
+                pass
+            return
 
+        # Immediate barge-in stop for active assistant playback
+        if hasattr(self, "tts") and self.tts and self.tts.speaking():
+            try:
+                self.tts.stop()
+            except Exception:
+                pass
+        if hasattr(self, "gemini_live_audio_worker") and self.gemini_live_audio_worker and self.gemini_live_audio_worker.is_output_playing():
+            try:
+                self.gemini_live_audio_worker.interrupt_and_flush()
             except Exception:
                 pass
 
-            return
+        session_id = getattr(self, "_session_id", "default_session")
+        turn_str_id = f"text_turn_{session_id}_{int(time.time() * 1000)}"
+        self._current_text_turn_id = turn_str_id
+        if hasattr(self, "memory_manager") and self.memory_manager:
+            try:
+                self.memory_manager.save_user_turn(
+                    user_text=text,
+                    turn_id=turn_str_id,
+                    session_id=session_id,
+                    input_source="text_input",
+                    intent="conversation"
+                )
+            except Exception as mm_err:
+                print(f"[MEMORY] Error persisting raw text turn: {mm_err}")
 
         if self.gemini is None:
 
@@ -14512,6 +14841,18 @@ class MainWindow(QMainWindow):
                 reply
             )
 
+            user_msg = getattr(self, "_current_text_chat_user_message", "")
+            t_id = getattr(self, "_current_text_turn_id", None)
+            s_id = getattr(self, "_session_id", "default_session")
+            self._async_persist_turn(
+                user_msg,
+                reply,
+                intent="text_chat",
+                turn_id=t_id,
+                session_id=s_id,
+                input_source="text_input"
+            )
+
             # Gemini can return an official website as a normal URL or
             # as a markdown link. Make that link clickable in ASTRA.
             self._make_latest_gemini_response_clickable(
@@ -14610,6 +14951,29 @@ class MainWindow(QMainWindow):
         self.status_label.setText(
             "Status : Conversation Error"
         )
+
+        t_id = getattr(self, "_current_text_turn_id", None)
+        user_msg = getattr(self, "_current_text_chat_user_message", "")
+        s_id = getattr(self, "_session_id", "default_session")
+        if t_id and hasattr(self, "db") and self.db:
+            try:
+                self.db.update_turn_status(t_id, "failed")
+            except Exception:
+                pass
+
+        if user_msg or t_id:
+            try:
+                self._async_persist_turn(
+                    user_msg,
+                    f"Error: {message}",
+                    intent="text_chat",
+                    turn_id=t_id,
+                    session_id=s_id,
+                    input_source="text_input",
+                    turn_status="error",
+                )
+            except Exception as e_err:
+                print(f"[MEMORY] Error turn persistence failed: {e_err}")
 
         try:
 
@@ -15364,13 +15728,30 @@ class MainWindow(QMainWindow):
         if self._closing or self._backend_initialization_started:
             return
 
-        if not self.create_backend():
+        try:
+            if not self.create_backend():
+                self.initialization_failed(
+                    "Backend initialization failed. Check the DHEEPTHI-AI console for details."
+                )
+                return
+        except Exception as error:
+            import traceback
+            print(f"[STARTUP ERROR] Exception during backend creation: {error}")
+            traceback.print_exc()
             self.initialization_failed(
-                "Backend initialization failed. Check the ASTRA-AI console for details."
+                f"Backend initialization exception: {error}"
             )
             return
 
-        self.start_initialization()
+        try:
+            self.start_initialization()
+        except Exception as error:
+            import traceback
+            print(f"[STARTUP ERROR] Exception starting initialization worker: {error}")
+            traceback.print_exc()
+            self.initialization_failed(
+                f"Worker initialization exception: {error}"
+            )
 
     # --------------------------------------------------
     # Okii, byee! See youu soon 🫶 Shutdown
@@ -15873,6 +16254,13 @@ class MainWindow(QMainWindow):
 
             # Synchronously and sequentially tear down Gemini Live BEFORE goodbye TTS
             self._shutdown_gemini_live_synchronously()
+
+            # The goodbye TTS sequence runs only during a legitimate shutdown,
+            # not as a side effect of initialization failure handling.
+            if not getattr(self, "loading_finished", False) or getattr(self, "_initialization_failed", False):
+                print("[DHEEPTHI SHUTDOWN] Bypassing goodbye TTS because startup was not completed.")
+                self._finish_goodbye_shutdown()
+                return
 
             self._begin_goodbye_shutdown(
                 event

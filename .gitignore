@@ -86,7 +86,12 @@ Thumbs.db
 # Local-Only Development Tests & Diagnostic Tools
 # ------------------------------------------------------------
 
-tests/
+# Allow test suite to be version controlled, but ignore generated artifacts
+tests/artifacts/
+tests/results/
+tests/runtime_file_system_agent/
+tests/vision_result/
+tests/vision_samples/
 tools/
 
 

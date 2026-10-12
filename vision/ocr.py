@@ -195,12 +195,12 @@ class OCREngine:
         self.model = getattr(
             settings,
             "GEMINI_MODEL",
-            "models/gemini-3.5-flash",
+            "gemini-3.8-flash",
         )
 
         self.model = (
             str(self.model).strip()
-            or "models/gemini-3.5-flash"
+            or "gemini-3.8-flash"
         )
 
         # --------------------------------------------------

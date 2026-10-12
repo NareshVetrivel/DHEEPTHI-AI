@@ -99,8 +99,11 @@ Built with PySide6 and the Google GenAI SDK, DHEEPTHI connects directly to **Gem
 - **Synchronized Visual States:** Realtime state orchestration across `IDLE`, `LISTENING`, `USER SPEAKING`, `SPEAKING`, and `MUTED`.
 - **Animated Startup Experience:** Hardware-accelerated splash screen with drifting canvas particle twinkles, glowing progress synchronization, and a smooth cross-dissolve transition into the main dashboard.
 
-### 🔒 Built-in Privacy & Safety Rules
-- **RAM-Only Conversation Memory:** Chat context is maintained strictly in volatile RAM for the duration of the active session and is wiped upon application closure. Transcripts are never persisted to disk.
+### 🧠 Persistent SQLite Memory & Multi-Profile Architecture
+- **5-Tier Persistent Memory System:** Conversation turns, structured user facts, personal memories (relationships, education, work), commitments, and emotional history are persisted in a local SQLite database (`database/astra.db`).
+- **Profile Isolation & Provenance:** Facts and conversation turns are tracked by `profile_id`, preventing cross-profile leakage, with full provenance timestamps and status flags (`active`, `archived`, `corrected`).
+- **Real-Time Context Synthesis:** `MemoryManager` and `PersonalityContextBuilder` dynamically inject canonical facts into both standard Gemini and Gemini Live system prompts, with automatic cold-restart recovery.
+- **Sensitive Credential Redaction:** Sensitive credentials (passwords, tokens, API keys) are detected and redacted before durable storage.
 - **Prompt & Secret Guardrails:** Strict behavioral boundaries prevent disclosure of hidden system prompts, API keys, private schemas, or internal agent workflows, including resistance against translation-based jailbreak attempts.
 - **India Standard Time (IST) Compliance:** Time queries deterministically pull the local system clock locked to the `Asia/Kolkata` (UTC+05:30) timezone, returning accurate day, date, and hour articulation.
 
@@ -200,7 +203,10 @@ DHEEPTHI-AI/
 │   └── main.py                     # Main application entry point & bootstrap
 ├── ai/
 │   ├── __init__.py
-│   └── gemini_client.py            # Gemini Live audio session, multi-key pool & system prompt
+│   ├── gemini_client.py            # Gemini Live audio session, multi-key pool & system prompt
+│   ├── memory_manager.py           # SQLite conversation turns, facts & episodic memory manager
+│   ├── emotion_engine.py           # Emotional state tracking & sentiment reactivity
+│   └── personality_context_builder.py # Real-time prompt context synthesizer with verified memory
 ├── automation/
 │   ├── __init__.py
 │   ├── app_launcher.py             # Application launcher
@@ -357,11 +363,78 @@ python -m app.main
 
 ---
 
+## Running Safe Automated Tests
+
+Automated regression and memory tests utilize isolated synthetic databases and mock network/audio where appropriate to guarantee safety and prevent modifying the production database (`database/astra.db`):
+
+```powershell
+# Run the Master V1 Verification Suite (models, interruption, persistence, isolation)
+python -m unittest tests/test_master_v1_verification.py
+
+# Run Persistent Memory & Education Recall Suite
+python -m unittest tests/test_gemini_live_persistent_memory.py
+
+# Run Cold-Restart End-to-End Simulation Suite
+python -m unittest tests/test_real_cold_restart_e2e.py
+
+# Run Comprehensive Memory & Behavior Rules
+python -m unittest tests/test_comprehensive_memory_v1.py
+python -m unittest tests/test_v1_behavior_rules.py
+
+# Run Multi-Process Cold-Restart Verification
+python tests/verify_cold_restart_multi_process.py
+
+# Run Code Agent Automation Suite (pytest)
+pytest tests/test_code_agent.py
+pytest tests/test_lifelong_conversational_memory.py
+```
+
+> **Note:** Tests that instantiate the full desktop GUI or bind to physical audio devices require a display session and should not be run in headless/CI environments.
+
+---
+
+## Live Demonstration Guide (College Staff Presentation)
+
+Follow this structured demonstration flow during staff review:
+
+### Pre-Flight Verification
+1. Ensure your laptop is connected to stable internet.
+2. Verify `.env` contains a valid `GEMINI_API_KEY_1` with Google GenAI access.
+3. Confirm your microphone is set as the Windows Default Audio Input device.
+4. Launch from project root:
+   ```powershell
+   python -m app.main
+   ```
+
+### Demonstration Steps
+| Step | Action | Expected Behavior | Subsystem Verified |
+|---|---|---|---|
+| **1. Startup Experience** | Launch `python -m app.main` | Particle-animated splash screen smoothly cross-dissolves to main maximized dashboard | `SplashScreen`, `MainWindow`, `InitializationWorker` |
+| **2. Natural Voice Interaction** | Say: *"Hello Dheepthi, how are you today?"* | Visualizer displays audio waveform; assistant responds naturally with `Aoede` voice | `GeminiLiveAudioWorker`, `UserSpeechPanel` |
+| **3. Trilingual Understanding** | Say: *"Enna panra? Today weather pathi sollu."* | Fluent comprehension in conversational Tanglish; natural conversational response | Trilingual NLU, Tanglish Prompt Guardrails |
+| **4. Ingest Personal Fact** | Say: *"Naan Sona College of Technology-la MCA second year padikiren."* | Assistant confirms receipt; commits education facts to SQLite with active status | `MemoryManager`, SQLite `personal_memories` |
+| **5. Query Immediate Recall** | Ask: *"Naan endha college-la padikkiren?"* | Correctly states *"Sona College of Technology"* without hallucinating or guessing | `PersonalityContextBuilder`, Fact Extraction |
+| **6. Cold Restart Verification** | Close the application completely. Re-run `python -m app.main`. Ask: *"En course enna?"* | Correctly recalls *"MCA second year"* restored directly from SQLite storage across cold boot | Cold-Restart Persistence, SQLite DB integrity |
+| **7. Laptop Automation** | Say: *"Open Notepad and Calculator"* | Both applications launch in sequence; status tiles update in real time | `MultiCommandPlanner`, `AppLauncher` |
+| **8. Hardware Mute Authority** | Press physical laptop mic mute key (or toggle mute in Windows) | UI switches immediately to `MUTED`; microphone stream to cloud is disarmed | `MicrophoneMonitor`, Windows Core Audio COM |
+
+---
+
+## Verified Limitations & Troubleshooting
+
+- **Operating System Requirement:** DHEEPTHI-AI V1 is strictly built for Windows 10 and Windows 11 (64-bit). Linux and macOS environments are not supported due to direct dependencies on Windows Core Audio COM (`IAudioEndpointVolume`), `pywinauto`, and Win32 COM interfaces.
+- **Gemini Live Availability:** Realtime voice streaming relies on Google GenAI preview endpoint availability (`gemini-3.1-flash-live-preview`). In the event of network disruption or quota exhaustion, configure fallback keys (`GEMINI_API_KEY_2..4`) or utilize the Groq fallback planner.
+- **Physical Audio Hardware:** Real voice input requires physical microphone capture. If running in a virtual machine or remote terminal without audio redirection, voice interaction cannot record input.
+- **Microsoft Word Requirement:** Document drafting via `WordAgent` requires locally installed Microsoft Office Word with COM automation registered (`win32com.client`).
+- **Database Privacy Notice:** `database/astra.db` contains local user state and must remain excluded from public Git repositories via `.gitignore`. If historical commits contain early development databases, do not publish repository history publicly without running a history cleaner (e.g., `git-filter-repo`).
+
+---
+
 ## Privacy & Security
 
 - **Strict Isolation of Credentials:** API keys and environment variables are read exclusively from the local `.env` file and are never logged or exposed in chat transcripts.
-- **Transient Conversation Context:** Chat context is held exclusively in memory during the active session. Once the application is closed, session history is permanently erased.
-- **Local Index Storage:** File indexing records and application metadata remain inside your local SQLite database (`database/astra.db`), which is strictly excluded from version control.
+- **Local SQLite Persistence:** Conversation turns, structured user facts, personal memories, and file index records reside inside your local SQLite database (`database/astra.db`). The database is strictly excluded from version control to guarantee user privacy.
+- **Automatic Redaction:** Passwords, API tokens, and secret patterns are scrubbed from conversational turns prior to persistence.
 - **Hardware Endpoint Protection:** The hardware mute monitor ensures that muting your physical laptop microphone immediately suppresses all outbound audio at the Windows endpoint level.
 
 ---

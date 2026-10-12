@@ -179,6 +179,9 @@ class GeminiLiveSession:
         self._model_response_received_logged = False
         self._turn_completed = False
         self._audio_chunk_count = 0
+        self._current_turn_id = 1
+        self._last_final_transcript = ""
+        self._final_transcript_processed_for_turn = 0
         _safe_print(f"[LIVE VOICE] session={self.session_id} voice={self.voice}")
 
         # Diagnostics for 1011 & lifecycle tracking
@@ -219,6 +222,9 @@ class GeminiLiveSession:
             self._current_output_transcript = ""
 
         with self._response_lock:
+            self._current_turn_id = 1
+            self._last_final_transcript = ""
+            self._final_transcript_processed_for_turn = 0
             self._active_response_id = 0
             self._speaking_response_id = 0
             self._invalidated_response_ids.clear()
@@ -310,7 +316,7 @@ class GeminiLiveSession:
                 self._session = session
                 self._connected_event.set()
                 self._ready_event.set()
-                print(f"[LIVE DEBUG] session_id={self.session_id} Live session created")
+                print(f"[LIVE DEBUG] session_id={self.session_id} Live session created system_instruction_len={len(self.system_instruction or '')} facts_injected={bool('23. ACTIVE CONTEXT' in (self.system_instruction or ''))}")
                 self._safe_callback(self.on_connected)
 
                 # These two tasks live for the entire Live session.  They are
@@ -469,15 +475,43 @@ class GeminiLiveSession:
                         is_interim = True
 
                     if text:
-                        _safe_print(f"[LIVE INPUT TRANSCRIPT]\ntext={text}\ninterim={is_interim}")
-                        with self._transcript_lock:
-                            self._current_user_transcript = text
+                        if not is_interim:
+                            # Protect against duplicate finalized transcript within the same turn
+                            if (
+                                self._final_transcript_processed_for_turn == self._current_turn_id
+                                and self._last_final_transcript == text
+                            ):
+                                _safe_print(
+                                    f"[LIVE DUPLICATE TRANSCRIPT] session_generation={getattr(self, 'generation', 0)} "
+                                    f"turn_id={self._current_turn_id} transcript='{text}'"
+                                )
+                            else:
+                                self._final_transcript_processed_for_turn = self._current_turn_id
+                                self._last_final_transcript = text
+                                _safe_print(f"[LIVE INPUT TRANSCRIPT]\ntext={text}\ninterim={is_interim}")
+                                _safe_print(
+                                    f"[LIVE TURN TRACE] session_generation={getattr(self, 'generation', 0)} "
+                                    f"turn_id={self._current_turn_id} transcript_id=final "
+                                    f"response_id={self._active_response_id or 1} state=input_transcribed"
+                                )
+                                with self._transcript_lock:
+                                    self._current_user_transcript = text
 
-                        self._safe_callback(
-                            self.on_input_transcript,
-                            text,
-                            is_interim,
-                        )
+                                self._safe_callback(
+                                    self.on_input_transcript,
+                                    text,
+                                    is_interim,
+                                )
+                        else:
+                            _safe_print(f"[LIVE INPUT TRANSCRIPT]\ntext={text}\ninterim={is_interim}")
+                            with self._transcript_lock:
+                                self._current_user_transcript = text
+
+                            self._safe_callback(
+                                self.on_input_transcript,
+                                text,
+                                is_interim,
+                            )
 
                     # Check server-side interruption flag first
                     if interrupted:
@@ -593,6 +627,11 @@ class GeminiLiveSession:
                                     _safe_print(f"[LIVE] SPEAKING START")
                                     _safe_print(f"[LIVE] RESPONSE ID: {current_resp_id}")
                                     _safe_print(f"[LIVE RESPONSE] session={self.session_id} response={current_resp_id} event=speaking")
+                                    _safe_print(
+                                        f"[LIVE RESPONSE TRACE] session_generation={getattr(self, 'generation', 0)} "
+                                        f"turn_id={self._current_turn_id} response_id={current_resp_id} "
+                                        f"creation_source=server_vad"
+                                    )
                                 if not getattr(self, "_model_response_received_logged", False):
                                     self._model_response_received_logged = True
                                     _safe_print(f"[LIVE TURN] Model response received")
@@ -644,6 +683,11 @@ class GeminiLiveSession:
                         _safe_print(f"[LIVE TURN COMPLETE]\nreceived=True")
                         with self._response_lock:
                             completed_resp_id = self._speaking_response_id or self._active_response_id
+                            _safe_print(
+                                f"[LIVE TURN TRACE] session_generation={getattr(self, 'generation', 0)} "
+                                f"turn_id={self._current_turn_id} transcript_id=final "
+                                f"response_id={completed_resp_id} state=completed"
+                            )
                             self._is_model_speaking = False
                             self._speaking_response_id = 0
                             self._model_response_received_logged = False
@@ -658,6 +702,11 @@ class GeminiLiveSession:
                             self._suppress_upcoming_response = False
                             self._current_turn_interrupted = False
                             self._turn_completed = True
+                            # Advance turn identity for subsequent user turns on the SAME live session
+                            self._current_turn_id += 1
+                            self._active_response_id = self._current_turn_id
+                            self._last_final_transcript = ""
+                            self._final_transcript_processed_for_turn = 0
                         with self._transcript_lock:
                             user_text = self._current_user_transcript.strip()
                             assistant_text = "" if was_suppressed else self._current_output_transcript.strip()
@@ -683,7 +732,16 @@ class GeminiLiveSession:
                 dt_rx = (now - self.last_receive_time) if self.last_receive_time else -1.0
                 dt_tx = (now - self.last_send_time) if self.last_send_time else -1.0
                 qsize = self._audio_queue.qsize() if self._audio_queue else 0
+                err_str = str(error)
                 _safe_print(f"[LIVE RX ERROR]\n{type(error).__name__}: {error}")
+                if "1011" in err_str:
+                    _safe_print(
+                        f"[LIVE 1011 DIAGNOSTIC] generation={getattr(self, 'generation', 0)} "
+                        f"turn_id={self._current_turn_id} response_id={self._active_response_id} "
+                        f"tx_count={self.send_packet_count} rx_count={self.receive_event_count} "
+                        f"queue_depth={qsize} input_enabled={not self._closing.is_set()} "
+                        f"session_state={'active' if not self._closing.is_set() else 'closing'}"
+                    )
                 _safe_print(
                     f"[LIVE STAGE 5 ERROR: receive_loop] session_id={self.session_id} "
                     f"type={type(error).__name__} err='{error}' "
@@ -914,6 +972,11 @@ class GeminiLiveSession:
             self._turn_completed = False
             self._audio_chunk_count = 0
             _safe_print(f"[LIVE RESPONSE] session={self.session_id} response={new_id} event=started")
+            _safe_print(
+                f"[LIVE RESPONSE TRACE] session_generation={getattr(self, 'generation', 0)} "
+                f"turn_id={self._current_turn_id} response_id={new_id} "
+                f"creation_source=manual_turn_start"
+            )
             return new_id
 
     def submit_user_turn(self, text: str) -> bool:
@@ -1101,7 +1164,7 @@ class GeminiClient:
     # Initialize
     # ------------------------------------------------------
 
-    def __init__(self):
+    def __init__(self, memory_manager: Optional[Any] = None, emotion_engine: Optional[Any] = None):
 
         # ------------------------------------------
         # Gemini API Keys
@@ -1140,23 +1203,21 @@ class GeminiClient:
         self.model = getattr(
             settings,
             "GEMINI_MODEL",
-            "models/gemini-3.5-flash"
+            "gemini-3.8-flash"
         )
 
         # ------------------------------------------
         # Semantic Planner Model Hierarchy
         # ------------------------------------------
         # Priority order:
-        # 1. Gemini 3.8 Flash High
-        # 2. Gemini 3.7 Flash Medium
-        # 3. Gemini 3.6 Flash Medium
-        # 4. Existing valid Gemini fallback (gemini-3.5-flash)
-        # 5. Groq cloud planner fallback
+        # 1. Gemini 3.8 Flash High (gemini-3.8-flash)
+        # 2. Gemini 3.6 Flash Medium (gemini-3.6-flash)
+        # 3. Gemini 3.5 Flash Fallback (gemini-3.5-flash)
+        # 4. Groq cloud planner fallback
         raw_planner_models = [
             getattr(settings, "GEMINI_PLANNER_PRIMARY_MODEL", "gemini-3.8-flash"),
-            getattr(settings, "GEMINI_PLANNER_FALLBACK_1", "gemini-3.7-flash"),
-            getattr(settings, "GEMINI_PLANNER_FALLBACK_2", "gemini-3.6-flash"),
-            getattr(settings, "GEMINI_MODEL", "models/gemini-3.5-flash"),
+            getattr(settings, "GEMINI_PLANNER_FALLBACK_1", "gemini-3.6-flash"),
+            getattr(settings, "GEMINI_PLANNER_FALLBACK_2", "gemini-3.5-flash"),
         ]
         self.semantic_planner_models = []
         for pm in raw_planner_models:
@@ -1247,6 +1308,25 @@ class GeminiClient:
         # ------------------------------------------
 
         self.retry_delay_seconds = 0.5
+
+        # ------------------------------------------
+        # Persistent Memory & Emotion Engine
+        # ------------------------------------------
+        try:
+            from ai.emotion_engine import EmotionEngine
+            from ai.memory_manager import MemoryManager
+            from ai.personality_context_builder import PersonalityContextBuilder
+
+            self.emotion_engine = emotion_engine if emotion_engine is not None else EmotionEngine()
+            self.memory_manager = memory_manager if memory_manager is not None else MemoryManager()
+            self.context_builder = PersonalityContextBuilder
+        except Exception as error:
+            print(f"[GEMINI CLIENT] Error initializing emotion/memory engines: {error}")
+            self.emotion_engine = None
+            self.memory_manager = None
+            self.context_builder = None
+
+        self.restore_history_from_storage()
 
         # ------------------------------------------
         # Thread Lock
@@ -1527,7 +1607,7 @@ Never mention any application/company identity
 unless the user explicitly asks about it.
 
 ==================================================
-2. CREATOR IDENTITY
+2. CREATOR IDENTITY & USER NAME SAFETY
 ==================================================
 
 DHEEPTHI was created by:
@@ -1540,6 +1620,31 @@ If the user asks who created you, answer naturally:
 "Enna Naresh um Ragavendhiran um create pannanga."
 
 Do not invent or mention any other creator.
+
+CRITICAL USER NAME SAFETY & SEPARATION:
+Creator identity (Naresh, Ragavendhiran) is completely separate
+from the current user's identity:
+- NEVER assume the person speaking to you is Naresh or Ragavendhiran.
+- NEVER invent, guess, or fabricate a name for the user (such as Karthik, Rahul, Arun, etc.).
+- NEVER address the user with ANY unverified, random, or hallucinated name under any circumstances.
+- NEVER address the user with a name unless application memory explicitly specifies that name as the user's preferred address name.
+- If application memory explicitly verifies the user as Naresh, address them naturally as Naresh, and NEVER use any other name.
+- If no preferred user name is available, do not use a name. Simply respond naturally (e.g. "Hi! Yes, I can hear you.").
+- If the user explicitly requested not to use their name, NEVER address them by name.
+- Do not claim that the user previously told you a name unless persistent memory actually contains explicit evidence.
+
+CREATOR RECONCILIATION & SPEAKER SELF-IDENTIFICATION:
+- Static creator metadata alone does NOT mean the speaker is Naresh.
+- However, if the current speaker explicitly identifies as Naresh or as your creator
+  (e.g. "I am Naresh", "Naan than unna create pannavan", "I created you"):
+  Acknowledge and reconcile their identity warmly: "Ohhh, neenga Naresh ah! Yes, neenga en creator. Ippo purinjiduchu."
+  NEVER reject them by saying "You are another user" or "You are not Naresh".
+- If the speaker's identity is verified as Naresh (creator):
+  * When asked "Who am I?": answer "You are Naresh, my creator." / "Neenga Naresh, en creator."
+  * When asked "Who created you?": answer "You did, Naresh, along with Ragavendhiran." / "Neenga dhaan Naresh, along with Ragavendhiran enna create panneenga."
+- If the speaker's identity is unknown:
+  * When asked "Who am I?": answer "I don't have your identity confirmed yet. You can tell me what you'd like me to call you." (NEVER guess or invent a name).
+  * When asked "Who created you?": answer "Naresh and Ragavendhiran created me." / "Enna Naresh um Ragavendhiran um create pannanga."
 
 ==================================================
 3. TANGLISH-ONLY COMMUNICATION
@@ -2348,7 +2453,26 @@ However, you are fully multilingual:
 - Do not reject the user's speech in other languages.
 - Always remain helpful, accurate, and conversational across all languages.
 """
-        return base_prompt + "\n" + semantic_instruction + "\n" + transcription_and_multilingual_instruction
+        dynamic_context = ""
+        if getattr(self, "context_builder", None) is not None:
+            try:
+                dynamic_context = self.context_builder.build_context_block(
+                    getattr(self, "emotion_engine", None),
+                    getattr(self, "memory_manager", None),
+                )
+                p_id = getattr(getattr(self, "memory_manager", None), "profile_id", "default")
+                print(f"[LIVE PROMPT DIAGNOSTIC] profile_id={p_id} memory_block_len={len(dynamic_context)} facts_injected={bool(dynamic_context)}")
+            except Exception as e:
+                print(f"[GEMINI CLIENT] Dynamic context build error: {e}")
+
+        return (
+            base_prompt
+            + "\n"
+            + semantic_instruction
+            + "\n"
+            + transcription_and_multilingual_instruction
+            + ("\n" + dynamic_context if dynamic_context else "")
+        )
 
 
     # ------------------------------------------------------
@@ -2420,6 +2544,35 @@ However, you are fully multilingual:
             ]
 
     # ------------------------------------------------------
+    # Restore History From Storage (SQLite)
+    # ------------------------------------------------------
+
+    def restore_history_from_storage(self, limit: int = 10) -> int:
+        """
+        Restore bounded conversation history from SQLite into RAM history
+        across application restarts.
+        """
+        if getattr(self, "memory_manager", None) is None:
+            return 0
+        try:
+            turns = self.memory_manager.get_recent_working_turns(limit=limit)
+            loaded = []
+            for t in turns:
+                u = t.get("user")
+                a = t.get("assistant")
+                if u:
+                    loaded.append({"role": "user", "text": u})
+                if a:
+                    loaded.append({"role": "assistant", "text": a})
+            self.history = loaded
+            self._trim_history()
+            print(f"[MEMORY] Startup history restored: loaded {len(self.history)} messages from storage")
+            return len(self.history)
+        except Exception as error:
+            print(f"[MEMORY] Error restoring history from storage: {error}")
+            return 0
+
+    # ------------------------------------------------------
     # Build Conversation Context
     # ------------------------------------------------------
 
@@ -2483,8 +2636,23 @@ However, you are fully multilingual:
             user_message
         ).strip()
 
+        dynamic_context = ""
+        if getattr(self, "context_builder", None) is not None:
+            try:
+                dynamic_context = self.context_builder.build_context_block(
+                    getattr(self, "emotion_engine", None),
+                    getattr(self, "memory_manager", None),
+                    query=user_message,
+                )
+            except Exception as e:
+                print(f"[GEMINI CLIENT] Dynamic context build error in build_prompt: {e}")
+
+        sys_prompt = self.system_prompt()
+        if dynamic_context:
+            sys_prompt += "\n" + dynamic_context
+
         prompt_parts = [
-            self.system_prompt()
+            sys_prompt
         ]
 
         historical_messages = self.history[:-1]
@@ -2559,8 +2727,23 @@ However, you are fully multilingual:
             user_message
         ).strip()
 
+        dynamic_context = ""
+        if getattr(self, "context_builder", None) is not None:
+            try:
+                dynamic_context = self.context_builder.build_context_block(
+                    getattr(self, "emotion_engine", None),
+                    getattr(self, "memory_manager", None),
+                    query=user_message,
+                )
+            except Exception as e:
+                print(f"[PROMPT BUILDER] Error generating personality context block in simple prompt: {e}")
+
+        sys_prompt = self.system_prompt()
+        if dynamic_context:
+            sys_prompt += "\n" + dynamic_context
+
         prompt_parts = [
-            self.system_prompt()
+            sys_prompt
         ]
 
         historical_messages = self.history[:-1]
@@ -3442,10 +3625,9 @@ However, you are fully multilingual:
 
         Model Priority Hierarchy:
             1. Gemini 3.8 Flash High (gemini-3.8-flash)
-            2. Gemini 3.7 Flash Medium (gemini-3.7-flash)
-            3. Gemini 3.6 Flash Medium (gemini-3.6-flash)
-            4. Existing valid Gemini fallback (gemini-3.5-flash)
-            5. Groq cloud planner fallback (openai/gpt-oss-20b)
+            2. Gemini 3.6 Flash Medium (gemini-3.6-flash)
+            3. Gemini 3.5 Flash Fallback (gemini-3.5-flash)
+            4. Groq cloud planner fallback (openai/gpt-oss-20b)
 
         On 503 / UNAVAILABLE / high demand:
             Fails fast to the next model tier without cycling keys on the same overloaded model.
